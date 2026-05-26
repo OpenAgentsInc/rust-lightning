@@ -15839,9 +15839,19 @@ pub(super) fn get_initial_channel_type(
 		ret.set_anchors_zero_fee_htlc_tx_required();
 	}
 
-	if config.channel_handshake_config.negotiate_taproot_asset_channels
-		&& their_features.supports_taproot_asset_channel()
-	{
+	let negotiate_simple_taproot =
+		config.channel_handshake_config.negotiate_simple_taproot_channels
+			&& their_features.supports_simple_taproot_staging();
+	let negotiate_taproot_asset = config.channel_handshake_config.negotiate_taproot_asset_channels
+		&& their_features.supports_simple_taproot_staging()
+		&& their_features.supports_taproot_asset_channel();
+	if negotiate_simple_taproot || negotiate_taproot_asset {
+		ret.set_static_remote_key_required();
+		ret.clear_anchors_zero_fee_htlc_tx();
+		ret.clear_anchor_zero_fee_commitments();
+		ret.set_simple_taproot_staging_required();
+	}
+	if negotiate_taproot_asset {
 		ret.set_taproot_asset_channel_required();
 	}
 

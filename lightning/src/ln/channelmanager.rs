@@ -17814,6 +17814,12 @@ pub fn provided_init_features(config: &UserConfig) -> InitFeatures {
 		features.set_anchor_zero_fee_commitments_optional();
 	}
 
+	if config.channel_handshake_config.negotiate_simple_taproot_channels
+		|| config.channel_handshake_config.negotiate_taproot_asset_channels
+	{
+		features.set_simple_taproot_staging_optional();
+	}
+
 	if config.channel_handshake_config.negotiate_taproot_asset_channels {
 		features.set_taproot_asset_channel_optional();
 	}

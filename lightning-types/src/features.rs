@@ -169,12 +169,20 @@ mod sealed {
 			ZeroConf,
 			// Byte 7
 			Trampoline | SimpleClose | Splice,
-			// Byte 8 - 17
-			,,,,,,,,,,
+			// Byte 8 - 9
+			,,
+			// Byte 10
+			SimpleTaproot,
+			// Byte 11 - 17
+			,,,,,,,
 			// Byte 18
 			TaprootAssetChannel,
 			// Byte 19
 			HtlcHold,
+			// Byte 20 - 21
+			,,
+			// Byte 22
+			SimpleTaprootStaging,
 		]
 	);
 	define_context!(
@@ -196,14 +204,22 @@ mod sealed {
 			ZeroConf | Keysend,
 			// Byte 7
 			Trampoline | SimpleClose | Splice,
-			// Byte 8 - 17
-			,,,,,,,,,,
+			// Byte 8 - 9
+			,,
+			// Byte 10
+			SimpleTaproot,
+			// Byte 11 - 17
+			,,,,,,,
 			// Byte 18
 			TaprootAssetChannel,
 			// Byte 19
 			HtlcHold,
-			// Byte 20 - 31
-			,,,,,,,,,,,,
+			// Byte 20 - 21
+			,,
+			// Byte 22
+			SimpleTaprootStaging,
+			// Byte 23 - 31
+			,,,,,,,,,
 			// Byte 32
 			DnsResolver,
 		]
@@ -265,10 +281,18 @@ mod sealed {
 		AnchorZeroFeeCommitments | SCIDPrivacy,
 		// Byte 6
 		ZeroConf,
-		// Byte 7 - 17
-		,,,,,,,,,,,
+		// Byte 7 - 9
+		,,,
+		// Byte 10
+		SimpleTaproot,
+		// Byte 11 - 17
+		,,,,,,,
 		// Byte 18
 		TaprootAssetChannel,
+		// Byte 19 - 21
+		,,,
+		// Byte 22
+		SimpleTaprootStaging,
 	]);
 
 	/// Defines a feature with the given bits for the specified [`Context`]s. The generated trait is
@@ -717,6 +741,28 @@ mod sealed {
 	// added which we expect to appear commonly across contexts.
 	pub(super) const MIN_FEATURES_ALLOCATION_BYTES: usize = 63_usize.div_ceil(8);
 	define_feature!(
+		81,
+		SimpleTaproot,
+		[InitContext, NodeContext, ChannelTypeContext],
+		"Feature flags for BOLT simple taproot channels.",
+		set_simple_taproot_optional,
+		set_simple_taproot_required,
+		clear_simple_taproot,
+		supports_simple_taproot,
+		requires_simple_taproot
+	);
+	define_feature!(
+		181,
+		SimpleTaprootStaging,
+		[InitContext, NodeContext, ChannelTypeContext],
+		"Feature flags for the staging deployment namespace for BOLT simple taproot channels.",
+		set_simple_taproot_staging_optional,
+		set_simple_taproot_staging_required,
+		clear_simple_taproot_staging,
+		supports_simple_taproot_staging,
+		requires_simple_taproot_staging
+	);
+	define_feature!(
 		151,
 		TaprootAssetChannel,
 		[InitContext, NodeContext, ChannelTypeContext],
@@ -1109,10 +1155,27 @@ impl ChannelTypeFeatures {
 		ret
 	}
 
-	/// Constructs a ChannelTypeFeatures for OpenAgentsInc experimental single-asset
-	/// Taproot Asset channels.
-	pub fn taproot_asset_single_asset() -> Self {
+	/// Constructs a ChannelTypeFeatures for BOLT simple taproot channels using the final
+	/// feature-bit assignment.
+	pub fn simple_taproot() -> Self {
 		let mut ret = Self::only_static_remote_key();
+		<sealed::ChannelTypeContext as sealed::SimpleTaproot>::set_required_bit(&mut ret);
+		ret
+	}
+
+	/// Constructs a ChannelTypeFeatures for BOLT simple taproot channels using the staging
+	/// feature-bit assignment from the draft.
+	pub fn simple_taproot_staging() -> Self {
+		let mut ret = Self::only_static_remote_key();
+		<sealed::ChannelTypeContext as sealed::SimpleTaprootStaging>::set_required_bit(&mut ret);
+		ret
+	}
+
+	/// Constructs a ChannelTypeFeatures for OpenAgentsInc experimental single-asset
+	/// Taproot Asset channels. The current demo intentionally uses the BOLT simple-taproot
+	/// staging bit as the base channel type while the BOLT remains unsettled.
+	pub fn taproot_asset_single_asset() -> Self {
+		let mut ret = Self::simple_taproot_staging();
 		<sealed::ChannelTypeContext as sealed::TaprootAssetChannel>::set_required_bit(&mut ret);
 		ret
 	}
@@ -1552,14 +1615,35 @@ mod tests {
 	}
 
 	#[test]
+	fn test_simple_taproot_channel_type_mapping() {
+		let mut init_features = InitFeatures::empty();
+		init_features.set_static_remote_key_optional();
+		init_features.set_simple_taproot_staging_optional();
+		let converted_features = ChannelTypeFeatures::from_init(&init_features);
+		assert_eq!(converted_features, ChannelTypeFeatures::simple_taproot_staging());
+		assert!(!converted_features.supports_any_optional_bits());
+		assert!(converted_features.requires_static_remote_key());
+		assert!(converted_features.requires_simple_taproot_staging());
+
+		let mut final_features = InitFeatures::empty();
+		final_features.set_static_remote_key_optional();
+		final_features.set_simple_taproot_optional();
+		let converted_final_features = ChannelTypeFeatures::from_init(&final_features);
+		assert_eq!(converted_final_features, ChannelTypeFeatures::simple_taproot());
+		assert!(converted_final_features.requires_simple_taproot());
+	}
+
+	#[test]
 	fn test_taproot_asset_channel_type_mapping() {
 		let mut init_features = InitFeatures::empty();
 		init_features.set_static_remote_key_optional();
+		init_features.set_simple_taproot_staging_optional();
 		init_features.set_taproot_asset_channel_optional();
 		let converted_features = ChannelTypeFeatures::from_init(&init_features);
 		assert_eq!(converted_features, ChannelTypeFeatures::taproot_asset_single_asset());
 		assert!(!converted_features.supports_any_optional_bits());
 		assert!(converted_features.requires_static_remote_key());
+		assert!(converted_features.requires_simple_taproot_staging());
 		assert!(converted_features.requires_taproot_asset_channel());
 	}
 

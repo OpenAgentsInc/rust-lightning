@@ -663,10 +663,16 @@ pub struct TaprootAssetMonitorAuxBlobExpectation {
 /// negotiation.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum TaprootAssetChannelNegotiationError {
+	/// The local node did not advertise the simple taproot staging feature.
+	MissingLocalSimpleTaprootSupport,
+	/// The remote peer did not advertise the simple taproot staging feature.
+	MissingRemoteSimpleTaprootSupport,
 	/// The local node did not advertise the experimental asset-channel feature.
 	MissingLocalSupport,
 	/// The remote peer did not advertise the experimental asset-channel feature.
 	MissingRemoteSupport,
+	/// The proposed channel type did not include the simple taproot staging bit.
+	MissingSimpleTaprootChannelType,
 	/// The proposed channel type did not include the experimental asset-channel
 	/// bit.
 	MissingAssetChannelType,
@@ -834,6 +840,12 @@ pub fn negotiate_single_asset_channel(
 	local_features: &InitFeatures, remote_features: &InitFeatures,
 	descriptor: TaprootAssetChannelDescriptor,
 ) -> Result<TaprootAssetChannelNegotiation, TaprootAssetChannelNegotiationError> {
+	if !local_features.supports_simple_taproot_staging() {
+		return Err(TaprootAssetChannelNegotiationError::MissingLocalSimpleTaprootSupport);
+	}
+	if !remote_features.supports_simple_taproot_staging() {
+		return Err(TaprootAssetChannelNegotiationError::MissingRemoteSimpleTaprootSupport);
+	}
 	if !local_features.supports_taproot_asset_channel() {
 		return Err(TaprootAssetChannelNegotiationError::MissingLocalSupport);
 	}
@@ -849,6 +861,9 @@ pub fn validate_single_asset_channel_open(
 	local_features: &InitFeatures, remote_features: &InitFeatures,
 	proposed_channel_type: &ChannelTypeFeatures, descriptor: TaprootAssetChannelDescriptor,
 ) -> Result<TaprootAssetChannelNegotiation, TaprootAssetChannelNegotiationError> {
+	if !proposed_channel_type.requires_simple_taproot_staging() {
+		return Err(TaprootAssetChannelNegotiationError::MissingSimpleTaprootChannelType);
+	}
 	if !proposed_channel_type.requires_taproot_asset_channel() {
 		return Err(TaprootAssetChannelNegotiationError::MissingAssetChannelType);
 	}
@@ -1218,6 +1233,7 @@ mod tests {
 		let mut features = InitFeatures::empty();
 		features.set_static_remote_key_optional();
 		features.set_channel_type_optional();
+		features.set_simple_taproot_staging_optional();
 		features.set_taproot_asset_channel_optional();
 		features
 	}
@@ -1392,7 +1408,8 @@ mod tests {
 
 	#[test]
 	fn rejects_missing_local_support() {
-		let local = InitFeatures::empty();
+		let mut local = InitFeatures::empty();
+		local.set_simple_taproot_staging_optional();
 		let remote = asset_features();
 		assert_eq!(
 			negotiate_single_asset_channel(&local, &remote, descriptor()),
@@ -1403,10 +1420,30 @@ mod tests {
 	#[test]
 	fn rejects_missing_remote_support() {
 		let local = asset_features();
-		let remote = InitFeatures::empty();
+		let mut remote = InitFeatures::empty();
+		remote.set_simple_taproot_staging_optional();
 		assert_eq!(
 			negotiate_single_asset_channel(&local, &remote, descriptor()),
 			Err(TaprootAssetChannelNegotiationError::MissingRemoteSupport)
+		);
+	}
+
+	#[test]
+	fn rejects_missing_simple_taproot_support() {
+		let mut local = asset_features();
+		local.clear_simple_taproot_staging();
+		let remote = asset_features();
+		assert_eq!(
+			negotiate_single_asset_channel(&local, &remote, descriptor()),
+			Err(TaprootAssetChannelNegotiationError::MissingLocalSimpleTaprootSupport)
+		);
+
+		let local = asset_features();
+		let mut remote = asset_features();
+		remote.clear_simple_taproot_staging();
+		assert_eq!(
+			negotiate_single_asset_channel(&local, &remote, descriptor()),
+			Err(TaprootAssetChannelNegotiationError::MissingRemoteSimpleTaprootSupport)
 		);
 	}
 
@@ -1440,7 +1477,7 @@ mod tests {
 				&ChannelTypeFeatures::only_static_remote_key(),
 				descriptor()
 			),
-			Err(TaprootAssetChannelNegotiationError::MissingAssetChannelType)
+			Err(TaprootAssetChannelNegotiationError::MissingSimpleTaprootChannelType)
 		);
 	}
 
