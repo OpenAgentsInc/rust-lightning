@@ -50,7 +50,8 @@ use super::channel_keys::{
 use super::simple_taproot::{
 	simple_taproot_anchor_spend_info, simple_taproot_htlc_spend_info,
 	simple_taproot_second_level_htlc_spend_info, simple_taproot_to_local_spend_info,
-	simple_taproot_to_remote_spend_info, SimpleTaprootKeyAggContext,
+	simple_taproot_to_local_spend_info_with_aux_leaf, simple_taproot_to_remote_spend_info,
+	simple_taproot_to_remote_spend_info_with_aux_leaf, SimpleTaprootKeyAggContext,
 };
 use crate::chain;
 use crate::crypto::utils::{sign, sign_with_aux_rand};
@@ -612,6 +613,20 @@ impl_writeable_tlv_based!(TxCreationKeys, {
 	(8, broadcaster_delayed_payment_key, required),
 });
 
+/// Base simple-taproot output keys for the four non-HTLC outputs that may receive Taproot Asset
+/// aux leaves across the initial holder and counterparty commitments.
+#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
+pub struct SimpleTaprootAssetCommitmentOutputKeys {
+	/// Base output key for the holder-broadcast commitment output paying the holder.
+	pub holder_commitment_to_holder: [u8; 32],
+	/// Base output key for the holder-broadcast commitment output paying the counterparty.
+	pub holder_commitment_to_counterparty: [u8; 32],
+	/// Base output key for the counterparty-broadcast commitment output paying the holder.
+	pub counterparty_commitment_to_holder: [u8; 32],
+	/// Base output key for the counterparty-broadcast commitment output paying the counterparty.
+	pub counterparty_commitment_to_counterparty: [u8; 32],
+}
+
 /// One counterparty's public keys which do not change over the life of a channel.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct ChannelPublicKeys {
@@ -1132,6 +1147,14 @@ pub struct ChannelTransactionParameters {
 	/// the asset tree. Plain simple-taproot channels leave it unset and use the
 	/// BIP86 no-script-path tweak.
 	pub simple_taproot_tapscript_root: Option<[u8; 32]>,
+	/// Optional Taproot Asset aux leaf for the holder commitment output paying the holder.
+	pub simple_taproot_holder_commitment_to_holder_aux_leaf_script: Option<ScriptBuf>,
+	/// Optional Taproot Asset aux leaf for the holder commitment output paying the counterparty.
+	pub simple_taproot_holder_commitment_to_counterparty_aux_leaf_script: Option<ScriptBuf>,
+	/// Optional Taproot Asset aux leaf for the counterparty commitment output paying the holder.
+	pub simple_taproot_counterparty_commitment_to_holder_aux_leaf_script: Option<ScriptBuf>,
+	/// Optional Taproot Asset aux leaf for the counterparty commitment output paying the counterparty.
+	pub simple_taproot_counterparty_commitment_to_counterparty_aux_leaf_script: Option<ScriptBuf>,
 	/// The value locked in the channel, denominated in satoshis.
 	pub channel_value_satoshis: u64,
 }
@@ -1254,6 +1277,10 @@ impl ChannelTransactionParameters {
 			splice_parent_funding_txid: None,
 			channel_type_features: ChannelTypeFeatures::empty(),
 			simple_taproot_tapscript_root: None,
+			simple_taproot_holder_commitment_to_holder_aux_leaf_script: None,
+			simple_taproot_holder_commitment_to_counterparty_aux_leaf_script: None,
+			simple_taproot_counterparty_commitment_to_holder_aux_leaf_script: None,
+			simple_taproot_counterparty_commitment_to_counterparty_aux_leaf_script: None,
 			channel_value_satoshis,
 		}
 	}
@@ -1279,6 +1306,10 @@ impl Writeable for ChannelTransactionParameters {
 			(12, self.splice_parent_funding_txid, option),
 			(13, self.channel_value_satoshis, required),
 			(14, self.simple_taproot_tapscript_root, option),
+			(16, self.simple_taproot_holder_commitment_to_holder_aux_leaf_script, option),
+			(18, self.simple_taproot_holder_commitment_to_counterparty_aux_leaf_script, option),
+			(20, self.simple_taproot_counterparty_commitment_to_holder_aux_leaf_script, option),
+			(22, self.simple_taproot_counterparty_commitment_to_counterparty_aux_leaf_script, option),
 		});
 		Ok(())
 	}
@@ -1297,6 +1328,10 @@ impl ReadableArgs<Option<u64>> for ChannelTransactionParameters {
 		let mut channel_type_features = None;
 		let mut channel_value_satoshis = None;
 		let mut simple_taproot_tapscript_root = None;
+		let mut simple_taproot_holder_commitment_to_holder_aux_leaf_script = None;
+		let mut simple_taproot_holder_commitment_to_counterparty_aux_leaf_script = None;
+		let mut simple_taproot_counterparty_commitment_to_holder_aux_leaf_script = None;
+		let mut simple_taproot_counterparty_commitment_to_counterparty_aux_leaf_script = None;
 
 		read_tlv_fields!(reader, {
 			(0, holder_pubkeys, required),
@@ -1309,6 +1344,10 @@ impl ReadableArgs<Option<u64>> for ChannelTransactionParameters {
 			(12, splice_parent_funding_txid, option),
 			(13, channel_value_satoshis, option),
 			(14, simple_taproot_tapscript_root, option),
+			(16, simple_taproot_holder_commitment_to_holder_aux_leaf_script, option),
+			(18, simple_taproot_holder_commitment_to_counterparty_aux_leaf_script, option),
+			(20, simple_taproot_counterparty_commitment_to_holder_aux_leaf_script, option),
+			(22, simple_taproot_counterparty_commitment_to_counterparty_aux_leaf_script, option),
 		});
 
 		let channel_value_satoshis = match read_args {
@@ -1336,6 +1375,10 @@ impl ReadableArgs<Option<u64>> for ChannelTransactionParameters {
 			splice_parent_funding_txid,
 			channel_type_features: channel_type_features.unwrap_or(ChannelTypeFeatures::only_static_remote_key()),
 			simple_taproot_tapscript_root,
+			simple_taproot_holder_commitment_to_holder_aux_leaf_script,
+			simple_taproot_holder_commitment_to_counterparty_aux_leaf_script,
+			simple_taproot_counterparty_commitment_to_holder_aux_leaf_script,
+			simple_taproot_counterparty_commitment_to_counterparty_aux_leaf_script,
 			channel_value_satoshis,
 		})
 	}
@@ -1403,6 +1446,26 @@ impl<'a> DirectedChannelTransactionParameters<'a> {
 	pub fn channel_value_satoshis(&self) -> u64 {
 		self.inner.channel_value_satoshis
 	}
+
+	/// Optional Taproot Asset aux leaf script for the output paying the broadcaster.
+	pub fn simple_taproot_to_broadcaster_aux_leaf_script(&self) -> Option<&'a Script> {
+		if self.holder_is_broadcaster {
+			self.inner.simple_taproot_holder_commitment_to_holder_aux_leaf_script.as_deref()
+		} else {
+			self.inner
+				.simple_taproot_counterparty_commitment_to_counterparty_aux_leaf_script
+				.as_deref()
+		}
+	}
+
+	/// Optional Taproot Asset aux leaf script for the output paying the countersignatory.
+	pub fn simple_taproot_to_countersignatory_aux_leaf_script(&self) -> Option<&'a Script> {
+		if self.holder_is_broadcaster {
+			self.inner.simple_taproot_holder_commitment_to_counterparty_aux_leaf_script.as_deref()
+		} else {
+			self.inner.simple_taproot_counterparty_commitment_to_holder_aux_leaf_script.as_deref()
+		}
+	}
 }
 
 /// Information needed to build and sign a holder's commitment transaction.
@@ -1466,6 +1529,10 @@ impl HolderCommitmentTransaction {
 			splice_parent_funding_txid: None,
 			channel_type_features: ChannelTypeFeatures::only_static_remote_key(),
 			simple_taproot_tapscript_root: None,
+			simple_taproot_holder_commitment_to_holder_aux_leaf_script: None,
+			simple_taproot_holder_commitment_to_counterparty_aux_leaf_script: None,
+			simple_taproot_counterparty_commitment_to_holder_aux_leaf_script: None,
+			simple_taproot_counterparty_commitment_to_counterparty_aux_leaf_script: None,
 			channel_value_satoshis,
 		};
 		let mut counterparty_htlc_sigs = Vec::new();
@@ -1990,9 +2057,13 @@ impl CommitmentTransaction {
 			#[cfg(feature = "simple_taproot_musig2")]
 			let script = if requires_simple_taproot_outputs(channel_type) {
 				let secp_ctx = Secp256k1::verification_only();
-				simple_taproot_to_remote_spend_info(&secp_ctx, countersignatory_payment_point)
-					.expect("valid simple-taproot to_remote output")
-					.script_pubkey
+				simple_taproot_to_remote_spend_info_with_aux_leaf(
+					&secp_ctx,
+					countersignatory_payment_point,
+					channel_parameters.simple_taproot_to_countersignatory_aux_leaf_script(),
+				)
+				.expect("valid simple-taproot to_remote output")
+				.script_pubkey
 			} else if channel_type.supports_anchors_zero_fee_htlc_tx() {
 				get_to_countersigner_keyed_anchor_redeemscript(countersignatory_payment_point).to_p2wsh()
 			} else {
@@ -2014,11 +2085,12 @@ impl CommitmentTransaction {
 			#[cfg(feature = "simple_taproot_musig2")]
 			let script_pubkey = if requires_simple_taproot_outputs(channel_type) {
 				let secp_ctx = Secp256k1::verification_only();
-				simple_taproot_to_local_spend_info(
+				simple_taproot_to_local_spend_info_with_aux_leaf(
 					&secp_ctx,
 					&keys.broadcaster_delayed_payment_key.to_public_key(),
 					&keys.revocation_key.to_public_key(),
 					contest_delay,
+					channel_parameters.simple_taproot_to_broadcaster_aux_leaf_script(),
 				)
 				.expect("valid simple-taproot to_local output")
 				.script_pubkey
@@ -2488,6 +2560,11 @@ mod tests {
 	};
 	#[cfg(feature = "simple_taproot_musig2")]
 	use crate::ln::channel_keys::{DelayedPaymentBasepoint, HtlcBasepoint, RevocationBasepoint};
+	#[cfg(feature = "simple_taproot_musig2")]
+	use crate::ln::simple_taproot::{
+		simple_taproot_to_local_spend_info_with_aux_leaf,
+		simple_taproot_to_remote_spend_info_with_aux_leaf,
+	};
 	use crate::sign::{ChannelSigner, SignerProvider};
 	use crate::types::features::ChannelTypeFeatures;
 	use crate::types::payment::PaymentHash;
@@ -2535,6 +2612,10 @@ mod tests {
 				splice_parent_funding_txid: None,
 				channel_type_features: ChannelTypeFeatures::only_static_remote_key(),
 				simple_taproot_tapscript_root: None,
+				simple_taproot_holder_commitment_to_holder_aux_leaf_script: None,
+				simple_taproot_holder_commitment_to_counterparty_aux_leaf_script: None,
+				simple_taproot_counterparty_commitment_to_holder_aux_leaf_script: None,
+				simple_taproot_counterparty_commitment_to_counterparty_aux_leaf_script: None,
 				channel_value_satoshis: 4000,
 			};
 
@@ -2599,6 +2680,10 @@ mod tests {
 			splice_parent_funding_txid: None,
 			channel_type_features: ChannelTypeFeatures::simple_taproot_staging(),
 			simple_taproot_tapscript_root: None,
+			simple_taproot_holder_commitment_to_holder_aux_leaf_script: None,
+			simple_taproot_holder_commitment_to_counterparty_aux_leaf_script: None,
+			simple_taproot_counterparty_commitment_to_holder_aux_leaf_script: None,
+			simple_taproot_counterparty_commitment_to_counterparty_aux_leaf_script: None,
 			channel_value_satoshis: 10_000_000,
 		};
 
@@ -2769,6 +2854,51 @@ mod tests {
 		assert_txout(&outputs[2], 3_000_000, "51203609bb705034e5629aa6ec05c5ca906ac89ac08b34c4583c259521ec30174408");
 		assert_txout(&outputs[3], 6_984_820, "51203e1fcbbd06c8a7414704612c72be9834a75d86ed85b29f0ef0c52e1950afaff3");
 		assert_eq!(tx.trust().revokeable_output_index(), Some(3));
+		assert!(builder.verify(&tx).is_ok());
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	#[test]
+	#[rustfmt::skip]
+	fn test_simple_taproot_commitment_non_htlc_outputs_include_asset_aux_leaves() {
+		let mut builder = simple_taproot_vector_builder();
+		let aux_leaf = ScriptBuf::new_op_return(&[7; 32]);
+		builder.channel_parameters.simple_taproot_holder_commitment_to_holder_aux_leaf_script =
+			Some(aux_leaf.clone());
+		builder.channel_parameters.simple_taproot_holder_commitment_to_counterparty_aux_leaf_script =
+			Some(aux_leaf.clone());
+
+		let tx = builder.build(6_984_820, 3_000_000, Vec::new());
+		let keys = tx.trust().keys();
+		let expected_to_countersignatory = simple_taproot_to_remote_spend_info_with_aux_leaf(
+			&builder.secp_ctx,
+			&builder.counterparty_pubkeys.payment_point,
+			Some(aux_leaf.as_script()),
+		)
+		.unwrap()
+		.script_pubkey;
+		let expected_to_broadcaster = simple_taproot_to_local_spend_info_with_aux_leaf(
+			&builder.secp_ctx,
+			&keys.broadcaster_delayed_payment_key.to_public_key(),
+			&keys.revocation_key.to_public_key(),
+			builder.channel_parameters.as_holder_broadcastable().contest_delay(),
+			Some(aux_leaf.as_script()),
+		)
+		.unwrap()
+		.script_pubkey;
+
+		let outputs = &tx.built.transaction.output;
+		assert_eq!(outputs.len(), 4);
+		assert_eq!(outputs[2].script_pubkey, expected_to_countersignatory);
+		assert_eq!(outputs[3].script_pubkey, expected_to_broadcaster);
+		assert_ne!(
+			outputs[2].script_pubkey.as_bytes(),
+			&<Vec<u8>>::from_hex("51203609bb705034e5629aa6ec05c5ca906ac89ac08b34c4583c259521ec30174408").unwrap()[..]
+		);
+		assert_ne!(
+			outputs[3].script_pubkey.as_bytes(),
+			&<Vec<u8>>::from_hex("51203e1fcbbd06c8a7414704612c72be9834a75d86ed85b29f0ef0c52e1950afaff3").unwrap()[..]
+		);
 		assert!(builder.verify(&tx).is_ok());
 	}
 

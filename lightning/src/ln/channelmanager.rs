@@ -21,6 +21,8 @@ use bitcoin::block::Header;
 use bitcoin::constants::ChainHash;
 use bitcoin::key::constants::SECRET_KEY_SIZE;
 use bitcoin::network::Network;
+#[cfg(feature = "simple_taproot_musig2")]
+use bitcoin::script::ScriptBuf;
 use bitcoin::transaction::Transaction;
 
 use bitcoin::hash_types::{BlockHash, Txid};
@@ -55,6 +57,8 @@ use crate::events::{
 };
 use crate::events::{FundingInfo, PaidBolt12Invoice};
 use crate::ln::chan_utils::selected_commitment_sat_per_1000_weight;
+#[cfg(feature = "simple_taproot_musig2")]
+use crate::ln::chan_utils::SimpleTaprootAssetCommitmentOutputKeys;
 #[cfg(any(test, fuzzing, feature = "_test_utils"))]
 use crate::ln::channel::QuiescentAction;
 use crate::ln::channel::QuiescentError;
@@ -3899,6 +3903,69 @@ impl<
 			}
 		})?;
 		chan.set_pending_simple_taproot_tapscript_root(tapscript_root)
+			.map_err(|err| APIError::APIMisuseError { err: err.to_string() })
+	}
+
+	/// Sets Taproot Asset aux leaves on a pending simple-taproot initial commitment pair.
+	///
+	/// The leaves must be derived from validated Taproot Asset proof data and from the base output
+	/// keys returned by [`Self::pending_simple_taproot_asset_output_keys`]. BTC-only and non-asset
+	/// channels reject this call.
+	#[cfg(feature = "simple_taproot_musig2")]
+	pub fn set_pending_simple_taproot_commitment_aux_leaves(
+		&self, temporary_channel_id: ChannelId, counterparty_node_id: PublicKey,
+		holder_commitment_to_holder: Option<ScriptBuf>,
+		holder_commitment_to_counterparty: Option<ScriptBuf>,
+		counterparty_commitment_to_holder: Option<ScriptBuf>,
+		counterparty_commitment_to_counterparty: Option<ScriptBuf>,
+	) -> Result<(), APIError> {
+		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
+		debug_assert!(&self.total_consistency_lock.try_write().is_err());
+
+		let per_peer_state = self.per_peer_state.read().unwrap();
+		let peer_state_mutex =
+			per_peer_state.get(&counterparty_node_id).ok_or_else(|| APIError::APIMisuseError {
+				err: format!("Not connected to node: {counterparty_node_id}"),
+			})?;
+		let mut peer_state = peer_state_mutex.lock().unwrap();
+		let chan = peer_state.channel_by_id.get_mut(&temporary_channel_id).ok_or_else(|| {
+			APIError::ChannelUnavailable {
+				err: format!(
+					"Channel {temporary_channel_id} with counterparty {counterparty_node_id} not found"
+				),
+			}
+		})?;
+		chan.set_pending_simple_taproot_commitment_aux_leaves(
+			holder_commitment_to_holder,
+			holder_commitment_to_counterparty,
+			counterparty_commitment_to_holder,
+			counterparty_commitment_to_counterparty,
+		)
+		.map_err(|err| APIError::APIMisuseError { err: err.to_string() })
+	}
+
+	/// Returns the base simple-taproot output keys needed to derive Taproot Asset aux leaves for a
+	/// pending initial commitment pair.
+	#[cfg(feature = "simple_taproot_musig2")]
+	pub fn pending_simple_taproot_asset_output_keys(
+		&self, temporary_channel_id: ChannelId, counterparty_node_id: PublicKey,
+	) -> Result<SimpleTaprootAssetCommitmentOutputKeys, APIError> {
+		debug_assert!(&self.total_consistency_lock.try_write().is_err());
+
+		let per_peer_state = self.per_peer_state.read().unwrap();
+		let peer_state_mutex =
+			per_peer_state.get(&counterparty_node_id).ok_or_else(|| APIError::APIMisuseError {
+				err: format!("Not connected to node: {counterparty_node_id}"),
+			})?;
+		let peer_state = peer_state_mutex.lock().unwrap();
+		let chan = peer_state.channel_by_id.get(&temporary_channel_id).ok_or_else(|| {
+			APIError::ChannelUnavailable {
+				err: format!(
+					"Channel {temporary_channel_id} with counterparty {counterparty_node_id} not found"
+				),
+			}
+		})?;
+		chan.pending_simple_taproot_asset_output_keys()
 			.map_err(|err| APIError::APIMisuseError { err: err.to_string() })
 	}
 

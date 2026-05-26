@@ -48,6 +48,8 @@ use crate::ln::chan_utils::{
 	CounterpartyCommitmentSecrets, HTLCOutputInCommitment, HolderCommitmentTransaction,
 	EMPTY_SCRIPT_SIG_WEIGHT, FUNDING_TRANSACTION_WITNESS_WEIGHT,
 };
+#[cfg(feature = "simple_taproot_musig2")]
+use crate::ln::chan_utils::{SimpleTaprootAssetCommitmentOutputKeys, TxCreationKeys};
 use crate::ln::channel_state::{
 	ChannelShutdownState, CounterpartyForwardingInfo, InboundHTLCDetails, InboundHTLCStateDetails,
 	OutboundHTLCDetails, OutboundHTLCStateDetails,
@@ -69,6 +71,13 @@ use crate::ln::onion_utils::{
 	AttributionData, HTLCFailReason, LocalHTLCFailureReason, HOLD_TIME_UNIT_MILLIS,
 };
 use crate::ln::script::{self, ShutdownScript};
+#[cfg(feature = "simple_taproot_musig2")]
+use crate::ln::simple_taproot::{
+	simple_taproot_to_local_spend_info, simple_taproot_to_remote_spend_info,
+	SimpleTaprootNoncePair, SimpleTaprootNonceScope, SimpleTaprootSentCommitmentSignature,
+	SIMPLE_TAPROOT_COMMITMENT_NONCE_PREIMAGE, SIMPLE_TAPROOT_COOPERATIVE_CLOSE_NONCE_PREIMAGE,
+	SIMPLE_TAPROOT_COUNTERPARTY_COMMITMENT_NONCE_PREIMAGE,
+};
 use crate::ln::simple_taproot::{
 	Musig2PublicNonce, SimpleTaprootCloseeNonceState, SimpleTaprootNextLocalNonces,
 	SimpleTaprootNonceEntries, SimpleTaprootNonceEntry, SimpleTaprootNonceState,
@@ -77,12 +86,6 @@ use crate::ln::simple_taproot::{
 };
 #[cfg(simple_close)]
 use crate::ln::simple_taproot::{SimpleTaprootClosingOutputSet, SimpleTaprootPartialSignature};
-#[cfg(feature = "simple_taproot_musig2")]
-use crate::ln::simple_taproot::{
-	SimpleTaprootNoncePair, SimpleTaprootNonceScope, SimpleTaprootSentCommitmentSignature,
-	SIMPLE_TAPROOT_COMMITMENT_NONCE_PREIMAGE, SIMPLE_TAPROOT_COOPERATIVE_CLOSE_NONCE_PREIMAGE,
-	SIMPLE_TAPROOT_COUNTERPARTY_COMMITMENT_NONCE_PREIMAGE,
-};
 use crate::ln::types::ChannelId;
 use crate::offers::static_invoice::StaticInvoice;
 use crate::routing::gossip::NodeId;
@@ -1692,6 +1695,241 @@ where
 		}
 	}
 
+	#[cfg(feature = "simple_taproot_musig2")]
+	fn pending_taproot_asset_funding_scope(&mut self) -> Result<&mut FundingScope, ChannelError> {
+		let funding = match &mut self.phase {
+			ChannelPhase::UnfundedOutboundV1(chan) => &mut chan.funding,
+			ChannelPhase::UnfundedInboundV1(chan) => &mut chan.funding,
+			_ => {
+				return Err(ChannelError::close(
+					"Taproot Asset aux leaves can only be set on an unfunded V1 channel".to_owned(),
+				));
+			},
+		};
+		if !funding.get_channel_type().requires_taproot_asset_channel() {
+			return Err(ChannelError::close(
+				"Taproot Asset aux leaves require a Taproot Asset channel".to_owned(),
+			));
+		}
+		if funding.channel_transaction_parameters.funding_outpoint.is_some() {
+			return Err(ChannelError::close(
+				"Taproot Asset aux leaves must be set before funding outpoint binding".to_owned(),
+			));
+		}
+		Ok(funding)
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	fn set_pending_aux_leaf_script(
+		target: &mut Option<ScriptBuf>, script: ScriptBuf, description: &str,
+	) -> Result<(), ChannelError> {
+		const MAX_TAPROOT_ASSET_AUX_LEAF_SCRIPT_LEN: usize = 10_000;
+		if script.is_empty() {
+			return Err(ChannelError::close(format!(
+				"Taproot Asset {description} aux leaf script cannot be empty"
+			)));
+		}
+		if script.len() > MAX_TAPROOT_ASSET_AUX_LEAF_SCRIPT_LEN {
+			return Err(ChannelError::close(format!(
+				"Taproot Asset {description} aux leaf script is too large"
+			)));
+		}
+		match target {
+			Some(existing) if existing != &script => Err(ChannelError::close(format!(
+				"Taproot Asset {description} aux leaf script changed for pending channel"
+			))),
+			Some(_) => Ok(()),
+			None => {
+				*target = Some(script);
+				Ok(())
+			},
+		}
+	}
+
+	/// Sets Taproot Asset aux leaves for the pending initial simple-taproot commitment pair.
+	///
+	/// Each leaf is keyed by which commitment transaction it belongs to and which party the
+	/// corresponding non-HTLC output pays. Passing `None` leaves that output as a BTC-only
+	/// simple-taproot output.
+	#[cfg(feature = "simple_taproot_musig2")]
+	pub fn set_pending_simple_taproot_commitment_aux_leaves(
+		&mut self, holder_commitment_to_holder: Option<ScriptBuf>,
+		holder_commitment_to_counterparty: Option<ScriptBuf>,
+		counterparty_commitment_to_holder: Option<ScriptBuf>,
+		counterparty_commitment_to_counterparty: Option<ScriptBuf>,
+	) -> Result<(), ChannelError> {
+		if holder_commitment_to_holder.is_none()
+			&& holder_commitment_to_counterparty.is_none()
+			&& counterparty_commitment_to_holder.is_none()
+			&& counterparty_commitment_to_counterparty.is_none()
+		{
+			return Err(ChannelError::close(
+				"At least one Taproot Asset aux leaf script must be set".to_owned(),
+			));
+		}
+		let funding = self.pending_taproot_asset_funding_scope()?;
+		let parameters = &mut funding.channel_transaction_parameters;
+		if let Some(script) = holder_commitment_to_holder {
+			Self::set_pending_aux_leaf_script(
+				&mut parameters.simple_taproot_holder_commitment_to_holder_aux_leaf_script,
+				script,
+				"holder-commitment-to-holder",
+			)?;
+		}
+		if let Some(script) = holder_commitment_to_counterparty {
+			Self::set_pending_aux_leaf_script(
+				&mut parameters.simple_taproot_holder_commitment_to_counterparty_aux_leaf_script,
+				script,
+				"holder-commitment-to-counterparty",
+			)?;
+		}
+		if let Some(script) = counterparty_commitment_to_holder {
+			Self::set_pending_aux_leaf_script(
+				&mut parameters.simple_taproot_counterparty_commitment_to_holder_aux_leaf_script,
+				script,
+				"counterparty-commitment-to-holder",
+			)?;
+		}
+		if let Some(script) = counterparty_commitment_to_counterparty {
+			Self::set_pending_aux_leaf_script(
+				&mut parameters
+					.simple_taproot_counterparty_commitment_to_counterparty_aux_leaf_script,
+				script,
+				"counterparty-commitment-to-counterparty",
+			)?;
+		}
+		Ok(())
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	fn simple_taproot_script_pubkey_xonly_key(
+		script_pubkey: &Script,
+	) -> Result<[u8; 32], ChannelError> {
+		let script = script_pubkey.as_bytes();
+		if script.len() != 34 || script[0] != 0x51 || script[1] != 0x20 {
+			return Err(ChannelError::close(
+				"Unexpected simple-taproot output script shape".to_owned(),
+			));
+		}
+		let mut output_key = [0; 32];
+		output_key.copy_from_slice(&script[2..]);
+		Ok(output_key)
+	}
+
+	/// Returns the base simple-taproot output keys that Taproot Asset aux-leaf derivation commits
+	/// to for the pending initial holder and counterparty commitments.
+	#[cfg(feature = "simple_taproot_musig2")]
+	pub fn pending_simple_taproot_asset_output_keys(
+		&self,
+	) -> Result<SimpleTaprootAssetCommitmentOutputKeys, ChannelError> {
+		let (funding, context, holder_commitment_point) = match &self.phase {
+			ChannelPhase::UnfundedOutboundV1(chan) => (
+				&chan.funding,
+				&chan.context,
+				chan.unfunded_context.holder_commitment_point.as_ref(),
+			),
+			ChannelPhase::UnfundedInboundV1(chan) => (
+				&chan.funding,
+				&chan.context,
+				chan.unfunded_context.holder_commitment_point.as_ref(),
+			),
+			_ => {
+				return Err(ChannelError::close(
+					"Taproot Asset output keys can only be queried on an unfunded V1 channel"
+						.to_owned(),
+				));
+			},
+		};
+		if !funding.get_channel_type().requires_taproot_asset_channel() {
+			return Err(ChannelError::close(
+				"Taproot Asset output keys require a Taproot Asset channel".to_owned(),
+			));
+		}
+		let holder_commitment_point = holder_commitment_point.ok_or_else(|| {
+			ChannelError::close(
+				"Holder commitment point is not available for pending Taproot Asset channel"
+					.to_owned(),
+			)
+		})?;
+		let counterparty_commitment_point =
+			context.counterparty_next_commitment_point.ok_or_else(|| {
+				ChannelError::close(
+					"Counterparty commitment point is not available for pending Taproot Asset channel"
+						.to_owned(),
+				)
+			})?;
+		let parameters = &funding.channel_transaction_parameters;
+		let counterparty_parameters =
+			parameters.counterparty_parameters.as_ref().ok_or_else(|| {
+				ChannelError::close(
+					"Counterparty parameters are not available for pending Taproot Asset channel"
+						.to_owned(),
+				)
+			})?;
+
+		let holder_pubkeys = &parameters.holder_pubkeys;
+		let counterparty_pubkeys = &counterparty_parameters.pubkeys;
+
+		let holder_commitment_keys = TxCreationKeys::from_channel_static_keys(
+			&holder_commitment_point.next_point(),
+			holder_pubkeys,
+			counterparty_pubkeys,
+			&context.secp_ctx,
+		);
+		let holder_commitment_to_holder = simple_taproot_to_local_spend_info(
+			&context.secp_ctx,
+			&holder_commitment_keys.broadcaster_delayed_payment_key.to_public_key(),
+			&holder_commitment_keys.revocation_key.to_public_key(),
+			counterparty_parameters.selected_contest_delay,
+		)
+		.map_err(|_| {
+			ChannelError::close("Failed to derive holder Taproot Asset output key".to_owned())
+		})?;
+		let holder_commitment_to_counterparty = simple_taproot_to_remote_spend_info(
+			&context.secp_ctx,
+			&counterparty_pubkeys.payment_point,
+		)
+		.map_err(|_| {
+			ChannelError::close("Failed to derive counterparty Taproot Asset output key".to_owned())
+		})?;
+
+		let counterparty_commitment_keys = TxCreationKeys::from_channel_static_keys(
+			&counterparty_commitment_point,
+			counterparty_pubkeys,
+			holder_pubkeys,
+			&context.secp_ctx,
+		);
+		let counterparty_commitment_to_holder =
+			simple_taproot_to_remote_spend_info(&context.secp_ctx, &holder_pubkeys.payment_point)
+				.map_err(|_| {
+				ChannelError::close("Failed to derive holder Taproot Asset output key".to_owned())
+			})?;
+		let counterparty_commitment_to_counterparty = simple_taproot_to_local_spend_info(
+			&context.secp_ctx,
+			&counterparty_commitment_keys.broadcaster_delayed_payment_key.to_public_key(),
+			&counterparty_commitment_keys.revocation_key.to_public_key(),
+			parameters.holder_selected_contest_delay,
+		)
+		.map_err(|_| {
+			ChannelError::close("Failed to derive counterparty Taproot Asset output key".to_owned())
+		})?;
+
+		Ok(SimpleTaprootAssetCommitmentOutputKeys {
+			holder_commitment_to_holder: Self::simple_taproot_script_pubkey_xonly_key(
+				&holder_commitment_to_holder.script_pubkey,
+			)?,
+			holder_commitment_to_counterparty: Self::simple_taproot_script_pubkey_xonly_key(
+				&holder_commitment_to_counterparty.script_pubkey,
+			)?,
+			counterparty_commitment_to_holder: Self::simple_taproot_script_pubkey_xonly_key(
+				&counterparty_commitment_to_holder.script_pubkey,
+			)?,
+			counterparty_commitment_to_counterparty: Self::simple_taproot_script_pubkey_xonly_key(
+				&counterparty_commitment_to_counterparty.script_pubkey,
+			)?,
+		})
+	}
+
 	#[cfg(any(test, feature = "_externalize_tests"))]
 	pub fn is_unfunded_v1(&self) -> bool {
 		matches!(
@@ -2916,6 +3154,19 @@ impl FundingScope {
 			splice_parent_funding_txid: prev_funding.get_funding_txid(),
 			channel_type_features: channel_parameters.channel_type_features.clone(),
 			simple_taproot_tapscript_root: channel_parameters.simple_taproot_tapscript_root,
+			simple_taproot_holder_commitment_to_holder_aux_leaf_script: channel_parameters
+				.simple_taproot_holder_commitment_to_holder_aux_leaf_script
+				.clone(),
+			simple_taproot_holder_commitment_to_counterparty_aux_leaf_script: channel_parameters
+				.simple_taproot_holder_commitment_to_counterparty_aux_leaf_script
+				.clone(),
+			simple_taproot_counterparty_commitment_to_holder_aux_leaf_script: channel_parameters
+				.simple_taproot_counterparty_commitment_to_holder_aux_leaf_script
+				.clone(),
+			simple_taproot_counterparty_commitment_to_counterparty_aux_leaf_script:
+				channel_parameters
+					.simple_taproot_counterparty_commitment_to_counterparty_aux_leaf_script
+					.clone(),
 			channel_value_satoshis: post_channel_value_sat,
 		};
 		post_channel_transaction_parameters
@@ -4216,6 +4467,10 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 				splice_parent_funding_txid: None,
 				channel_type_features: channel_type.clone(),
 				simple_taproot_tapscript_root: None,
+				simple_taproot_holder_commitment_to_holder_aux_leaf_script: None,
+				simple_taproot_holder_commitment_to_counterparty_aux_leaf_script: None,
+				simple_taproot_counterparty_commitment_to_holder_aux_leaf_script: None,
+				simple_taproot_counterparty_commitment_to_counterparty_aux_leaf_script: None,
 				channel_value_satoshis,
 			},
 			funding_transaction: None,
@@ -4551,6 +4806,10 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 				splice_parent_funding_txid: None,
 				channel_type_features: channel_type.clone(),
 				simple_taproot_tapscript_root: None,
+				simple_taproot_holder_commitment_to_holder_aux_leaf_script: None,
+				simple_taproot_holder_commitment_to_counterparty_aux_leaf_script: None,
+				simple_taproot_counterparty_commitment_to_holder_aux_leaf_script: None,
+				simple_taproot_counterparty_commitment_to_counterparty_aux_leaf_script: None,
 				// We'll add our counterparty's `funding_satoshis` when we receive `accept_channel2`.
 				channel_value_satoshis,
 			},

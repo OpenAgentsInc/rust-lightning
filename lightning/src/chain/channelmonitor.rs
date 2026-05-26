@@ -7069,6 +7069,10 @@ pub(super) fn dummy_monitor<S: EcdsaChannelSigner + 'static>(
 		splice_parent_funding_txid: None,
 		channel_type_features: ChannelTypeFeatures::only_static_remote_key(),
 		simple_taproot_tapscript_root: None,
+		simple_taproot_holder_commitment_to_holder_aux_leaf_script: None,
+		simple_taproot_holder_commitment_to_counterparty_aux_leaf_script: None,
+		simple_taproot_counterparty_commitment_to_holder_aux_leaf_script: None,
+		simple_taproot_counterparty_commitment_to_counterparty_aux_leaf_script: None,
 		channel_value_satoshis: 0,
 	};
 	let shutdown_script = crate::ln::script::ShutdownScript::new_p2wpkh_from_pubkey(dummy_key);
