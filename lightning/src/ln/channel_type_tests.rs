@@ -3,6 +3,8 @@ use crate::ln::channel::{
 	channel_type_from_open_channel, get_initial_channel_type, InboundV1Channel, OutboundV1Channel,
 };
 use crate::ln::channelmanager;
+#[cfg(feature = "simple_taproot_musig2")]
+use crate::ln::simple_taproot::Musig2PublicNonce;
 use crate::prelude::*;
 use crate::util::config::UserConfig;
 use crate::util::test_utils::{TestFeeEstimator, TestKeysInterface, TestLogger};
@@ -10,6 +12,16 @@ use bitcoin::constants::ChainHash;
 use bitcoin::network::Network;
 use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
 use lightning_types::features::{ChannelTypeFeatures, InitFeatures};
+
+#[cfg(feature = "simple_taproot_musig2")]
+fn sample_musig2_public_nonce(secp_ctx: &Secp256k1<bitcoin::secp256k1::All>) -> Musig2PublicNonce {
+	let first = PublicKey::from_secret_key(secp_ctx, &SecretKey::from_slice(&[3; 32]).unwrap());
+	let second = PublicKey::from_secret_key(secp_ctx, &SecretKey::from_slice(&[4; 32]).unwrap());
+	let mut nonce = [0; 66];
+	nonce[..33].copy_from_slice(&first.serialize());
+	nonce[33..].copy_from_slice(&second.serialize());
+	Musig2PublicNonce::from_bytes(nonce).unwrap()
+}
 
 #[test]
 fn test_option_scid_privacy_initial() {
@@ -200,6 +212,72 @@ fn test_experimental_taproot_asset_channel_open_accepts_overlay_type() {
 		channel_type_from_open_channel(&open_channel_msg.common_fields, &supported_channel_types)
 			.unwrap();
 	assert_eq!(accepted_type, ChannelTypeFeatures::taproot_asset_single_asset());
+}
+
+#[cfg(feature = "simple_taproot_musig2")]
+#[test]
+fn test_experimental_taproot_asset_accept_channel_includes_local_nonce() {
+	let test_est = TestFeeEstimator::new(15000);
+	let feeest = LowerBoundedFeeEstimator::new(&test_est);
+	let secp_ctx = Secp256k1::new();
+	let network = Network::Testnet;
+	let keys_provider = TestKeysInterface::new(&[42; 32], network);
+	let logger = TestLogger::new();
+
+	let node_id_a =
+		PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[1; 32]).unwrap());
+	let node_id_b =
+		PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[2; 32]).unwrap());
+	let mut config = UserConfig::default();
+	config.channel_handshake_config.negotiate_taproot_asset_channels = true;
+
+	let mut channel_a = OutboundV1Channel::<&TestKeysInterface>::new(
+		&feeest,
+		&&keys_provider,
+		&&keys_provider,
+		node_id_b,
+		&channelmanager::provided_init_features(&config),
+		10000000,
+		100000,
+		42,
+		&config,
+		0,
+		42,
+		None,
+		&logger,
+		None,
+	)
+	.unwrap();
+	let mut open_channel_msg =
+		channel_a.get_open_channel(ChainHash::using_genesis_block(network), &&logger).unwrap();
+	open_channel_msg.common_fields.channel_type =
+		Some(ChannelTypeFeatures::taproot_asset_single_asset());
+	open_channel_msg.common_fields.simple_taproot_next_local_nonce =
+		Some(sample_musig2_public_nonce(&secp_ctx));
+
+	let mut init_features = InitFeatures::empty();
+	init_features.set_static_remote_key_optional();
+	init_features.set_simple_taproot_staging_optional();
+	init_features.set_taproot_asset_channel_optional();
+	let supported_channel_types = ChannelTypeFeatures::from_init(&init_features);
+
+	let mut channel_b = InboundV1Channel::<&TestKeysInterface>::new(
+		&feeest,
+		&&keys_provider,
+		&&keys_provider,
+		node_id_a,
+		&supported_channel_types,
+		&init_features,
+		&open_channel_msg,
+		7,
+		&config,
+		0,
+		&&logger,
+		None,
+	)
+	.unwrap();
+	let accept_channel_msg = channel_b.get_accept_channel_message(&&logger).unwrap();
+	assert!(accept_channel_msg.common_fields.simple_taproot_next_local_nonce.is_some());
 }
 
 fn do_test_get_initial_channel_type<F1, F2>(

@@ -1192,6 +1192,7 @@ impl ChannelTransactionParameters {
 		let p = self.counterparty_parameters.as_ref()?;
 		if self.channel_type_features.requires_simple_taproot()
 			|| self.channel_type_features.requires_simple_taproot_staging()
+			|| self.channel_type_features.requires_taproot_asset_channel()
 		{
 			#[cfg(feature = "simple_taproot_musig2")]
 			{

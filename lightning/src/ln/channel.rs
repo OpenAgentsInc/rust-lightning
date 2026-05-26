@@ -3544,6 +3544,8 @@ pub(super) struct ChannelContext<SP: SignerProvider> {
 
 	/// Simple-taproot MuSig2 nonce uses already consumed by the holder signer.
 	simple_taproot_nonce_state: SimpleTaprootNonceState,
+	/// Counterparty local nonce advertised during simple-taproot channel establishment.
+	simple_taproot_counterparty_initial_local_nonce: Option<Musig2PublicNonce>,
 	/// Counterparty next-local public nonces by funding transaction.
 	simple_taproot_counterparty_next_local_nonces: SimpleTaprootNonceEntries,
 	/// Sent commitment partial signatures retained for reconnect retransmission.
@@ -3643,7 +3645,8 @@ trait InitialRemoteCommitmentReceiver<SP: SignerProvider> {
 
 	#[rustfmt::skip]
 	fn check_counterparty_commitment_signature<L: Logger>(
-		&self, sig: &Signature, holder_commitment_point: &HolderCommitmentPoint, logger: &L
+		&self, sig: &Signature, simple_taproot_partial_signature_with_nonce: Option<&SimpleTaprootPartialSignatureWithNonce>,
+		holder_commitment_point: &HolderCommitmentPoint, logger: &L
 	) -> Result<CommitmentTransaction, ChannelError> {
 		let funding_script = self.funding().get_funding_redeemscript();
 
@@ -3653,6 +3656,15 @@ trait InitialRemoteCommitmentReceiver<SP: SignerProvider> {
 		let initial_commitment_tx = commitment_data.tx;
 		let trusted_tx = initial_commitment_tx.trust();
 		let initial_commitment_bitcoin_tx = trusted_tx.built_transaction();
+		self.context().simple_taproot_validate_commitment_partial(
+			self.funding(),
+			holder_commitment_point.next_transaction_number(),
+			&initial_commitment_bitcoin_tx.transaction,
+			simple_taproot_partial_signature_with_nonce,
+		)?;
+		if ChannelContext::<SP>::is_simple_taproot_funding(self.funding()) {
+			return Ok(initial_commitment_tx);
+		}
 		let sighash = initial_commitment_bitcoin_tx.get_sighash_all(&funding_script, self.funding().get_value_satoshis());
 		// They sign the holder commitment transaction...
 		log_trace!(logger, "Checking {} tx signature {} by key {} against tx {} (sighash {}) with redeemscript {} for channel {}.",
@@ -3666,10 +3678,12 @@ trait InitialRemoteCommitmentReceiver<SP: SignerProvider> {
 
 	#[rustfmt::skip]
 	fn initial_commitment_signed<L: Logger>(
-		&mut self, channel_id: ChannelId, counterparty_signature: Signature, holder_commitment_point: &mut HolderCommitmentPoint,
+		&mut self, channel_id: ChannelId, counterparty_signature: Signature,
+		simple_taproot_partial_signature_with_nonce: Option<&SimpleTaprootPartialSignatureWithNonce>,
+		holder_commitment_point: &mut HolderCommitmentPoint,
 		best_block: BlockLocator, signer_provider: &SP, logger: &L,
 	) -> Result<(ChannelMonitor<SP::EcdsaSigner>, CommitmentTransaction), ChannelError> {
-		let initial_commitment_tx = match self.check_counterparty_commitment_signature(&counterparty_signature, holder_commitment_point, logger) {
+		let initial_commitment_tx = match self.check_counterparty_commitment_signature(&counterparty_signature, simple_taproot_partial_signature_with_nonce, holder_commitment_point, logger) {
 			Ok(res) => res,
 			Err(ChannelError::Close(e)) => {
 				// TODO(dual_funding): Update for V2 established channels.
@@ -4165,6 +4179,16 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 			short_channel_id: None,
 			minimum_depth_override: None,
 		};
+		let simple_taproot_counterparty_initial_local_nonce = if channel_type
+			.requires_simple_taproot()
+			|| channel_type.requires_simple_taproot_staging()
+			|| channel_type.requires_taproot_asset_channel()
+		{
+			open_channel_fields.simple_taproot_next_local_nonce
+		} else {
+			None
+		};
+
 		let channel_context = ChannelContext {
 			user_id,
 
@@ -4280,6 +4304,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 			workaround_lnd_bug_4006: None,
 			funding_locked_txid_sent_in_reestablish: None,
 			simple_taproot_nonce_state: SimpleTaprootNonceState::new(),
+			simple_taproot_counterparty_initial_local_nonce,
 			simple_taproot_counterparty_next_local_nonces: SimpleTaprootNonceEntries::default(),
 			simple_taproot_sent_commitment_signatures:
 				SimpleTaprootSentCommitmentSignatures::default(),
@@ -4599,6 +4624,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 			workaround_lnd_bug_4006: None,
 			funding_locked_txid_sent_in_reestablish: None,
 			simple_taproot_nonce_state: SimpleTaprootNonceState::new(),
+			simple_taproot_counterparty_initial_local_nonce: None,
 			simple_taproot_counterparty_next_local_nonces: SimpleTaprootNonceEntries::default(),
 			simple_taproot_sent_commitment_signatures:
 				SimpleTaprootSentCommitmentSignatures::default(),
@@ -5084,6 +5110,10 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 				selected_contest_delay: common_fields.to_self_delay,
 				pubkeys: counterparty_pubkeys,
 			});
+		if Self::is_simple_taproot_funding(funding) {
+			self.simple_taproot_counterparty_initial_local_nonce =
+				common_fields.simple_taproot_next_local_nonce;
+		}
 
 		self.counterparty_next_commitment_point = Some(common_fields.first_per_commitment_point);
 		self.counterparty_shutdown_scriptpubkey = counterparty_shutdown_scriptpubkey;
@@ -5737,12 +5767,23 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 	fn is_simple_taproot_funding(funding: &FundingScope) -> bool {
 		funding.get_channel_type().requires_simple_taproot()
 			|| funding.get_channel_type().requires_simple_taproot_staging()
+			|| funding.get_channel_type().requires_taproot_asset_channel()
 	}
 
 	fn simple_taproot_funding_txid(funding: &FundingScope) -> Result<Txid, ChannelError> {
 		funding.get_funding_txid().ok_or_else(|| {
 			ChannelError::close("Missing funding txid for simple-taproot nonce state".to_owned())
 		})
+	}
+
+	fn simple_taproot_initial_nonce_txid(&self) -> Result<Txid, ChannelError> {
+		self.temporary_channel_id.map(|channel_id| Txid::from_byte_array(channel_id.0)).ok_or_else(
+			|| {
+				ChannelError::close(
+					"Missing temporary channel id for simple-taproot initial nonce".to_owned(),
+				)
+			},
+		)
 	}
 
 	#[cfg(feature = "simple_taproot_musig2")]
@@ -5965,6 +6006,46 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 	}
 
 	#[cfg(feature = "simple_taproot_musig2")]
+	fn simple_taproot_initial_local_public_nonce(
+		&self, funding: &FundingScope, nonce_index: u64,
+	) -> Result<Option<Musig2PublicNonce>, ChannelError> {
+		if !Self::is_simple_taproot_funding(funding) {
+			return Ok(None);
+		}
+		let nonce_txid = self.simple_taproot_initial_nonce_txid()?;
+		self.holder_signer
+			.simple_taproot_musig_counter_nonce_pair(
+				*funding.counterparty_funding_pubkey(),
+				nonce_txid,
+				nonce_index,
+				SimpleTaprootNonceScope::Commitment,
+				SIMPLE_TAPROOT_COMMITMENT_NONCE_PREIMAGE,
+				funding.channel_transaction_parameters.splice_parent_funding_txid,
+				&self.secp_ctx,
+			)
+			.map(|nonce_pair| Some(nonce_pair.public_nonce))
+			.map_err(|err| {
+				ChannelError::close(format!(
+					"Failed to derive simple-taproot initial nonce: {:?}",
+					err
+				))
+			})
+	}
+
+	#[cfg(not(feature = "simple_taproot_musig2"))]
+	fn simple_taproot_initial_local_public_nonce(
+		&self, funding: &FundingScope, _nonce_index: u64,
+	) -> Result<Option<Musig2PublicNonce>, ChannelError> {
+		if Self::is_simple_taproot_funding(funding) {
+			return Err(ChannelError::close(
+				"simple_taproot_musig2 feature is required for simple-taproot channel signing"
+					.to_owned(),
+			));
+		}
+		Ok(None)
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
 	fn simple_taproot_local_public_nonce(
 		&self, funding: &FundingScope, nonce_index: u64,
 	) -> Result<Option<Musig2PublicNonce>, ChannelError> {
@@ -6018,14 +6099,21 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 			return Ok(Some(signature));
 		}
 
-		let counterparty_public_nonce = self
-			.simple_taproot_counterparty_next_local_nonces
-			.get(funding_txid)
-			.ok_or_else(|| {
+		let counterparty_public_nonce = if nonce_index == INITIAL_COMMITMENT_NUMBER {
+			self.simple_taproot_counterparty_initial_local_nonce.ok_or_else(|| {
 				ChannelError::close(
-					"Missing simple-taproot counterparty next-local nonce".to_owned(),
+					"Missing simple-taproot counterparty initial local nonce".to_owned(),
 				)
-			})?;
+			})?
+		} else {
+			self.simple_taproot_counterparty_next_local_nonces.get(funding_txid).ok_or_else(
+				|| {
+					ChannelError::close(
+						"Missing simple-taproot counterparty next-local nonce".to_owned(),
+					)
+				},
+			)?
+		};
 		let local_nonce_pair = self
 			.holder_signer
 			.simple_taproot_musig_counter_nonce_pair(
@@ -6099,24 +6187,30 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 				"Peer omitted simple-taproot commitment partial signature".to_owned(),
 			)
 		})?;
-		let expected_counterparty_nonce = self
-			.simple_taproot_counterparty_next_local_nonces
-			.get(funding_txid)
-			.ok_or_else(|| {
-				ChannelError::close(
-					"Missing simple-taproot counterparty nonce for commitment validation"
-						.to_owned(),
-				)
-			})?;
-		if partial_signature_with_nonce.public_nonce != expected_counterparty_nonce {
-			return Err(ChannelError::close(
-				"Peer used a mismatched simple-taproot commitment nonce".to_owned(),
-			));
+		if nonce_index != INITIAL_COMMITMENT_NUMBER {
+			let expected_counterparty_nonce = self
+				.simple_taproot_counterparty_next_local_nonces
+				.get(funding_txid)
+				.ok_or_else(|| {
+					ChannelError::close(
+						"Missing simple-taproot counterparty nonce for commitment validation"
+							.to_owned(),
+					)
+				})?;
+			if partial_signature_with_nonce.public_nonce != expected_counterparty_nonce {
+				return Err(ChannelError::close(
+					"Peer used a mismatched simple-taproot commitment nonce".to_owned(),
+				));
+			}
 		}
-		let local_public_nonce =
-			self.simple_taproot_local_public_nonce(funding, nonce_index)?.ok_or_else(|| {
-				ChannelError::close("Missing simple-taproot local commitment nonce".to_owned())
-			})?;
+		let local_public_nonce = if nonce_index == INITIAL_COMMITMENT_NUMBER {
+			self.simple_taproot_initial_local_public_nonce(funding, nonce_index)?
+		} else {
+			self.simple_taproot_local_public_nonce(funding, nonce_index)?
+		}
+		.ok_or_else(|| {
+			ChannelError::close("Missing simple-taproot local commitment nonce".to_owned())
+		})?;
 		let public_nonces = [local_public_nonce, partial_signature_with_nonce.public_nonce];
 		let message = Self::simple_taproot_commitment_sighash(funding, transaction)?;
 		let key_agg_ctx = self
@@ -6192,23 +6286,26 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 				msg.simple_taproot_partial_signature_with_nonce.as_ref(),
 			)?;
 
-			let sighash = bitcoin_tx.get_sighash_all(&funding_script, funding.get_value_satoshis());
+			if !ChannelContext::<SP>::is_simple_taproot_funding(funding) {
+				let sighash =
+					bitcoin_tx.get_sighash_all(&funding_script, funding.get_value_satoshis());
 
-			log_trace!(logger, "Checking commitment tx signature {} by key {} against tx {} (sighash {}) with redeemscript {} in channel {}",
-				log_bytes!(msg.signature.serialize_compact()[..]),
-				log_bytes!(funding.counterparty_funding_pubkey().serialize()),
-				encode::serialize_hex(&bitcoin_tx.transaction),
-				log_bytes!(sighash[..]), encode::serialize_hex(&funding_script),
-				&self.channel_id(),
-			);
-			if let Err(_) = self.secp_ctx.verify_ecdsa(
-				&sighash,
-				&msg.signature,
-				&funding.counterparty_funding_pubkey(),
-			) {
-				return Err(ChannelError::close(
-					"Invalid commitment tx signature from peer".to_owned(),
-				));
+				log_trace!(logger, "Checking commitment tx signature {} by key {} against tx {} (sighash {}) with redeemscript {} in channel {}",
+					log_bytes!(msg.signature.serialize_compact()[..]),
+					log_bytes!(funding.counterparty_funding_pubkey().serialize()),
+					encode::serialize_hex(&bitcoin_tx.transaction),
+					log_bytes!(sighash[..]), encode::serialize_hex(&funding_script),
+					&self.channel_id(),
+				);
+				if let Err(_) = self.secp_ctx.verify_ecdsa(
+					&sighash,
+					&msg.signature,
+					&funding.counterparty_funding_pubkey(),
+				) {
+					return Err(ChannelError::close(
+						"Invalid commitment tx signature from peer".to_owned(),
+					));
+				}
 			}
 			bitcoin_tx.txid
 		};
@@ -7027,7 +7124,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 	/// Only allowed after [`FundingScope::channel_transaction_parameters`] is set.
 	#[rustfmt::skip]
 	fn get_funding_signed_msg<L: Logger>(
-		&mut self, channel_parameters: &ChannelTransactionParameters, logger: &L,
+		&mut self, funding: &FundingScope, logger: &L,
 		counterparty_initial_commitment_tx: CommitmentTransaction,
 	) -> Option<msgs::FundingSigned> {
 		let counterparty_trusted_tx = counterparty_initial_commitment_tx.trust();
@@ -7039,7 +7136,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 		let signature = self
 			.holder_signer
 			.sign_counterparty_commitment(
-				channel_parameters,
+				&funding.channel_transaction_parameters,
 				&counterparty_initial_commitment_tx,
 				Vec::new(),
 				Vec::new(),
@@ -7055,10 +7152,24 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 			self.signer_pending_funding = true;
 		}
 
+		let simple_taproot_partial_signature_with_nonce = match self
+			.simple_taproot_sign_commitment_partial(
+				funding,
+				self.counterparty_next_commitment_transaction_number,
+				&counterparty_initial_bitcoin_tx.transaction,
+			) {
+			Ok(partial_signature) => partial_signature,
+			Err(err) => {
+				log_trace!(logger, "Counterparty commitment simple-taproot signature not available for funding_signed message: {}", err);
+				self.signer_pending_funding = true;
+				return None;
+			},
+		};
+
 		signature.map(|(signature, _)| msgs::FundingSigned {
 			channel_id: self.channel_id(),
 			signature,
-			simple_taproot_partial_signature_with_nonce: None,
+			simple_taproot_partial_signature_with_nonce,
 		})
 	}
 
@@ -8972,6 +9083,7 @@ where
 		let (channel_monitor, _) = self.initial_commitment_signed(
 			self.context.channel_id(),
 			msg.signature,
+			msg.simple_taproot_partial_signature_with_nonce.as_ref(),
 			holder_commitment_point,
 			best_block,
 			signer_provider,
@@ -10685,7 +10797,7 @@ where
 				self.context.counterparty_next_commitment_transaction_number + 1,
 				&self.context.counterparty_next_commitment_point.unwrap(), false, false, logger);
 			let counterparty_initial_commitment_tx = commitment_data.tx;
-			self.context.get_funding_signed_msg(&self.funding.channel_transaction_parameters, logger, counterparty_initial_commitment_tx)
+			self.context.get_funding_signed_msg(&self.funding, logger, counterparty_initial_commitment_tx)
 		} else { None };
 
 		let funding_commit_sig = if self.context.signer_pending_funding
@@ -16091,12 +16203,25 @@ impl<SP: SignerProvider> OutboundV1Channel<SP> {
 			self.context.signer_pending_funding = true;
 		};
 
+		let simple_taproot_partial_signature_with_nonce = match self.context.simple_taproot_sign_commitment_partial(
+			&self.funding,
+			self.context.counterparty_next_commitment_transaction_number,
+			&counterparty_initial_commitment_tx.trust().built_transaction().transaction,
+		) {
+			Ok(partial_signature) => partial_signature,
+			Err(err) => {
+				log_trace!(logger, "funding_created awaiting simple-taproot signature: {}", err);
+				self.context.signer_pending_funding = true;
+				return None;
+			},
+		};
+
 		signature.map(|signature| msgs::FundingCreated {
 			temporary_channel_id: self.context.temporary_channel_id.unwrap(),
 			funding_txid: self.funding.channel_transaction_parameters.funding_outpoint.as_ref().unwrap().txid,
 			funding_output_index: self.funding.channel_transaction_parameters.funding_outpoint.as_ref().unwrap().index,
 			signature,
-			simple_taproot_partial_signature_with_nonce: None,
+			simple_taproot_partial_signature_with_nonce,
 		})
 	}
 
@@ -16268,6 +16393,7 @@ impl<SP: SignerProvider> OutboundV1Channel<SP> {
 		let (channel_monitor, _) = match self.initial_commitment_signed(
 			self.context.channel_id(),
 			msg.signature,
+			msg.simple_taproot_partial_signature_with_nonce.as_ref(),
 			&mut holder_commitment_point,
 			best_block,
 			signer_provider,
@@ -16509,6 +16635,17 @@ impl<SP: SignerProvider> InboundV1Channel<SP> {
 			}
 		};
 		let keys = self.funding.get_holder_pubkeys();
+		let simple_taproot_next_local_nonce = match self.context.simple_taproot_initial_local_public_nonce(
+			&self.funding,
+			self.unfunded_context.transaction_number(),
+		) {
+			Ok(nonce) => nonce,
+			Err(err) => {
+				log_trace!(_logger, "Unable to generate accept_channel message, waiting for simple-taproot nonce: {}", err);
+				self.signer_pending_accept_channel = true;
+				return None;
+			},
+		};
 
 		Some(msgs::AcceptChannel {
 			common_fields: msgs::CommonAcceptChannelFields {
@@ -16530,7 +16667,7 @@ impl<SP: SignerProvider> InboundV1Channel<SP> {
 					None => Builder::new().into_script(),
 				}),
 				channel_type: Some(self.funding.get_channel_type().clone()),
-				simple_taproot_next_local_nonce: None,
+				simple_taproot_next_local_nonce,
 			},
 			channel_reserve_satoshis: self.funding.holder_selected_channel_reserve_satoshis,
 		})
@@ -16588,6 +16725,7 @@ impl<SP: SignerProvider> InboundV1Channel<SP> {
 			.initial_commitment_signed(
 				ChannelId::v1_from_funding_outpoint(funding_txo),
 				msg.signature,
+				msg.simple_taproot_partial_signature_with_nonce.as_ref(),
 				&mut holder_commitment_point,
 				best_block,
 				signer_provider,
@@ -16598,7 +16736,7 @@ impl<SP: SignerProvider> InboundV1Channel<SP> {
 		};
 
 		let funding_signed = self.context.get_funding_signed_msg(
-			&self.funding.channel_transaction_parameters,
+			&self.funding,
 			logger,
 			counterparty_initial_commitment_tx,
 		);
@@ -17529,6 +17667,8 @@ impl<SP: SignerProvider> Writeable for FundedChannel<SP> {
 		let simple_taproot_nonce_state =
 			(!self.context.simple_taproot_nonce_state.used_nonces().is_empty())
 				.then_some(&self.context.simple_taproot_nonce_state);
+		let simple_taproot_counterparty_initial_local_nonce =
+			self.context.simple_taproot_counterparty_initial_local_nonce.as_ref();
 		let simple_taproot_counterparty_next_local_nonces =
 			(!self.context.simple_taproot_counterparty_next_local_nonces.is_empty())
 				.then_some(&self.context.simple_taproot_counterparty_next_local_nonces);
@@ -17604,6 +17744,7 @@ impl<SP: SignerProvider> Writeable for FundedChannel<SP> {
 			(87, simple_taproot_local_closee_nonce_index, option),
 			(89, self.context.simple_taproot_counterparty_closee_nonce, option),
 			(91, self.context.simple_taproot_sent_closing_complete, option),
+			(93, simple_taproot_counterparty_initial_local_nonce, option),
 		});
 
 		Ok(())
@@ -17994,6 +18135,7 @@ impl<'a, 'b, 'c, ES: EntropySource, SP: SignerProvider>
 
 		let mut monitor_pending_tx_signatures: Option<()> = None;
 		let mut simple_taproot_nonce_state: Option<SimpleTaprootNonceState> = None;
+		let mut simple_taproot_counterparty_initial_local_nonce: Option<Musig2PublicNonce> = None;
 		let mut simple_taproot_counterparty_next_local_nonces: Option<SimpleTaprootNonceEntries> =
 			None;
 		let mut simple_taproot_sent_commitment_signatures: Option<
@@ -18064,6 +18206,7 @@ impl<'a, 'b, 'c, ES: EntropySource, SP: SignerProvider>
 			(87, simple_taproot_local_closee_nonce_index, option),
 			(89, simple_taproot_counterparty_closee_nonce, option),
 			(91, simple_taproot_sent_closing_complete, option),
+			(93, simple_taproot_counterparty_initial_local_nonce, option),
 		});
 
 		let holder_signer = signer_provider.derive_channel_signer(channel_keys_id);
@@ -18499,6 +18642,7 @@ impl<'a, 'b, 'c, ES: EntropySource, SP: SignerProvider>
 				workaround_lnd_bug_4006: None,
 				funding_locked_txid_sent_in_reestablish: None,
 				simple_taproot_nonce_state: simple_taproot_nonce_state.unwrap_or_default(),
+				simple_taproot_counterparty_initial_local_nonce,
 				simple_taproot_counterparty_next_local_nonces:
 					simple_taproot_counterparty_next_local_nonces.unwrap_or_default(),
 				simple_taproot_sent_commitment_signatures:
