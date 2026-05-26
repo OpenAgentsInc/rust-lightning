@@ -79,6 +79,10 @@ pub const SIMPLE_TAPROOT_COMMITMENT_NONCE_PREIMAGE: &[u8] =
 /// counterparty's commitment transaction.
 pub const SIMPLE_TAPROOT_COUNTERPARTY_COMMITMENT_NONCE_PREIMAGE: &[u8] =
 	b"ldk-simple-taproot-counterparty-commitment-nonce-v1";
+/// Domain-separated message for deterministic closee nonces advertised in
+/// simple-taproot `shutdown` and `closing_sig` messages.
+pub const SIMPLE_TAPROOT_COOPERATIVE_CLOSE_NONCE_PREIMAGE: &[u8] =
+	b"ldk-simple-taproot-cooperative-close-nonce-v1";
 /// BOLT simple-taproot NUMS point used for script-only commitment outputs.
 #[cfg(feature = "simple_taproot_musig2")]
 pub const SIMPLE_TAPROOT_NUMS_POINT_BYTES: [u8; 33] = [
@@ -297,6 +301,126 @@ pub struct SimpleTaprootSentCommitmentSignature {
 	pub partial_signature_with_nonce: SimpleTaprootPartialSignatureWithNonce,
 }
 
+/// The output set signed by a simple-taproot cooperative-close partial
+/// signature.
+#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
+pub enum SimpleTaprootClosingOutputSet {
+	/// The closing transaction contains only the closer's output.
+	CloserOutputOnly,
+	/// The closing transaction contains only the closee's output.
+	CloseeOutputOnly,
+	/// The closing transaction contains both closer and closee outputs.
+	CloserAndCloseeOutputs,
+}
+
+impl SimpleTaprootClosingOutputSet {
+	/// Returns the nonce scope used for the closer-side JIT nonce for this
+	/// output set.
+	pub fn closer_nonce_scope(self) -> SimpleTaprootNonceScope {
+		match self {
+			Self::CloserOutputOnly => SimpleTaprootNonceScope::CooperativeCloseCloserOutputOnly,
+			Self::CloseeOutputOnly => SimpleTaprootNonceScope::CooperativeCloseCloseeOutputOnly,
+			Self::CloserAndCloseeOutputs => {
+				SimpleTaprootNonceScope::CooperativeCloseCloserAndCloseeOutputs
+			},
+		}
+	}
+
+	fn wire_value(self) -> u8 {
+		match self {
+			Self::CloserOutputOnly => 0,
+			Self::CloseeOutputOnly => 1,
+			Self::CloserAndCloseeOutputs => 2,
+		}
+	}
+
+	fn from_wire_value(value: u8) -> Result<Self, DecodeError> {
+		match value {
+			0 => Ok(Self::CloserOutputOnly),
+			1 => Ok(Self::CloseeOutputOnly),
+			2 => Ok(Self::CloserAndCloseeOutputs),
+			_ => Err(DecodeError::InvalidValue),
+		}
+	}
+}
+
+impl Writeable for SimpleTaprootClosingOutputSet {
+	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), io::Error> {
+		self.wire_value().write(writer)
+	}
+}
+
+impl Readable for SimpleTaprootClosingOutputSet {
+	fn read<R: Read>(reader: &mut R) -> Result<Self, DecodeError> {
+		Self::from_wire_value(Readable::read(reader)?)
+	}
+}
+
+/// Restart-persisted counterparty closee nonce state for simple-taproot
+/// cooperative closes.
+#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
+pub struct SimpleTaprootCloseeNonceState {
+	/// The locally assigned close attempt index for this peer nonce.
+	pub nonce_index: u64,
+	/// The peer's closee public nonce for that attempt.
+	pub public_nonce: Musig2PublicNonce,
+}
+
+impl Writeable for SimpleTaprootCloseeNonceState {
+	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), io::Error> {
+		self.nonce_index.write(writer)?;
+		self.public_nonce.write(writer)
+	}
+}
+
+impl Readable for SimpleTaprootCloseeNonceState {
+	fn read<R: Read>(reader: &mut R) -> Result<Self, DecodeError> {
+		Ok(Self { nonce_index: Readable::read(reader)?, public_nonce: Readable::read(reader)? })
+	}
+}
+
+/// Restart-persisted simple-taproot `closing_complete` data needed to validate
+/// a returned `closing_sig` without reusing a MuSig2 nonce.
+#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
+pub struct SimpleTaprootSentClosingComplete {
+	/// Funding transaction ID for the cooperative-close transaction.
+	pub funding_txid: Txid,
+	/// Close attempt index used for both closer and closee nonces.
+	pub nonce_index: u64,
+	/// Output set signed in this close attempt.
+	pub output_set: SimpleTaprootClosingOutputSet,
+	/// Proposed total fee in satoshis.
+	pub fee_satoshis: u64,
+	/// Closing transaction locktime.
+	pub locktime: u32,
+	/// The partial signature and public nonce that were sent.
+	pub partial_signature_with_nonce: SimpleTaprootPartialSignatureWithNonce,
+}
+
+impl Writeable for SimpleTaprootSentClosingComplete {
+	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), io::Error> {
+		self.funding_txid.write(writer)?;
+		self.nonce_index.write(writer)?;
+		self.output_set.write(writer)?;
+		self.fee_satoshis.write(writer)?;
+		self.locktime.write(writer)?;
+		self.partial_signature_with_nonce.write(writer)
+	}
+}
+
+impl Readable for SimpleTaprootSentClosingComplete {
+	fn read<R: Read>(reader: &mut R) -> Result<Self, DecodeError> {
+		Ok(Self {
+			funding_txid: Readable::read(reader)?,
+			nonce_index: Readable::read(reader)?,
+			output_set: Readable::read(reader)?,
+			fee_satoshis: Readable::read(reader)?,
+			locktime: Readable::read(reader)?,
+			partial_signature_with_nonce: Readable::read(reader)?,
+		})
+	}
+}
+
 impl Writeable for SimpleTaprootSentCommitmentSignature {
 	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), io::Error> {
 		self.funding_txid.write(writer)?;
@@ -473,10 +597,18 @@ pub enum SimpleTaprootNonceScope {
 	Commitment,
 	/// A nonce consumed while signing a counterparty commitment transaction.
 	CounterpartyCommitment,
-	/// A cooperative-close signature nonce.
+	/// Legacy cooperative-close nonce domain retained for old persisted data.
 	CooperativeClose,
 	/// A force-close signature nonce.
 	ForceClose,
+	/// A closee nonce advertised before the exact close transaction is known.
+	CooperativeCloseClosee,
+	/// A closer nonce signing a transaction with only the closer output.
+	CooperativeCloseCloserOutputOnly,
+	/// A closer nonce signing a transaction with only the closee output.
+	CooperativeCloseCloseeOutputOnly,
+	/// A closer nonce signing a transaction with both closer and closee outputs.
+	CooperativeCloseCloserAndCloseeOutputs,
 }
 
 impl SimpleTaprootNonceScope {
@@ -486,6 +618,10 @@ impl SimpleTaprootNonceScope {
 			Self::CounterpartyCommitment => 1,
 			Self::CooperativeClose => 2,
 			Self::ForceClose => 3,
+			Self::CooperativeCloseClosee => 4,
+			Self::CooperativeCloseCloserOutputOnly => 5,
+			Self::CooperativeCloseCloseeOutputOnly => 6,
+			Self::CooperativeCloseCloserAndCloseeOutputs => 7,
 		}
 	}
 
@@ -495,6 +631,10 @@ impl SimpleTaprootNonceScope {
 			1 => Ok(Self::CounterpartyCommitment),
 			2 => Ok(Self::CooperativeClose),
 			3 => Ok(Self::ForceClose),
+			4 => Ok(Self::CooperativeCloseClosee),
+			5 => Ok(Self::CooperativeCloseCloserOutputOnly),
+			6 => Ok(Self::CooperativeCloseCloseeOutputOnly),
+			7 => Ok(Self::CooperativeCloseCloserAndCloseeOutputs),
 			_ => Err(DecodeError::InvalidValue),
 		}
 	}
@@ -1468,6 +1608,16 @@ mod tests {
 		);
 		let close_use =
 			SimpleTaprootNonceUse::new(funding_txid, 11, SimpleTaprootNonceScope::CooperativeClose);
+		let closee_use = SimpleTaprootNonceUse::new(
+			funding_txid,
+			11,
+			SimpleTaprootNonceScope::CooperativeCloseClosee,
+		);
+		let close_both_outputs_use = SimpleTaprootNonceUse::new(
+			funding_txid,
+			11,
+			SimpleTaprootNonceScope::CooperativeCloseCloserAndCloseeOutputs,
+		);
 		let force_close_use =
 			SimpleTaprootNonceUse::new(funding_txid, 11, SimpleTaprootNonceScope::ForceClose);
 
@@ -1480,6 +1630,10 @@ mod tests {
 		);
 		let close_nonce_seed =
 			derive_simple_taproot_counter_nonce_seed(&commitment_seed, &close_use);
+		let closee_nonce_seed =
+			derive_simple_taproot_counter_nonce_seed(&commitment_seed, &closee_use);
+		let close_both_outputs_nonce_seed =
+			derive_simple_taproot_counter_nonce_seed(&commitment_seed, &close_both_outputs_use);
 		let force_close_nonce_seed =
 			derive_simple_taproot_counter_nonce_seed(&commitment_seed, &force_close_use);
 		assert_ne!(commitment_nonce_seed, counterparty_commitment_nonce_seed);
@@ -1488,6 +1642,9 @@ mod tests {
 		assert_ne!(counterparty_commitment_nonce_seed, close_nonce_seed);
 		assert_ne!(counterparty_commitment_nonce_seed, force_close_nonce_seed);
 		assert_ne!(close_nonce_seed, force_close_nonce_seed);
+		assert_ne!(close_nonce_seed, closee_nonce_seed);
+		assert_ne!(closee_nonce_seed, close_both_outputs_nonce_seed);
+		assert_ne!(close_both_outputs_nonce_seed, force_close_nonce_seed);
 
 		let jit_nonce_seed = derive_simple_taproot_jit_nonce_seed(&[13; 32], &commitment_use);
 		assert_ne!(commitment_nonce_seed, jit_nonce_seed);

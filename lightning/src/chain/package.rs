@@ -98,6 +98,11 @@ pub(crate) fn verify_channel_type_features(channel_type_features: &Option<Channe
 		supported_feature_set.set_scid_privacy_required();
 		supported_feature_set.set_zero_conf_required();
 		supported_feature_set.set_anchor_zero_fee_commitments_required();
+		#[cfg(feature = "simple_taproot_musig2")]
+		{
+			supported_feature_set.set_simple_taproot_required();
+			supported_feature_set.set_simple_taproot_staging_required();
+		}
 
 		// allow the passing of an additional necessary permitted flag
 		if let Some(additional_permitted_features) = additional_permitted_features {

@@ -40,6 +40,67 @@ use bitcoin::{Transaction, TxOut, WitnessProgram, WitnessVersion};
 
 use crate::ln::functional_test_utils::*;
 
+#[cfg(all(simple_close, feature = "simple_taproot_musig2"))]
+#[test]
+#[ignore = "requires #69 simple-taproot commitment output accounting before functional channel open can round-trip monitors"]
+fn simple_taproot_cooperative_close_uses_closing_complete_and_sig() {
+	let mut simple_taproot_config = UserConfig::default();
+	simple_taproot_config.channel_handshake_config.negotiate_simple_taproot_channels = true;
+
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(
+		2,
+		&node_cfgs,
+		&[Some(simple_taproot_config.clone()), Some(simple_taproot_config)],
+	);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node.get_our_node_id();
+	let (_, funding_tx) =
+		create_unannounced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 100_000_000);
+	let chan_id = nodes[0].node.list_channels()[0].channel_id;
+
+	nodes[0].node.close_channel(&chan_id, &node_b_id).unwrap();
+	let node_0_shutdown = get_event_msg!(nodes[0], MessageSendEvent::SendShutdown, node_b_id);
+	assert!(node_0_shutdown.simple_taproot_shutdown_nonce.is_some());
+	nodes[1].node.handle_shutdown(node_a_id, &node_0_shutdown);
+	let node_1_shutdown = get_event_msg!(nodes[1], MessageSendEvent::SendShutdown, node_a_id);
+	assert!(node_1_shutdown.simple_taproot_shutdown_nonce.is_some());
+	nodes[0].node.handle_shutdown(node_b_id, &node_1_shutdown);
+
+	let node_0_closing_complete =
+		get_event_msg!(nodes[0], MessageSendEvent::SendClosingComplete, node_b_id);
+	assert!(node_0_closing_complete.simple_taproot_closer_and_closee_outputs.is_some());
+	nodes[1].node.handle_closing_complete(node_a_id, node_0_closing_complete);
+	let node_1_closing_sig = get_event_msg!(nodes[1], MessageSendEvent::SendClosingSig, node_a_id);
+	assert!(node_1_closing_sig.simple_taproot_closer_and_closee_outputs.is_some());
+	assert!(node_1_closing_sig.simple_taproot_next_closee_nonce.is_some());
+	assert_eq!(nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap().len(), 1);
+	let node_1_tx = nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap().remove(0);
+
+	nodes[0].node.handle_closing_sig(node_b_id, node_1_closing_sig);
+	assert_eq!(nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap().len(), 1);
+	let node_0_tx = nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap().remove(0);
+	assert_eq!(node_0_tx, node_1_tx);
+	check_spends!(node_0_tx, funding_tx);
+
+	check_closed_event(
+		&nodes[0],
+		1,
+		ClosureReason::LocallyInitiatedCooperativeClosure,
+		&[node_b_id],
+		1_000_000,
+	);
+	check_closed_event(
+		&nodes[1],
+		1,
+		ClosureReason::CounterpartyInitiatedCooperativeClosure,
+		&[node_a_id],
+		1_000_000,
+	);
+}
+
 #[test]
 fn pre_funding_lock_shutdown_test() {
 	// Test sending a shutdown prior to channel_ready after funding generation

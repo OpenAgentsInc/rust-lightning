@@ -22,6 +22,8 @@ use bitcoin::hashes::sha256d::Hash as Sha256d;
 use bitcoin::hashes::Hash;
 
 use bitcoin::secp256k1::constants::PUBLIC_KEY_SIZE;
+#[cfg(simple_close)]
+use bitcoin::secp256k1::schnorr;
 use bitcoin::secp256k1::{ecdsa::Signature, Secp256k1};
 use bitcoin::secp256k1::{PublicKey, SecretKey};
 use bitcoin::{secp256k1, sighash, FeeRate, Sequence, TxIn};
@@ -68,14 +70,17 @@ use crate::ln::onion_utils::{
 };
 use crate::ln::script::{self, ShutdownScript};
 use crate::ln::simple_taproot::{
-	Musig2PublicNonce, SimpleTaprootNextLocalNonces, SimpleTaprootNonceEntries,
-	SimpleTaprootNonceEntry, SimpleTaprootNonceState, SimpleTaprootPartialSignatureWithNonce,
+	Musig2PublicNonce, SimpleTaprootCloseeNonceState, SimpleTaprootNextLocalNonces,
+	SimpleTaprootNonceEntries, SimpleTaprootNonceEntry, SimpleTaprootNonceState,
+	SimpleTaprootPartialSignatureWithNonce, SimpleTaprootSentClosingComplete,
 	SimpleTaprootSentCommitmentSignatures,
 };
+#[cfg(simple_close)]
+use crate::ln::simple_taproot::{SimpleTaprootClosingOutputSet, SimpleTaprootPartialSignature};
 #[cfg(feature = "simple_taproot_musig2")]
 use crate::ln::simple_taproot::{
-	SimpleTaprootNonceScope, SimpleTaprootSentCommitmentSignature,
-	SIMPLE_TAPROOT_COMMITMENT_NONCE_PREIMAGE,
+	SimpleTaprootNoncePair, SimpleTaprootNonceScope, SimpleTaprootSentCommitmentSignature,
+	SIMPLE_TAPROOT_COMMITMENT_NONCE_PREIMAGE, SIMPLE_TAPROOT_COOPERATIVE_CLOSE_NONCE_PREIMAGE,
 	SIMPLE_TAPROOT_COUNTERPARTY_COMMITMENT_NONCE_PREIMAGE,
 };
 use crate::ln::types::ChannelId;
@@ -3298,6 +3303,13 @@ impl<'a> From<&'a Transaction> for ConfirmedTransaction<'a> {
 	}
 }
 
+#[cfg(simple_close)]
+#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
+enum SimpleTaprootClosingRole {
+	LocalCloser,
+	CounterpartyCloser,
+}
+
 /// Contains everything about the channel including state, and various flags.
 pub(super) struct ChannelContext<SP: SignerProvider> {
 	config: LegacyChannelConfig,
@@ -3536,6 +3548,12 @@ pub(super) struct ChannelContext<SP: SignerProvider> {
 	simple_taproot_counterparty_next_local_nonces: SimpleTaprootNonceEntries,
 	/// Sent commitment partial signatures retained for reconnect retransmission.
 	simple_taproot_sent_commitment_signatures: SimpleTaprootSentCommitmentSignatures,
+	/// Locally advertised closee nonce index for simple-taproot cooperative close.
+	simple_taproot_local_closee_nonce_index: u64,
+	/// Counterparty closee nonce state for simple-taproot cooperative close.
+	simple_taproot_counterparty_closee_nonce: Option<SimpleTaprootCloseeNonceState>,
+	/// Sent `closing_complete` partial retained for returned `closing_sig` validation.
+	simple_taproot_sent_closing_complete: Option<SimpleTaprootSentClosingComplete>,
 
 	/// An option set when we wish to track how many ticks have elapsed while waiting for a response
 	/// from our counterparty after entering specific states. If the peer has yet to respond after
@@ -4265,6 +4283,9 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 			simple_taproot_counterparty_next_local_nonces: SimpleTaprootNonceEntries::default(),
 			simple_taproot_sent_commitment_signatures:
 				SimpleTaprootSentCommitmentSignatures::default(),
+			simple_taproot_local_closee_nonce_index: 0,
+			simple_taproot_counterparty_closee_nonce: None,
+			simple_taproot_sent_closing_complete: None,
 			sent_message_awaiting_response: None,
 
 			latest_inbound_scid_alias: None,
@@ -4581,6 +4602,9 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 			simple_taproot_counterparty_next_local_nonces: SimpleTaprootNonceEntries::default(),
 			simple_taproot_sent_commitment_signatures:
 				SimpleTaprootSentCommitmentSignatures::default(),
+			simple_taproot_local_closee_nonce_index: 0,
+			simple_taproot_counterparty_closee_nonce: None,
+			simple_taproot_sent_closing_complete: None,
 			sent_message_awaiting_response: None,
 
 			latest_inbound_scid_alias: None,
@@ -5738,6 +5762,152 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 				ChannelError::close("Failed to build simple-taproot commitment sighash".to_owned())
 			})?;
 		Ok(sighash.to_byte_array())
+	}
+
+	#[cfg(all(simple_close, feature = "simple_taproot_musig2"))]
+	fn simple_taproot_closing_sighash(
+		funding: &FundingScope, closing_tx: &ClosingTransaction,
+	) -> Result<[u8; 32], ChannelError> {
+		Self::simple_taproot_commitment_sighash(funding, closing_tx.trust().built_transaction())
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	fn simple_taproot_local_closee_nonce_pair(
+		&self, funding: &FundingScope, nonce_index: u64,
+	) -> Result<Option<SimpleTaprootNoncePair>, ChannelError> {
+		if !Self::is_simple_taproot_funding(funding) {
+			return Ok(None);
+		}
+		let funding_txid = Self::simple_taproot_funding_txid(funding)?;
+		self.holder_signer
+			.simple_taproot_musig_counter_nonce_pair(
+				*funding.counterparty_funding_pubkey(),
+				funding_txid,
+				nonce_index,
+				SimpleTaprootNonceScope::CooperativeCloseClosee,
+				SIMPLE_TAPROOT_COOPERATIVE_CLOSE_NONCE_PREIMAGE,
+				funding.channel_transaction_parameters.splice_parent_funding_txid,
+				&self.secp_ctx,
+			)
+			.map(Some)
+			.map_err(|_| {
+				ChannelError::close(
+					"Failed to derive simple-taproot cooperative close nonce".to_owned(),
+				)
+			})
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	fn simple_taproot_local_closee_public_nonce(
+		&self, funding: &FundingScope, nonce_index: u64,
+	) -> Result<Option<Musig2PublicNonce>, ChannelError> {
+		Ok(self
+			.simple_taproot_local_closee_nonce_pair(funding, nonce_index)?
+			.map(|nonce_pair| nonce_pair.public_nonce))
+	}
+
+	#[cfg(not(feature = "simple_taproot_musig2"))]
+	fn simple_taproot_local_closee_public_nonce(
+		&self, funding: &FundingScope, _nonce_index: u64,
+	) -> Result<Option<Musig2PublicNonce>, ChannelError> {
+		if Self::is_simple_taproot_funding(funding) {
+			return Err(ChannelError::close(
+				"simple_taproot_musig2 feature is required for simple-taproot cooperative close"
+					.to_owned(),
+			));
+		}
+		Ok(None)
+	}
+
+	fn simple_taproot_store_counterparty_closee_nonce(
+		&mut self, public_nonce: Musig2PublicNonce,
+	) -> Result<(), ChannelError> {
+		match self.simple_taproot_counterparty_closee_nonce {
+			Some(existing) if existing.public_nonce == public_nonce => Ok(()),
+			Some(_) => Err(ChannelError::close(
+				"Peer changed simple-taproot shutdown closee nonce".to_owned(),
+			)),
+			None => {
+				self.simple_taproot_counterparty_closee_nonce =
+					Some(SimpleTaprootCloseeNonceState { nonce_index: 0, public_nonce });
+				Ok(())
+			},
+		}
+	}
+
+	#[cfg(simple_close)]
+	fn simple_taproot_output_set_for_role(
+		closing_tx: &ClosingTransaction, role: SimpleTaprootClosingRole,
+	) -> Result<SimpleTaprootClosingOutputSet, ChannelError> {
+		let holder_output = closing_tx.to_holder_value_sat() > 0;
+		let counterparty_output = closing_tx.to_counterparty_value_sat() > 0;
+		let (closer_output, closee_output) = match role {
+			SimpleTaprootClosingRole::LocalCloser => (holder_output, counterparty_output),
+			SimpleTaprootClosingRole::CounterpartyCloser => (counterparty_output, holder_output),
+		};
+		match (closer_output, closee_output) {
+			(true, false) => Ok(SimpleTaprootClosingOutputSet::CloserOutputOnly),
+			(false, true) => Ok(SimpleTaprootClosingOutputSet::CloseeOutputOnly),
+			(true, true) => Ok(SimpleTaprootClosingOutputSet::CloserAndCloseeOutputs),
+			(false, false) => Err(ChannelError::close(
+				"Simple-taproot closing transaction omitted both outputs".to_owned(),
+			)),
+		}
+	}
+
+	#[cfg(simple_close)]
+	fn simple_taproot_closing_complete_partial(
+		msg: &msgs::ClosingComplete,
+	) -> Result<(SimpleTaprootClosingOutputSet, SimpleTaprootPartialSignatureWithNonce), ChannelError>
+	{
+		let fields = [
+			(
+				SimpleTaprootClosingOutputSet::CloserOutputOnly,
+				msg.simple_taproot_closer_output_only,
+			),
+			(
+				SimpleTaprootClosingOutputSet::CloseeOutputOnly,
+				msg.simple_taproot_closee_output_only,
+			),
+			(
+				SimpleTaprootClosingOutputSet::CloserAndCloseeOutputs,
+				msg.simple_taproot_closer_and_closee_outputs,
+			),
+		];
+		let mut selected = None;
+		for (output_set, partial) in fields {
+			if let Some(partial) = partial {
+				if selected.is_some() {
+					return Err(ChannelError::close(
+						"Peer sent multiple simple-taproot closing_complete signatures".to_owned(),
+					));
+				}
+				selected = Some((output_set, partial));
+			}
+		}
+		selected.ok_or_else(|| {
+			ChannelError::close("Peer omitted simple-taproot closing_complete signature".to_owned())
+		})
+	}
+
+	#[cfg(simple_close)]
+	fn simple_taproot_closing_sig_partial(
+		msg: &msgs::ClosingSig, output_set: SimpleTaprootClosingOutputSet,
+	) -> Result<SimpleTaprootPartialSignature, ChannelError> {
+		let partial = match output_set {
+			SimpleTaprootClosingOutputSet::CloserOutputOnly => {
+				msg.simple_taproot_closer_output_only
+			},
+			SimpleTaprootClosingOutputSet::CloseeOutputOnly => {
+				msg.simple_taproot_closee_output_only
+			},
+			SimpleTaprootClosingOutputSet::CloserAndCloseeOutputs => {
+				msg.simple_taproot_closer_and_closee_outputs
+			},
+		};
+		partial.ok_or_else(|| {
+			ChannelError::close("Peer omitted simple-taproot closing_sig signature".to_owned())
+		})
 	}
 
 	fn simple_taproot_store_counterparty_next_local_nonce(
@@ -7537,6 +7707,11 @@ where
 {
 	pub fn context(&self) -> &ChannelContext<SP> {
 		&self.context
+	}
+
+	#[cfg(simple_close)]
+	pub(super) fn is_simple_taproot_channel(&self) -> bool {
+		ChannelContext::<SP>::is_simple_taproot_funding(&self.funding)
 	}
 
 	fn simple_taproot_expected_funding_txids(&self) -> Result<Vec<Txid>, ChannelError> {
@@ -10854,7 +11029,14 @@ where
 			Some(msgs::Shutdown {
 				channel_id: self.context.channel_id,
 				scriptpubkey: self.get_closing_scriptpubkey(),
-				simple_taproot_shutdown_nonce: None,
+				simple_taproot_shutdown_nonce: self
+					.context
+					.simple_taproot_local_closee_public_nonce(
+						&self.funding,
+						self.context.simple_taproot_local_closee_nonce_index,
+					)
+					.ok()
+					.flatten(),
 			})
 		} else {
 			None
@@ -11387,10 +11569,53 @@ where
 		Ok(())
 	}
 
+	#[cfg(all(simple_close, feature = "simple_taproot_musig2"))]
+	pub fn maybe_propose_simple_taproot_closing_complete<ES: EntropySource, F: FeeEstimator>(
+		&mut self, fee_estimator: &LowerBoundedFeeEstimator<F>, entropy_source: &ES,
+	) -> Result<Option<msgs::ClosingComplete>, ChannelError> {
+		if !ChannelContext::<SP>::is_simple_taproot_funding(&self.funding) {
+			return Ok(None);
+		}
+		if self.context.simple_taproot_sent_closing_complete.is_some()
+			|| !self.closing_negotiation_ready()
+		{
+			return Ok(None);
+		}
+
+		if !self.funding.is_outbound() || self.context.expecting_peer_commitment_signed {
+			return Ok(None);
+		}
+
+		let (our_min_fee, our_max_fee) = self.calculate_closing_fee_limits(fee_estimator);
+		let (closing_tx, total_fee_satoshis) =
+			self.build_closing_transaction(our_min_fee, false)?;
+		if total_fee_satoshis < our_min_fee || total_fee_satoshis > our_max_fee {
+			return Err(ChannelError::close(
+				"Simple-taproot closing fee fell outside local limits".to_owned(),
+			));
+		}
+		let output_set = ChannelContext::<SP>::simple_taproot_output_set_for_role(
+			&closing_tx,
+			SimpleTaprootClosingRole::LocalCloser,
+		)?;
+		self.get_simple_taproot_closing_complete_msg(
+			&closing_tx,
+			total_fee_satoshis,
+			output_set,
+			entropy_source,
+		)
+		.map(Some)
+	}
+
 	pub fn maybe_propose_closing_signed<F: FeeEstimator, L: Logger>(
 		&mut self, fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L,
 	) -> Result<(Option<msgs::ClosingSigned>, Option<(Transaction, ShutdownResult)>), ChannelError>
 	{
+		if ChannelContext::<SP>::is_simple_taproot_funding(&self.funding) {
+			return Err(ChannelError::close(
+				"simple-taproot channels use closing_complete/closing_sig".to_owned(),
+			));
+		}
 		// If we're waiting on a monitor persistence, that implies we're also waiting to send some
 		// message to our counterparty (probably a `revoke_and_ack`). In such a case, we shouldn't
 		// initiate `closing_signed` negotiation until we're clear of all pending messages. Note
@@ -11537,6 +11762,12 @@ where
 		} else {
 			self.context.counterparty_shutdown_scriptpubkey = Some(msg.scriptpubkey.clone());
 		}
+		if ChannelContext::<SP>::is_simple_taproot_funding(&self.funding) {
+			let public_nonce = msg.simple_taproot_shutdown_nonce.ok_or_else(|| {
+				ChannelError::close("Peer omitted simple-taproot shutdown closee nonce".to_owned())
+			})?;
+			self.context.simple_taproot_store_counterparty_closee_nonce(public_nonce)?;
+		}
 
 		// If we have any LocalAnnounced updates we'll probably just get back an update_fail_htlc
 		// immediately after the commitment dance, but we can send a Shutdown because we won't send
@@ -11597,7 +11828,12 @@ where
 			Some(msgs::Shutdown {
 				channel_id: self.context.channel_id,
 				scriptpubkey: self.get_closing_scriptpubkey(),
-				simple_taproot_shutdown_nonce: None,
+				simple_taproot_shutdown_nonce: self
+					.context
+					.simple_taproot_local_closee_public_nonce(
+						&self.funding,
+						self.context.simple_taproot_local_closee_nonce_index,
+					)?,
 			})
 		} else {
 			None
@@ -11648,6 +11884,127 @@ where
 
 		tx.input[0].witness.push(self.funding.get_funding_redeemscript().into_bytes());
 		tx
+	}
+
+	#[cfg(all(simple_close, feature = "simple_taproot_musig2"))]
+	fn build_signed_simple_taproot_closing_transaction(
+		&self, closing_tx: &ClosingTransaction, sig: &schnorr::Signature,
+	) -> Transaction {
+		let mut tx = closing_tx.trust().built_transaction().clone();
+		tx.input[0].witness.push(sig.serialize().to_vec());
+		tx
+	}
+
+	#[cfg(all(simple_close, feature = "simple_taproot_musig2"))]
+	fn get_simple_taproot_closing_complete_msg<ES: EntropySource>(
+		&mut self, closing_tx: &ClosingTransaction, fee_satoshis: u64,
+		output_set: SimpleTaprootClosingOutputSet, entropy_source: &ES,
+	) -> Result<msgs::ClosingComplete, ChannelError> {
+		let funding_txid = ChannelContext::<SP>::simple_taproot_funding_txid(&self.funding)?;
+		let counterparty_closee_nonce =
+			self.context.simple_taproot_counterparty_closee_nonce.ok_or_else(|| {
+				ChannelError::close("Missing simple-taproot counterparty closee nonce".to_owned())
+			})?;
+		let message =
+			ChannelContext::<SP>::simple_taproot_closing_sighash(&self.funding, closing_tx)?;
+		let nonce_pair = self
+			.context
+			.holder_signer
+			.simple_taproot_musig_jit_nonce_pair(
+				*self.funding.counterparty_funding_pubkey(),
+				funding_txid,
+				counterparty_closee_nonce.nonce_index,
+				output_set.closer_nonce_scope(),
+				&entropy_source.get_secure_random_bytes(),
+				&message,
+				self.funding.channel_transaction_parameters.splice_parent_funding_txid,
+				&self.context.secp_ctx,
+			)
+			.map_err(|_| {
+				ChannelError::close("Failed to derive simple-taproot closer close nonce".to_owned())
+			})?;
+		let public_nonces = [nonce_pair.public_nonce, counterparty_closee_nonce.public_nonce];
+		let partial_signature_with_nonce = self
+			.context
+			.holder_signer
+			.simple_taproot_musig_sign_partial(
+				*self.funding.counterparty_funding_pubkey(),
+				nonce_pair.secret_nonce,
+				&public_nonces,
+				&message,
+				funding_txid,
+				counterparty_closee_nonce.nonce_index,
+				output_set.closer_nonce_scope(),
+				self.funding.channel_transaction_parameters.splice_parent_funding_txid,
+				&self.context.secp_ctx,
+				&mut self.context.simple_taproot_nonce_state,
+			)
+			.map_err(|_| {
+				ChannelError::close(
+					"Failed to sign simple-taproot closing_complete partial".to_owned(),
+				)
+			})?;
+		self.context.simple_taproot_sent_closing_complete =
+			Some(SimpleTaprootSentClosingComplete {
+				funding_txid,
+				nonce_index: counterparty_closee_nonce.nonce_index,
+				output_set,
+				fee_satoshis,
+				locktime: closing_tx.trust().built_transaction().lock_time.to_consensus_u32(),
+				partial_signature_with_nonce,
+			});
+		Ok(msgs::ClosingComplete {
+			channel_id: self.context.channel_id,
+			closer_scriptpubkey: self.get_closing_scriptpubkey(),
+			closee_scriptpubkey: self.context.counterparty_shutdown_scriptpubkey.clone().unwrap(),
+			fee_satoshis,
+			locktime: closing_tx.trust().built_transaction().lock_time.to_consensus_u32(),
+			closer_output_only: None,
+			closee_output_only: None,
+			closer_and_closee_outputs: None,
+			simple_taproot_closer_output_only: (output_set
+				== SimpleTaprootClosingOutputSet::CloserOutputOnly)
+				.then_some(partial_signature_with_nonce),
+			simple_taproot_closee_output_only: (output_set
+				== SimpleTaprootClosingOutputSet::CloseeOutputOnly)
+				.then_some(partial_signature_with_nonce),
+			simple_taproot_closer_and_closee_outputs: (output_set
+				== SimpleTaprootClosingOutputSet::CloserAndCloseeOutputs)
+				.then_some(partial_signature_with_nonce),
+		})
+	}
+
+	#[cfg(all(simple_close, feature = "simple_taproot_musig2"))]
+	fn aggregate_simple_taproot_closing_signature(
+		&self, closing_tx: &ClosingTransaction,
+		partial_signatures: &[SimpleTaprootPartialSignature], public_nonces: &[Musig2PublicNonce],
+	) -> Result<schnorr::Signature, ChannelError> {
+		let key_agg_ctx = self
+			.context
+			.holder_signer
+			.simple_taproot_musig_key_agg_context(
+				*self.funding.counterparty_funding_pubkey(),
+				self.funding.channel_transaction_parameters.splice_parent_funding_txid,
+				&self.context.secp_ctx,
+			)
+			.map_err(|_| {
+				ChannelError::close(
+					"Failed to build simple-taproot close key aggregation context".to_owned(),
+				)
+			})?;
+		let message =
+			ChannelContext::<SP>::simple_taproot_closing_sighash(&self.funding, closing_tx)?;
+		let final_signature = key_agg_ctx
+			.aggregate_final_signature(partial_signatures, public_nonces, &message)
+			.map_err(|_| {
+				ChannelError::close(
+					"Failed to aggregate simple-taproot closing signature".to_owned(),
+				)
+			})?;
+		key_agg_ctx.verify_final_signature(&final_signature, &message).map_err(|_| {
+			ChannelError::close("Invalid aggregate simple-taproot closing signature".to_owned())
+		})?;
+		Ok(final_signature)
 	}
 
 	fn get_closing_signed_msg<L: Logger>(
@@ -11905,6 +12262,342 @@ where
 				}
 			}
 		}
+	}
+
+	#[cfg(all(simple_close, feature = "simple_taproot_musig2"))]
+	pub fn closing_complete<F: FeeEstimator>(
+		&mut self, fee_estimator: &LowerBoundedFeeEstimator<F>, msg: &msgs::ClosingComplete,
+	) -> Result<(Option<msgs::ClosingSig>, Option<(Transaction, ShutdownResult)>), ChannelError> {
+		if !ChannelContext::<SP>::is_simple_taproot_funding(&self.funding) {
+			return Err(ChannelError::close(
+				"closing_complete is only supported for simple-taproot channels".to_owned(),
+			));
+		}
+		if !self.context.channel_state.is_both_sides_shutdown() {
+			return Err(ChannelError::close(
+				"Remote end sent us a closing_complete before both sides provided a shutdown"
+					.to_owned(),
+			));
+		}
+		if self.context.channel_state.is_peer_disconnected() {
+			return Err(ChannelError::close(
+				"Peer sent closing_complete when we needed a channel_reestablish".to_owned(),
+			));
+		}
+		if !self.context.pending_inbound_htlcs.is_empty()
+			|| !self.context.pending_outbound_htlcs.is_empty()
+		{
+			return Err(ChannelError::close(
+				"Remote end sent us a closing_complete while there were still pending HTLCs"
+					.to_owned(),
+			));
+		}
+		if msg.fee_satoshis > TOTAL_BITCOIN_SUPPLY_SATOSHIS {
+			return Err(ChannelError::close(
+				"Remote tried to send us a closing_complete with > 21 million BTC fee".to_owned(),
+			));
+		}
+		if msg.locktime != 0 {
+			return Err(ChannelError::close(
+				"Simple-taproot closing_complete used unsupported non-zero locktime".to_owned(),
+			));
+		}
+		if msg.closer_output_only.is_some()
+			|| msg.closee_output_only.is_some()
+			|| msg.closer_and_closee_outputs.is_some()
+		{
+			return Err(ChannelError::close(
+				"Simple-taproot closing_complete included legacy ECDSA signatures".to_owned(),
+			));
+		}
+		if Some(&msg.closer_scriptpubkey)
+			!= self.context.counterparty_shutdown_scriptpubkey.as_ref()
+		{
+			return Err(ChannelError::close(
+				"Peer closing_complete closer script did not match shutdown script".to_owned(),
+			));
+		}
+		if msg.closee_scriptpubkey != self.get_closing_scriptpubkey() {
+			return Err(ChannelError::close(
+				"Peer closing_complete closee script did not match our shutdown script".to_owned(),
+			));
+		}
+
+		let (output_set, counterparty_partial_with_nonce) =
+			ChannelContext::<SP>::simple_taproot_closing_complete_partial(msg)?;
+		let (closing_tx, used_total_fee) =
+			self.build_closing_transaction(msg.fee_satoshis, false)?;
+		if used_total_fee != msg.fee_satoshis {
+			return Err(ChannelError::close(format!(
+				"Remote sent us a closing_complete with a fee other than the value they can claim. Fee in message: {}. Actual closing tx fee: {}",
+				msg.fee_satoshis, used_total_fee
+			)));
+		}
+		let actual_output_set = ChannelContext::<SP>::simple_taproot_output_set_for_role(
+			&closing_tx,
+			SimpleTaprootClosingRole::CounterpartyCloser,
+		)?;
+		if output_set != actual_output_set {
+			return Err(ChannelError::close(
+				"Peer simple-taproot closing_complete signature field did not match outputs"
+					.to_owned(),
+			));
+		}
+		let (our_min_fee, our_max_fee) = self.calculate_closing_fee_limits(fee_estimator);
+		if msg.fee_satoshis < our_min_fee || msg.fee_satoshis > our_max_fee {
+			return Err(ChannelError::Warn(format!(
+				"Unable to accept simple-taproot cooperative close fee of {} sat outside our range of {} sat - {} sat",
+				msg.fee_satoshis, our_min_fee, our_max_fee
+			)));
+		}
+
+		let local_nonce_index = self.context.simple_taproot_local_closee_nonce_index;
+		let local_nonce_pair = self
+			.context
+			.simple_taproot_local_closee_nonce_pair(&self.funding, local_nonce_index)?
+			.ok_or_else(|| ChannelError::close("Missing simple-taproot closee nonce".to_owned()))?;
+		let public_nonces =
+			[counterparty_partial_with_nonce.public_nonce, local_nonce_pair.public_nonce];
+		let message =
+			ChannelContext::<SP>::simple_taproot_closing_sighash(&self.funding, &closing_tx)?;
+		let key_agg_ctx = self
+			.context
+			.holder_signer
+			.simple_taproot_musig_key_agg_context(
+				*self.funding.counterparty_funding_pubkey(),
+				self.funding.channel_transaction_parameters.splice_parent_funding_txid,
+				&self.context.secp_ctx,
+			)
+			.map_err(|_| {
+				ChannelError::close(
+					"Failed to build simple-taproot close key aggregation context".to_owned(),
+				)
+			})?;
+		key_agg_ctx
+			.verify_partial(
+				self.funding.counterparty_funding_pubkey(),
+				&counterparty_partial_with_nonce.public_nonce,
+				&counterparty_partial_with_nonce.partial_signature,
+				&public_nonces,
+				&message,
+			)
+			.map_err(|_| {
+				ChannelError::close(
+					"Invalid simple-taproot closing_complete partial signature".to_owned(),
+				)
+			})?;
+		let local_partial_with_nonce = self
+			.context
+			.holder_signer
+			.simple_taproot_musig_sign_partial(
+				*self.funding.counterparty_funding_pubkey(),
+				local_nonce_pair.secret_nonce,
+				&public_nonces,
+				&message,
+				ChannelContext::<SP>::simple_taproot_funding_txid(&self.funding)?,
+				local_nonce_index,
+				SimpleTaprootNonceScope::CooperativeCloseClosee,
+				self.funding.channel_transaction_parameters.splice_parent_funding_txid,
+				&self.context.secp_ctx,
+				&mut self.context.simple_taproot_nonce_state,
+			)
+			.map_err(|_| {
+				ChannelError::close("Failed to sign simple-taproot closing_sig partial".to_owned())
+			})?;
+		if local_partial_with_nonce.public_nonce != local_nonce_pair.public_nonce {
+			return Err(ChannelError::close(
+				"Signer returned mismatched simple-taproot closee nonce".to_owned(),
+			));
+		}
+		self.context.simple_taproot_local_closee_nonce_index += 1;
+		let next_closee_nonce = self
+			.context
+			.simple_taproot_local_closee_public_nonce(
+				&self.funding,
+				self.context.simple_taproot_local_closee_nonce_index,
+			)?
+			.ok_or_else(|| {
+				ChannelError::close("Missing next simple-taproot closee nonce".to_owned())
+			})?;
+
+		let final_signature = self.aggregate_simple_taproot_closing_signature(
+			&closing_tx,
+			&[
+				counterparty_partial_with_nonce.partial_signature,
+				local_partial_with_nonce.partial_signature,
+			],
+			&public_nonces,
+		)?;
+		let tx =
+			self.build_signed_simple_taproot_closing_transaction(&closing_tx, &final_signature);
+		let shutdown_result = self.shutdown_result_coop_close();
+		self.context.channel_state = ChannelState::ShutdownComplete;
+		self.context.update_time_counter += 1;
+
+		let closing_sig = msgs::ClosingSig {
+			channel_id: self.context.channel_id,
+			closer_scriptpubkey: msg.closer_scriptpubkey.clone(),
+			closee_scriptpubkey: msg.closee_scriptpubkey.clone(),
+			fee_satoshis: msg.fee_satoshis,
+			locktime: msg.locktime,
+			closer_output_only: None,
+			closee_output_only: None,
+			closer_and_closee_outputs: None,
+			simple_taproot_closer_output_only: (output_set
+				== SimpleTaprootClosingOutputSet::CloserOutputOnly)
+				.then_some(local_partial_with_nonce.partial_signature),
+			simple_taproot_closee_output_only: (output_set
+				== SimpleTaprootClosingOutputSet::CloseeOutputOnly)
+				.then_some(local_partial_with_nonce.partial_signature),
+			simple_taproot_closer_and_closee_outputs: (output_set
+				== SimpleTaprootClosingOutputSet::CloserAndCloseeOutputs)
+				.then_some(local_partial_with_nonce.partial_signature),
+			simple_taproot_next_closee_nonce: Some(next_closee_nonce),
+		};
+		Ok((Some(closing_sig), Some((tx, shutdown_result))))
+	}
+
+	#[cfg(all(simple_close, feature = "simple_taproot_musig2"))]
+	pub fn closing_sig(
+		&mut self, msg: &msgs::ClosingSig,
+	) -> Result<Option<(Transaction, ShutdownResult)>, ChannelError> {
+		if !ChannelContext::<SP>::is_simple_taproot_funding(&self.funding) {
+			return Err(ChannelError::close(
+				"closing_sig is only supported for simple-taproot channels".to_owned(),
+			));
+		}
+		if !self.context.channel_state.is_both_sides_shutdown() {
+			return Err(ChannelError::close(
+				"Remote end sent us a closing_sig before both sides provided a shutdown".to_owned(),
+			));
+		}
+		if msg.locktime != 0 {
+			return Err(ChannelError::close(
+				"Simple-taproot closing_sig used unsupported non-zero locktime".to_owned(),
+			));
+		}
+		if msg.closer_output_only.is_some()
+			|| msg.closee_output_only.is_some()
+			|| msg.closer_and_closee_outputs.is_some()
+		{
+			return Err(ChannelError::close(
+				"Simple-taproot closing_sig included legacy ECDSA signatures".to_owned(),
+			));
+		}
+		if msg.closer_scriptpubkey != self.get_closing_scriptpubkey() {
+			return Err(ChannelError::close(
+				"Peer closing_sig closer script did not match our shutdown script".to_owned(),
+			));
+		}
+		if Some(&msg.closee_scriptpubkey)
+			!= self.context.counterparty_shutdown_scriptpubkey.as_ref()
+		{
+			return Err(ChannelError::close(
+				"Peer closing_sig closee script did not match counterparty shutdown script"
+					.to_owned(),
+			));
+		}
+		let sent_closing_complete =
+			self.context.simple_taproot_sent_closing_complete.ok_or_else(|| {
+				ChannelError::close(
+					"Peer sent simple-taproot closing_sig without a sent closing_complete"
+						.to_owned(),
+				)
+			})?;
+		if msg.fee_satoshis != sent_closing_complete.fee_satoshis
+			|| msg.locktime != sent_closing_complete.locktime
+		{
+			return Err(ChannelError::close(
+				"Peer simple-taproot closing_sig did not match our closing_complete".to_owned(),
+			));
+		}
+		let counterparty_closee_nonce =
+			self.context.simple_taproot_counterparty_closee_nonce.ok_or_else(|| {
+				ChannelError::close(
+					"Missing simple-taproot counterparty closee nonce for closing_sig".to_owned(),
+				)
+			})?;
+		if counterparty_closee_nonce.nonce_index != sent_closing_complete.nonce_index {
+			return Err(ChannelError::close(
+				"Peer simple-taproot closing_sig used stale closee nonce state".to_owned(),
+			));
+		}
+		let counterparty_partial = ChannelContext::<SP>::simple_taproot_closing_sig_partial(
+			msg,
+			sent_closing_complete.output_set,
+		)?;
+		let (closing_tx, used_total_fee) =
+			self.build_closing_transaction(msg.fee_satoshis, false)?;
+		if used_total_fee != msg.fee_satoshis {
+			return Err(ChannelError::close(
+				"Peer simple-taproot closing_sig fee no longer matches closing transaction"
+					.to_owned(),
+			));
+		}
+		let actual_output_set = ChannelContext::<SP>::simple_taproot_output_set_for_role(
+			&closing_tx,
+			SimpleTaprootClosingRole::LocalCloser,
+		)?;
+		if actual_output_set != sent_closing_complete.output_set {
+			return Err(ChannelError::close(
+				"Peer simple-taproot closing_sig signature field did not match outputs".to_owned(),
+			));
+		}
+		let public_nonces = [
+			sent_closing_complete.partial_signature_with_nonce.public_nonce,
+			counterparty_closee_nonce.public_nonce,
+		];
+		let message =
+			ChannelContext::<SP>::simple_taproot_closing_sighash(&self.funding, &closing_tx)?;
+		let key_agg_ctx = self
+			.context
+			.holder_signer
+			.simple_taproot_musig_key_agg_context(
+				*self.funding.counterparty_funding_pubkey(),
+				self.funding.channel_transaction_parameters.splice_parent_funding_txid,
+				&self.context.secp_ctx,
+			)
+			.map_err(|_| {
+				ChannelError::close(
+					"Failed to build simple-taproot close key aggregation context".to_owned(),
+				)
+			})?;
+		key_agg_ctx
+			.verify_partial(
+				self.funding.counterparty_funding_pubkey(),
+				&counterparty_closee_nonce.public_nonce,
+				&counterparty_partial,
+				&public_nonces,
+				&message,
+			)
+			.map_err(|_| {
+				ChannelError::close(
+					"Invalid simple-taproot closing_sig partial signature".to_owned(),
+				)
+			})?;
+		let next_closee_nonce = msg.simple_taproot_next_closee_nonce.ok_or_else(|| {
+			ChannelError::close("Peer omitted next simple-taproot closee nonce".to_owned())
+		})?;
+		self.context.simple_taproot_counterparty_closee_nonce =
+			Some(SimpleTaprootCloseeNonceState {
+				nonce_index: counterparty_closee_nonce.nonce_index + 1,
+				public_nonce: next_closee_nonce,
+			});
+
+		let final_signature = self.aggregate_simple_taproot_closing_signature(
+			&closing_tx,
+			&[
+				sent_closing_complete.partial_signature_with_nonce.partial_signature,
+				counterparty_partial,
+			],
+			&public_nonces,
+		)?;
+		let tx =
+			self.build_signed_simple_taproot_closing_transaction(&closing_tx, &final_signature);
+		let shutdown_result = self.shutdown_result_coop_close();
+		self.context.channel_state = ChannelState::ShutdownComplete;
+		self.context.update_time_counter += 1;
+		Ok(Some((tx, shutdown_result)))
 	}
 
 	#[rustfmt::skip]
@@ -16819,6 +17512,9 @@ impl<SP: SignerProvider> Writeable for FundedChannel<SP> {
 		let simple_taproot_sent_commitment_signatures =
 			(!self.context.simple_taproot_sent_commitment_signatures.is_empty())
 				.then_some(&self.context.simple_taproot_sent_commitment_signatures);
+		let simple_taproot_local_closee_nonce_index =
+			(self.context.simple_taproot_local_closee_nonce_index != 0)
+				.then_some(self.context.simple_taproot_local_closee_nonce_index);
 
 		write_tlv_fields!(writer, {
 			(0, self.context.announcement_sigs, option),
@@ -16882,6 +17578,9 @@ impl<SP: SignerProvider> Writeable for FundedChannel<SP> {
 			(81, simple_taproot_nonce_state, option),
 			(83, simple_taproot_counterparty_next_local_nonces, option),
 			(85, simple_taproot_sent_commitment_signatures, option),
+			(87, simple_taproot_local_closee_nonce_index, option),
+			(89, self.context.simple_taproot_counterparty_closee_nonce, option),
+			(91, self.context.simple_taproot_sent_closing_complete, option),
 		});
 
 		Ok(())
@@ -17277,6 +17976,11 @@ impl<'a, 'b, 'c, ES: EntropySource, SP: SignerProvider>
 		let mut simple_taproot_sent_commitment_signatures: Option<
 			SimpleTaprootSentCommitmentSignatures,
 		> = None;
+		let mut simple_taproot_local_closee_nonce_index: Option<u64> = None;
+		let mut simple_taproot_counterparty_closee_nonce: Option<SimpleTaprootCloseeNonceState> =
+			None;
+		let mut simple_taproot_sent_closing_complete: Option<SimpleTaprootSentClosingComplete> =
+			None;
 
 		read_tlv_fields!(reader, {
 			(0, announcement_sigs, option),
@@ -17334,6 +18038,9 @@ impl<'a, 'b, 'c, ES: EntropySource, SP: SignerProvider>
 			(81, simple_taproot_nonce_state, option),
 			(83, simple_taproot_counterparty_next_local_nonces, option),
 			(85, simple_taproot_sent_commitment_signatures, option),
+			(87, simple_taproot_local_closee_nonce_index, option),
+			(89, simple_taproot_counterparty_closee_nonce, option),
+			(91, simple_taproot_sent_closing_complete, option),
 		});
 
 		let holder_signer = signer_provider.derive_channel_signer(channel_keys_id);
@@ -17773,6 +18480,10 @@ impl<'a, 'b, 'c, ES: EntropySource, SP: SignerProvider>
 					simple_taproot_counterparty_next_local_nonces.unwrap_or_default(),
 				simple_taproot_sent_commitment_signatures:
 					simple_taproot_sent_commitment_signatures.unwrap_or_default(),
+				simple_taproot_local_closee_nonce_index: simple_taproot_local_closee_nonce_index
+					.unwrap_or(0),
+				simple_taproot_counterparty_closee_nonce,
+				simple_taproot_sent_closing_complete,
 				sent_message_awaiting_response: None,
 
 				latest_inbound_scid_alias,

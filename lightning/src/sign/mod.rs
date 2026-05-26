@@ -854,6 +854,16 @@ pub trait ChannelSigner {
 		Err(SimpleTaprootMusigError::InvalidKey)
 	}
 
+	/// Derives a simple-taproot JIT nonce pair from caller-supplied entropy.
+	#[cfg(feature = "simple_taproot_musig2")]
+	fn simple_taproot_musig_jit_nonce_pair(
+		&self, _counterparty_funding_pubkey: PublicKey, _funding_txid: Txid, _nonce_index: u64,
+		_scope: SimpleTaprootNonceScope, _entropy: &[u8; 32], _message: &[u8],
+		_splice_parent_funding_txid: Option<Txid>, _secp_ctx: &Secp256k1<All>,
+	) -> Result<SimpleTaprootNoncePair, SimpleTaprootMusigError> {
+		Err(SimpleTaprootMusigError::InvalidKey)
+	}
+
 	/// Produces a MuSig2 partial signature and records the nonce as consumed.
 	#[cfg(feature = "simple_taproot_musig2")]
 	fn simple_taproot_musig_sign_partial(
@@ -1697,6 +1707,25 @@ impl ChannelSigner for InMemorySigner {
 			funding_txid,
 			nonce_index,
 			scope,
+			message,
+			splice_parent_funding_txid,
+			secp_ctx,
+		)
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	fn simple_taproot_musig_jit_nonce_pair(
+		&self, counterparty_funding_pubkey: PublicKey, funding_txid: Txid, nonce_index: u64,
+		scope: SimpleTaprootNonceScope, entropy: &[u8; 32], message: &[u8],
+		splice_parent_funding_txid: Option<Txid>, secp_ctx: &Secp256k1<All>,
+	) -> Result<SimpleTaprootNoncePair, SimpleTaprootMusigError> {
+		<Self as SimpleTaprootChannelSigner>::simple_taproot_jit_nonce_pair(
+			self,
+			counterparty_funding_pubkey,
+			funding_txid,
+			nonce_index,
+			scope,
+			entropy,
 			message,
 			splice_parent_funding_txid,
 			secp_ctx,

@@ -12679,16 +12679,175 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 
 	#[cfg(simple_close)]
 	fn internal_closing_complete(
-		&self, _counterparty_node_id: PublicKey, _msg: msgs::ClosingComplete,
+		&self, counterparty_node_id: PublicKey, msg: msgs::ClosingComplete,
 	) -> Result<(), MsgHandleErrInternal> {
-		unimplemented!("Handling ClosingComplete is not implemented");
+		#[cfg(feature = "simple_taproot_musig2")]
+		{
+			let per_peer_state = self.per_peer_state.read().unwrap();
+			let peer_state_mutex = per_peer_state.get(&counterparty_node_id).ok_or_else(|| {
+				MsgHandleErrInternal::unreachable_no_such_peer(
+					&counterparty_node_id,
+					msg.channel_id,
+				)
+			})?;
+			let logger;
+			let tx_err: Option<(_, Result<Infallible, _>)> = {
+				let mut peer_state_lock = peer_state_mutex.lock().unwrap();
+				let peer_state = &mut *peer_state_lock;
+				match peer_state.channel_by_id.entry(msg.channel_id.clone()) {
+					hash_map::Entry::Occupied(mut chan_entry) => {
+						if let Some(chan) = chan_entry.get_mut().as_funded_mut() {
+							logger = WithChannelContext::from(&self.logger, &chan.context, None);
+							let res = chan.closing_complete(&self.fee_estimator, &msg);
+							let (closing_sig, tx_shutdown_result) =
+								try_channel_entry!(self, peer_state, res, chan_entry);
+							debug_assert_eq!(tx_shutdown_result.is_some(), chan.is_shutdown());
+							if let Some(msg) = closing_sig {
+								peer_state.pending_msg_events.push(
+									MessageSendEvent::SendClosingSig {
+										node_id: counterparty_node_id,
+										msg,
+									},
+								);
+							}
+							if let Some((tx, close_res)) = tx_shutdown_result {
+								let err = self.locked_handle_funded_coop_close(
+									&mut peer_state.closed_channel_monitor_update_ids,
+									&mut peer_state.in_flight_monitor_updates,
+									close_res,
+									chan,
+								);
+								chan_entry.remove();
+								Some((tx, Err(err)))
+							} else {
+								None
+							}
+						} else {
+							return try_channel_entry!(
+								self,
+								peer_state,
+								Err(ChannelError::close(
+									"Got a closing_complete message for an unfunded channel!"
+										.into()
+								)),
+								chan_entry
+							);
+						}
+					},
+					hash_map::Entry::Vacant(_) => {
+						return Err(MsgHandleErrInternal::no_such_channel_for_peer(
+							&counterparty_node_id,
+							msg.channel_id,
+						))
+					},
+				}
+			};
+			mem::drop(per_peer_state);
+			if let Some((broadcast_tx, err)) = tx_err {
+				log_info!(logger, "Broadcasting {}", log_tx!(broadcast_tx));
+				self.tx_broadcaster.broadcast_transactions(&[(
+					&broadcast_tx,
+					TransactionType::CooperativeClose {
+						counterparty_node_id,
+						channel_id: msg.channel_id,
+					},
+				)]);
+				let _ = self.handle_error(err, counterparty_node_id);
+			}
+			Ok(())
+		}
+		#[cfg(not(feature = "simple_taproot_musig2"))]
+		{
+			let _ = counterparty_node_id;
+			Err(MsgHandleErrInternal::from_chan_no_close(
+				ChannelError::close(
+					"simple_taproot_musig2 feature is required for closing_complete".to_owned(),
+				),
+				msg.channel_id,
+			))
+		}
 	}
 
 	#[cfg(simple_close)]
 	fn internal_closing_sig(
-		&self, _counterparty_node_id: PublicKey, _msg: msgs::ClosingSig,
+		&self, counterparty_node_id: PublicKey, msg: msgs::ClosingSig,
 	) -> Result<(), MsgHandleErrInternal> {
-		unimplemented!("Handling ClosingSig is not implemented");
+		#[cfg(feature = "simple_taproot_musig2")]
+		{
+			let per_peer_state = self.per_peer_state.read().unwrap();
+			let peer_state_mutex = per_peer_state.get(&counterparty_node_id).ok_or_else(|| {
+				MsgHandleErrInternal::unreachable_no_such_peer(
+					&counterparty_node_id,
+					msg.channel_id,
+				)
+			})?;
+			let logger;
+			let tx_err: Option<(_, Result<Infallible, _>)> = {
+				let mut peer_state_lock = peer_state_mutex.lock().unwrap();
+				let peer_state = &mut *peer_state_lock;
+				match peer_state.channel_by_id.entry(msg.channel_id.clone()) {
+					hash_map::Entry::Occupied(mut chan_entry) => {
+						if let Some(chan) = chan_entry.get_mut().as_funded_mut() {
+							logger = WithChannelContext::from(&self.logger, &chan.context, None);
+							let res = chan.closing_sig(&msg);
+							let tx_shutdown_result =
+								try_channel_entry!(self, peer_state, res, chan_entry);
+							debug_assert_eq!(tx_shutdown_result.is_some(), chan.is_shutdown());
+							if let Some((tx, close_res)) = tx_shutdown_result {
+								let err = self.locked_handle_funded_coop_close(
+									&mut peer_state.closed_channel_monitor_update_ids,
+									&mut peer_state.in_flight_monitor_updates,
+									close_res,
+									chan,
+								);
+								chan_entry.remove();
+								Some((tx, Err(err)))
+							} else {
+								None
+							}
+						} else {
+							return try_channel_entry!(
+								self,
+								peer_state,
+								Err(ChannelError::close(
+									"Got a closing_sig message for an unfunded channel!".into()
+								)),
+								chan_entry
+							);
+						}
+					},
+					hash_map::Entry::Vacant(_) => {
+						return Err(MsgHandleErrInternal::no_such_channel_for_peer(
+							&counterparty_node_id,
+							msg.channel_id,
+						))
+					},
+				}
+			};
+			mem::drop(per_peer_state);
+			if let Some((broadcast_tx, err)) = tx_err {
+				log_info!(logger, "Broadcasting {}", log_tx!(broadcast_tx));
+				self.tx_broadcaster.broadcast_transactions(&[(
+					&broadcast_tx,
+					TransactionType::CooperativeClose {
+						counterparty_node_id,
+						channel_id: msg.channel_id,
+					},
+				)]);
+				let _ = self.handle_error(err, counterparty_node_id);
+			}
+			Ok(())
+		}
+		#[cfg(not(feature = "simple_taproot_musig2"))]
+		{
+			let _ = counterparty_node_id;
+			Err(MsgHandleErrInternal::from_chan_no_close(
+				ChannelError::close(
+					"simple_taproot_musig2 feature is required for closing_sig".to_owned(),
+				),
+				msg.channel_id,
+			))
+		}
 	}
 
 	#[rustfmt::skip]
@@ -14265,6 +14424,42 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 						Some(funded_chan) => {
 							let logger =
 								WithChannelContext::from(&self.logger, &funded_chan.context, None);
+							#[cfg(all(simple_close, feature = "simple_taproot_musig2"))]
+							if funded_chan.is_simple_taproot_channel() {
+								match funded_chan.maybe_propose_simple_taproot_closing_complete(
+									&self.fee_estimator,
+									&self.entropy_source,
+								) {
+									Ok(Some(msg)) => {
+										has_update = true;
+										pending_msg_events.push(
+											MessageSendEvent::SendClosingComplete {
+												node_id: funded_chan
+													.context
+													.get_counterparty_node_id(),
+												msg,
+											},
+										);
+									},
+									Ok(None) => {},
+									Err(e) => {
+										has_update = true;
+										let (close_channel, res) = self
+											.locked_handle_funded_force_close(
+												&mut peer_state.closed_channel_monitor_update_ids,
+												&mut peer_state.in_flight_monitor_updates,
+												e,
+												funded_chan,
+											);
+										handle_errors.push((
+											funded_chan.context.get_counterparty_node_id(),
+											Err(res),
+										));
+										return !close_channel;
+									},
+								}
+								return true;
+							}
 							match funded_chan
 								.maybe_propose_closing_signed(&self.fee_estimator, &&logger)
 							{
