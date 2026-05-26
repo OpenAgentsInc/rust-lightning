@@ -43,8 +43,8 @@ use bitcoin::secp256k1::{PublicKey, Scalar, SecretKey};
 use bitcoin::{secp256k1, Sequence, Witness};
 
 use super::channel_keys::{
-	add_public_key_tweak, DelayedPaymentBasepoint, DelayedPaymentKey, HtlcBasepoint, HtlcKey,
-	RevocationBasepoint, RevocationKey,
+	DelayedPaymentBasepoint, DelayedPaymentKey, HtlcBasepoint, HtlcKey, RevocationBasepoint,
+	RevocationKey,
 };
 #[cfg(feature = "simple_taproot_musig2")]
 use super::simple_taproot::{
@@ -737,15 +737,14 @@ pub fn get_countersigner_payment_script(
 }
 
 #[cfg(feature = "simple_taproot_musig2")]
-pub(crate) fn derive_simple_taproot_to_remote_payment_key(
-	secp_ctx: &Secp256k1<secp256k1::All>, per_commitment_point: &PublicKey,
-	payment_basepoint: &PublicKey,
+pub(crate) fn simple_taproot_to_remote_payment_key(
+	channel_type_features: &ChannelTypeFeatures, payment_basepoint: &PublicKey,
 ) -> PublicKey {
-	let mut sha = Sha256::engine();
-	sha.input(&per_commitment_point.serialize());
-	sha.input(&payment_basepoint.serialize());
-	let tweak = Sha256::from_engine(sha);
-	add_public_key_tweak(secp_ctx, payment_basepoint, &tweak)
+	debug_assert!(
+		requires_simple_taproot_outputs(channel_type_features),
+		"simple-taproot to_remote keys require simple-taproot channel type"
+	);
+	*payment_basepoint
 }
 
 /// Information about an HTLC as it appears in a commitment transaction
@@ -906,12 +905,14 @@ pub(crate) fn make_funding_redeemscript_from_slices(broadcaster_funding_key: &[u
 pub(crate) fn requires_simple_taproot_outputs(channel_type_features: &ChannelTypeFeatures) -> bool {
 	channel_type_features.requires_simple_taproot()
 		|| channel_type_features.requires_simple_taproot_staging()
+		|| channel_type_features.requires_taproot_asset_channel()
 }
 
 #[cfg(not(feature = "simple_taproot_musig2"))]
 pub(crate) fn requires_simple_taproot_outputs(channel_type_features: &ChannelTypeFeatures) -> bool {
 	channel_type_features.requires_simple_taproot()
 		|| channel_type_features.requires_simple_taproot_staging()
+		|| channel_type_features.requires_taproot_asset_channel()
 }
 
 /// Builds an unsigned HTLC-Success or HTLC-Timeout transaction from the given channel and HTLC
@@ -2068,10 +2069,9 @@ impl CommitmentTransaction {
 		if to_countersignatory_value_sat > Amount::ZERO {
 			#[cfg(feature = "simple_taproot_musig2")]
 			let script = if requires_simple_taproot_outputs(channel_type) {
-				let secp_ctx = Secp256k1::new();
-				let countersignatory_payment_key = derive_simple_taproot_to_remote_payment_key(
-					&secp_ctx,
-					&keys.per_commitment_point,
+				let secp_ctx = Secp256k1::verification_only();
+				let countersignatory_payment_key = simple_taproot_to_remote_payment_key(
+					channel_type,
 					countersignatory_payment_point,
 				);
 				simple_taproot_to_remote_spend_info_with_aux_leaf(
@@ -2569,7 +2569,7 @@ mod tests {
 	use super::{ChannelPublicKeys, CounterpartyCommitmentSecrets};
 	use crate::chain;
 	#[cfg(feature = "simple_taproot_musig2")]
-	use crate::ln::chan_utils::derive_simple_taproot_to_remote_payment_key;
+	use crate::ln::chan_utils::simple_taproot_to_remote_payment_key;
 	use crate::ln::chan_utils::{
 		build_htlc_transaction, commit_tx_fee_sat, get_htlc_redeemscript,
 		get_keyed_anchor_redeemscript, get_to_countersigner_keyed_anchor_redeemscript,
@@ -2853,7 +2853,7 @@ mod tests {
 	#[cfg(feature = "simple_taproot_musig2")]
 	#[test]
 	#[rustfmt::skip]
-	fn test_simple_taproot_commitment_non_htlc_outputs_use_lnd_tweaked_to_remote_key() {
+	fn test_simple_taproot_commitment_non_htlc_outputs_use_static_to_remote_key() {
 		let builder = simple_taproot_vector_builder();
 		let tx = builder.build(6_984_820, 3_000_000, Vec::new());
 		let keys = tx.trust().keys();
@@ -2870,7 +2870,7 @@ mod tests {
 		assert_eq!(outputs.len(), 4);
 		assert_txout(&outputs[0], 330, "51201249c50576fdf914caa14f9221370b986df520bdbc73f57d5056a86ee03e5ac4");
 		assert_txout(&outputs[1], 330, "5120f67ab012701705f3203d132f909a6810ef18c5da4c11d986cb50818803b8344e");
-		assert_txout(&outputs[2], 3_000_000, "512014ab1c44604d7722a33efb5cdb837696afdc40fe218675718c67dd4ebe8b89f0");
+		assert_txout(&outputs[2], 3_000_000, "51206b1a8421cb92be16a6a754426d4a6df8bfb7e2cd16d07c654039294a1df7328b");
 		assert_txout(&outputs[3], 6_984_820, "51207b49ec6082e5fe6cd59ab23ab3030a918928dab1e3ea202b5c0faba770a830bf");
 		assert_eq!(tx.trust().revokeable_output_index(), Some(3));
 		assert!(builder.verify(&tx).is_ok());
@@ -2889,9 +2889,8 @@ mod tests {
 
 		let tx = builder.build(6_984_820, 3_000_000, Vec::new());
 		let keys = tx.trust().keys();
-		let countersignatory_payment_key = derive_simple_taproot_to_remote_payment_key(
-			&builder.secp_ctx,
-			&keys.per_commitment_point,
+		let countersignatory_payment_key = simple_taproot_to_remote_payment_key(
+			&builder.channel_parameters.channel_type_features,
 			&builder.counterparty_pubkeys.payment_point,
 		);
 		let expected_to_countersignatory = simple_taproot_to_remote_spend_info_with_aux_leaf(

@@ -41,17 +41,16 @@ use crate::chain::transaction::{OutPoint, TransactionData};
 use crate::chain::BlockLocator;
 use crate::events::{ClosureReason, FundingInfo, NegotiationFailureReason};
 use crate::ln::chan_utils;
-#[cfg(feature = "simple_taproot_musig2")]
-use crate::ln::chan_utils::{
-	derive_simple_taproot_to_remote_payment_key, SimpleTaprootAssetCommitmentOutputKeys,
-	TxCreationKeys,
-};
 use crate::ln::chan_utils::{
 	get_commitment_transaction_number_obscure_factor, max_htlcs, second_stage_tx_fees_sat,
 	selected_commitment_sat_per_1000_weight, ChannelPublicKeys, ChannelTransactionParameters,
 	ClosingTransaction, CommitmentTransaction, CounterpartyChannelTransactionParameters,
 	CounterpartyCommitmentSecrets, HTLCOutputInCommitment, HolderCommitmentTransaction,
 	EMPTY_SCRIPT_SIG_WEIGHT, FUNDING_TRANSACTION_WITNESS_WEIGHT,
+};
+#[cfg(feature = "simple_taproot_musig2")]
+use crate::ln::chan_utils::{
+	simple_taproot_to_remote_payment_key, SimpleTaprootAssetCommitmentOutputKeys, TxCreationKeys,
 };
 use crate::ln::channel_state::{
 	ChannelShutdownState, CounterpartyForwardingInfo, InboundHTLCDetails, InboundHTLCStateDetails,
@@ -1888,12 +1887,10 @@ where
 		.map_err(|_| {
 			ChannelError::close("Failed to derive holder Taproot Asset output key".to_owned())
 		})?;
-		let holder_commitment_to_counterparty_payment_key =
-			derive_simple_taproot_to_remote_payment_key(
-				&context.secp_ctx,
-				&holder_commitment_point.next_point(),
-				&counterparty_pubkeys.payment_point,
-			);
+		let holder_commitment_to_counterparty_payment_key = simple_taproot_to_remote_payment_key(
+			funding.get_channel_type(),
+			&counterparty_pubkeys.payment_point,
+		);
 		let holder_commitment_to_counterparty = simple_taproot_to_remote_spend_info(
 			&context.secp_ctx,
 			&holder_commitment_to_counterparty_payment_key,
@@ -1910,9 +1907,8 @@ where
 		);
 		let counterparty_commitment_to_holder = simple_taproot_to_remote_spend_info(
 			&context.secp_ctx,
-			&derive_simple_taproot_to_remote_payment_key(
-				&context.secp_ctx,
-				&counterparty_commitment_point,
+			&simple_taproot_to_remote_payment_key(
+				funding.get_channel_type(),
 				&holder_pubkeys.payment_point,
 			),
 		)
