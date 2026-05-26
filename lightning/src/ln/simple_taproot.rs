@@ -38,7 +38,8 @@ use bitcoin::secp256k1::{
 use bitcoin::sighash::{self, SighashCache, TapSighashType};
 #[cfg(feature = "simple_taproot_musig2")]
 use bitcoin::taproot::{
-	LeafVersion, Signature as TaprootSignature, TapLeafHash, TaprootBuilder, TaprootSpendInfo,
+	LeafVersion, Signature as TaprootSignature, TapLeafHash, TapNodeHash, TaprootBuilder,
+	TaprootSpendInfo,
 };
 #[cfg(feature = "simple_taproot_musig2")]
 use bitcoin::{Amount, Transaction, TxOut, Witness};
@@ -904,15 +905,35 @@ impl SimpleTaprootKeyAggContext {
 	pub fn bip86_funding_script_pubkey<C: Verification>(
 		&self, secp_ctx: &Secp256k1<C>,
 	) -> Result<ScriptBuf, SimpleTaprootMusigError> {
+		self.funding_script_pubkey(secp_ctx, None)
+	}
+
+	/// Returns the funding scriptPubKey for the sorted aggregate funding key.
+	///
+	/// Passing a tapscript root matches LND's taproot-overlay/Taproot Asset
+	/// channel behavior, where the funding MuSig2 key commits to the asset
+	/// tree via the BIP341 tap tweak. Passing `None` preserves the BIP86
+	/// simple-taproot behavior with no script path.
+	pub fn funding_script_pubkey<C: Verification>(
+		&self, secp_ctx: &Secp256k1<C>, tapscript_root: Option<[u8; 32]>,
+	) -> Result<ScriptBuf, SimpleTaprootMusigError> {
 		let internal_key = self.aggregate_xonly_public_key()?;
-		Ok(ScriptBuf::new_p2tr(secp_ctx, internal_key, None))
+		let merkle_root = tapscript_root.map(TapNodeHash::from_byte_array);
+		Ok(ScriptBuf::new_p2tr(secp_ctx, internal_key, merkle_root))
 	}
 
 	/// Returns the aggregate x-only public key after the BIP86 taproot tweak.
 	pub fn bip86_aggregate_xonly_public_key(
 		&self,
 	) -> Result<XOnlyPublicKey, SimpleTaprootMusigError> {
-		let musig_ctx = self.bip86_musig_context()?;
+		self.tweaked_aggregate_xonly_public_key(None)
+	}
+
+	/// Returns the aggregate x-only public key after the selected taproot tweak.
+	pub fn tweaked_aggregate_xonly_public_key(
+		&self, tapscript_root: Option<[u8; 32]>,
+	) -> Result<XOnlyPublicKey, SimpleTaprootMusigError> {
+		let musig_ctx = self.taproot_musig_context(tapscript_root)?;
 		let aggregate: musig2::secp::Point = musig_ctx.aggregated_pubkey();
 		XOnlyPublicKey::from_slice(&aggregate.serialize_xonly())
 			.map_err(|_| SimpleTaprootMusigError::InvalidKey)
@@ -923,8 +944,22 @@ impl SimpleTaprootKeyAggContext {
 		&self, signer_secret_key: &SecretKey, nonce_seed: [u8; 32], message: &[u8],
 		nonce_use: &SimpleTaprootNonceUse,
 	) -> Result<SimpleTaprootNoncePair, SimpleTaprootMusigError> {
+		self.generate_nonce_pair_with_tapscript_root(
+			signer_secret_key,
+			nonce_seed,
+			message,
+			nonce_use,
+			None,
+		)
+	}
+
+	/// Generates a BIP-327 secret/public nonce pair from caller-supplied entropy.
+	pub fn generate_nonce_pair_with_tapscript_root(
+		&self, signer_secret_key: &SecretKey, nonce_seed: [u8; 32], message: &[u8],
+		nonce_use: &SimpleTaprootNonceUse, tapscript_root: Option<[u8; 32]>,
+	) -> Result<SimpleTaprootNoncePair, SimpleTaprootMusigError> {
 		let signer_scalar = musig_scalar(signer_secret_key)?;
-		let musig_ctx = self.bip86_musig_context()?;
+		let musig_ctx = self.taproot_musig_context(tapscript_root)?;
 		let aggregate: musig2::secp::Point = musig_ctx.aggregated_pubkey();
 		let extra_input = nonce_use.extra_input();
 		let secret_nonce =
@@ -942,6 +977,23 @@ impl SimpleTaprootKeyAggContext {
 		public_nonces: &[Musig2PublicNonce], message: &[u8], nonce_use: SimpleTaprootNonceUse,
 		nonce_state: &mut SimpleTaprootNonceState,
 	) -> Result<SimpleTaprootPartialSignatureWithNonce, SimpleTaprootMusigError> {
+		self.sign_partial_with_tapscript_root(
+			signer_secret_key,
+			secret_nonce,
+			public_nonces,
+			message,
+			nonce_use,
+			nonce_state,
+			None,
+		)
+	}
+
+	/// Signs a message with a fresh secret nonce and records the nonce as consumed.
+	pub fn sign_partial_with_tapscript_root(
+		&self, signer_secret_key: &SecretKey, secret_nonce: SimpleTaprootSecretNonce,
+		public_nonces: &[Musig2PublicNonce], message: &[u8], nonce_use: SimpleTaprootNonceUse,
+		nonce_state: &mut SimpleTaprootNonceState, tapscript_root: Option<[u8; 32]>,
+	) -> Result<SimpleTaprootPartialSignatureWithNonce, SimpleTaprootMusigError> {
 		if nonce_state.is_used(&nonce_use) {
 			return Err(SimpleTaprootMusigError::DuplicateNonceUse);
 		}
@@ -949,7 +1001,7 @@ impl SimpleTaprootKeyAggContext {
 		let local_public_nonce = musig_public_nonce_to_wire(&secret_nonce.public_nonce())?;
 		let aggregate_nonce = aggregate_musig_public_nonces(public_nonces)?;
 		let signer_scalar = musig_scalar(signer_secret_key)?;
-		let musig_ctx = self.bip86_musig_context()?;
+		let musig_ctx = self.taproot_musig_context(tapscript_root)?;
 		let partial_signature: musig2::PartialSignature = musig2::sign_partial(
 			&musig_ctx,
 			signer_scalar,
@@ -971,7 +1023,23 @@ impl SimpleTaprootKeyAggContext {
 		partial_signature: &SimpleTaprootPartialSignature, public_nonces: &[Musig2PublicNonce],
 		message: &[u8],
 	) -> Result<(), SimpleTaprootMusigError> {
-		let musig_ctx = self.bip86_musig_context()?;
+		self.verify_partial_with_tapscript_root(
+			signer_pubkey,
+			signer_public_nonce,
+			partial_signature,
+			public_nonces,
+			message,
+			None,
+		)
+	}
+
+	/// Verifies a peer's MuSig2 partial signature under the selected taproot tweak.
+	pub fn verify_partial_with_tapscript_root(
+		&self, signer_pubkey: &PublicKey, signer_public_nonce: &Musig2PublicNonce,
+		partial_signature: &SimpleTaprootPartialSignature, public_nonces: &[Musig2PublicNonce],
+		message: &[u8], tapscript_root: Option<[u8; 32]>,
+	) -> Result<(), SimpleTaprootMusigError> {
+		let musig_ctx = self.taproot_musig_context(tapscript_root)?;
 		let aggregate_nonce = aggregate_musig_public_nonces(public_nonces)?;
 		let signer_pubkey = musig_point(signer_pubkey)?;
 		let signer_public_nonce = musig_public_nonce_from_wire(signer_public_nonce)?;
@@ -992,7 +1060,20 @@ impl SimpleTaprootKeyAggContext {
 		&self, partial_signatures: &[SimpleTaprootPartialSignature],
 		public_nonces: &[Musig2PublicNonce], message: &[u8],
 	) -> Result<schnorr::Signature, SimpleTaprootMusigError> {
-		let musig_ctx = self.bip86_musig_context()?;
+		self.aggregate_final_signature_with_tapscript_root(
+			partial_signatures,
+			public_nonces,
+			message,
+			None,
+		)
+	}
+
+	/// Aggregates verified partial signatures under the selected taproot tweak.
+	pub fn aggregate_final_signature_with_tapscript_root(
+		&self, partial_signatures: &[SimpleTaprootPartialSignature],
+		public_nonces: &[Musig2PublicNonce], message: &[u8], tapscript_root: Option<[u8; 32]>,
+	) -> Result<schnorr::Signature, SimpleTaprootMusigError> {
+		let musig_ctx = self.taproot_musig_context(tapscript_root)?;
 		let aggregate_nonce = aggregate_musig_public_nonces(public_nonces)?;
 		let mut signatures = Vec::new();
 		for partial_signature in partial_signatures.iter() {
@@ -1009,16 +1090,28 @@ impl SimpleTaprootKeyAggContext {
 	pub fn verify_final_signature(
 		&self, signature: &schnorr::Signature, message: &[u8],
 	) -> Result<(), SimpleTaprootMusigError> {
-		let musig_ctx = self.bip86_musig_context()?;
+		self.verify_final_signature_with_tapscript_root(signature, message, None)
+	}
+
+	/// Verifies an aggregated Schnorr signature against the selected aggregate key.
+	pub fn verify_final_signature_with_tapscript_root(
+		&self, signature: &schnorr::Signature, message: &[u8], tapscript_root: Option<[u8; 32]>,
+	) -> Result<(), SimpleTaprootMusigError> {
+		let musig_ctx = self.taproot_musig_context(tapscript_root)?;
 		let aggregate: musig2::secp::Point = musig_ctx.aggregated_pubkey();
 		musig2::verify_single(aggregate, signature.serialize(), message)
 			.map_err(|_| SimpleTaprootMusigError::InvalidSignature)
 	}
 
-	fn bip86_musig_context(&self) -> Result<musig2::KeyAggContext, SimpleTaprootMusigError> {
-		self.musig_context()?
-			.with_unspendable_taproot_tweak()
-			.map_err(|_| SimpleTaprootMusigError::InvalidKey)
+	fn taproot_musig_context(
+		&self, tapscript_root: Option<[u8; 32]>,
+	) -> Result<musig2::KeyAggContext, SimpleTaprootMusigError> {
+		let musig_ctx = self.musig_context()?;
+		match tapscript_root {
+			Some(root) => musig_ctx.with_taproot_tweak(&root),
+			None => musig_ctx.with_unspendable_taproot_tweak(),
+		}
+		.map_err(|_| SimpleTaprootMusigError::InvalidKey)
 	}
 
 	fn musig_context(&self) -> Result<musig2::KeyAggContext, SimpleTaprootMusigError> {
@@ -1850,6 +1943,135 @@ mod tests {
 
 	#[cfg(feature = "simple_taproot_musig2")]
 	#[test]
+	fn musig2_tapscript_root_tweak_signs_and_verifies() {
+		let secp_ctx = Secp256k1::new();
+		let alice_secret = SecretKey::from_slice(&[11; 32]).unwrap();
+		let bob_secret = SecretKey::from_slice(&[12; 32]).unwrap();
+		let alice_pubkey = PublicKey::from_secret_key(&secp_ctx, &alice_secret);
+		let bob_pubkey = PublicKey::from_secret_key(&secp_ctx, &bob_secret);
+		let key_agg_ctx = SimpleTaprootKeyAggContext::for_funding_keys(alice_pubkey, bob_pubkey);
+		let asset_root = Sha256::hash(b"taproot asset funding root").to_byte_array();
+		let wrong_root = Sha256::hash(b"wrong taproot asset funding root").to_byte_array();
+
+		let funding_script =
+			key_agg_ctx.funding_script_pubkey(&secp_ctx, Some(asset_root)).unwrap();
+		assert_eq!(
+			funding_script,
+			ScriptBuf::new_p2tr(
+				&secp_ctx,
+				key_agg_ctx.aggregate_xonly_public_key().unwrap(),
+				Some(TapNodeHash::from_byte_array(asset_root))
+			)
+		);
+		assert_ne!(funding_script, key_agg_ctx.bip86_funding_script_pubkey(&secp_ctx).unwrap());
+
+		let nonce_use = SimpleTaprootNonceUse::new(
+			Txid::from_slice(&[31; 32]).unwrap(),
+			0,
+			SimpleTaprootNonceScope::Commitment,
+		);
+		let message = Sha256::hash(b"taproot asset commitment").to_byte_array();
+		let alice_seed = derive_simple_taproot_jit_nonce_seed(&[13; 32], &nonce_use);
+		let bob_seed = derive_simple_taproot_jit_nonce_seed(&[14; 32], &nonce_use);
+		let alice_nonce = key_agg_ctx
+			.generate_nonce_pair_with_tapscript_root(
+				&alice_secret,
+				alice_seed,
+				&message,
+				&nonce_use,
+				Some(asset_root),
+			)
+			.unwrap();
+		let bob_nonce = key_agg_ctx
+			.generate_nonce_pair_with_tapscript_root(
+				&bob_secret,
+				bob_seed,
+				&message,
+				&nonce_use,
+				Some(asset_root),
+			)
+			.unwrap();
+		let public_nonces = [alice_nonce.public_nonce, bob_nonce.public_nonce];
+		let mut alice_state = SimpleTaprootNonceState::new();
+		let alice_partial = key_agg_ctx
+			.sign_partial_with_tapscript_root(
+				&alice_secret,
+				alice_nonce.secret_nonce,
+				&public_nonces,
+				&message,
+				nonce_use,
+				&mut alice_state,
+				Some(asset_root),
+			)
+			.unwrap();
+		let mut bob_state = SimpleTaprootNonceState::new();
+		let bob_partial = key_agg_ctx
+			.sign_partial_with_tapscript_root(
+				&bob_secret,
+				bob_nonce.secret_nonce,
+				&public_nonces,
+				&message,
+				nonce_use,
+				&mut bob_state,
+				Some(asset_root),
+			)
+			.unwrap();
+
+		key_agg_ctx
+			.verify_partial_with_tapscript_root(
+				&alice_pubkey,
+				&alice_partial.public_nonce,
+				&alice_partial.partial_signature,
+				&public_nonces,
+				&message,
+				Some(asset_root),
+			)
+			.unwrap();
+		assert_eq!(
+			key_agg_ctx.verify_partial(
+				&alice_pubkey,
+				&alice_partial.public_nonce,
+				&alice_partial.partial_signature,
+				&public_nonces,
+				&message,
+			),
+			Err(SimpleTaprootMusigError::InvalidSignature)
+		);
+		assert_eq!(
+			key_agg_ctx.verify_partial_with_tapscript_root(
+				&alice_pubkey,
+				&alice_partial.public_nonce,
+				&alice_partial.partial_signature,
+				&public_nonces,
+				&message,
+				Some(wrong_root),
+			),
+			Err(SimpleTaprootMusigError::InvalidSignature)
+		);
+
+		let final_signature = key_agg_ctx
+			.aggregate_final_signature_with_tapscript_root(
+				&[alice_partial.partial_signature, bob_partial.partial_signature],
+				&public_nonces,
+				&message,
+				Some(asset_root),
+			)
+			.unwrap();
+		key_agg_ctx
+			.verify_final_signature_with_tapscript_root(
+				&final_signature,
+				&message,
+				Some(asset_root),
+			)
+			.unwrap();
+		assert_eq!(
+			key_agg_ctx.verify_final_signature(&final_signature, &message),
+			Err(SimpleTaprootMusigError::InvalidSignature)
+		);
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	#[test]
 	fn bip86_funding_script_matches_bolt_vector() {
 		let secp_ctx = Secp256k1::new();
 		let local_funding_pubkey = PublicKey::from_slice(
@@ -1878,6 +2100,71 @@ mod tests {
 			)
 			.unwrap()[..]
 		);
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	#[test]
+	fn verifies_lnd_taproot_commitment_partial_signature_vector() {
+		let local_funding_pubkey =
+			pubkey_from_hex("03b7203dec7c13896b6ff1f58b24f84458c441720a12b5a57426397e22f0a8c78b");
+		let remote_funding_pubkey =
+			pubkey_from_hex("02956e6845a6f346f97c5e028c0f8ab38a76b0124fd7184deab60f682b3e657fdb");
+		let key_agg_ctx = SimpleTaprootKeyAggContext::for_funding_keys(
+			local_funding_pubkey,
+			remote_funding_pubkey,
+		);
+		let local_nonce = Musig2PublicNonce::from_slice(
+			&Vec::<u8>::from_hex(
+				"025f2272ea289c5fe9d52d411f5a50a6d4882341bf0ecb201d5675850a2ba0b09d025bc489cf67752134ba81f8d7f1146d7455baf3190de75a6a661e2405212991a9",
+			)
+			.unwrap(),
+		)
+		.unwrap();
+		let remote_nonce = Musig2PublicNonce::from_slice(
+			&Vec::<u8>::from_hex(
+				"02d324627074522af8cf4287caf1e073a3493550b99aed2697e58f476ec402e272039c25fc616207e15917b7145cefcb4c9c702580baf255597d2fa115564a74a130",
+			)
+			.unwrap(),
+		)
+		.unwrap();
+		let remote_partial = SimpleTaprootPartialSignature::from_bytes(
+			Vec::<u8>::from_hex("3fa93659d4c2d590eadbd422595a37597ed58607e026a91f4e6e19329134a931")
+				.unwrap()
+				.try_into()
+				.unwrap(),
+		);
+		let commitment_tx: Transaction = bitcoin::consensus::encode::deserialize(
+			&Vec::<u8>::from_hex(
+				"020000000001015474cba49124ab0c4327c244bb2907059585c4af3fa5f3469701534120fec0170000000000c5fe1780044a010000000000002251201249c50576fdf914caa14f9221370b986df520bdbc73f57d5056a86ee03e5ac44a01000000000000225120f67ab012701705f3203d132f909a6810ef18c5da4c11d986cb50818803b8344ec0c62d00000000002251203609bb705034e5629aa6ec05c5ca906ac89ac08b34c4583c259521ec3017440874946a00000000002251203e1fcbbd06c8a7414704612c72be9834a75d86ed85b29f0ef0c52e1950afaff30140a4a9eb512a2f4094efdd2c566f1f20cc8a6e2c307a4a44cc3f9fea7fa147dd7038f1b048aa43fa0b4009175c1c37c37b96c01058541f9e1b61110fce4e831d9f55dc1920",
+			)
+			.unwrap()
+			.as_slice(),
+		)
+		.unwrap();
+		let funding_output = TxOut {
+			value: Amount::from_sat(10_000_000),
+			script_pubkey: ScriptBuf::from_bytes(
+				Vec::<u8>::from_hex(
+					"5120d0ebb4909d563a7ae1213fddede4ae54132fba0ef0b97ee3f8469191fecd348e",
+				)
+				.unwrap(),
+			),
+		};
+		let prevouts = [funding_output];
+		let prevouts = sighash::Prevouts::All(&prevouts);
+		let message = sighash::SighashCache::new(&commitment_tx)
+			.taproot_key_spend_signature_hash(0, &prevouts, TapSighashType::Default)
+			.unwrap()
+			.to_byte_array();
+		key_agg_ctx
+			.verify_partial(
+				&remote_funding_pubkey,
+				&remote_nonce,
+				&remote_partial,
+				&[local_nonce, remote_nonce],
+				&message,
+			)
+			.unwrap();
 	}
 
 	#[cfg(feature = "simple_taproot_musig2")]

@@ -1361,6 +1361,7 @@ mod tests {
 			funding_outpoint: Some(funding_outpoint),
 			splice_parent_funding_txid: None,
 			channel_type_features: ChannelTypeFeatures::only_static_remote_key(),
+			simple_taproot_tapscript_root: None,
 			channel_value_satoshis: 0,
 		};
 

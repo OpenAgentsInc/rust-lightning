@@ -1126,6 +1126,12 @@ pub struct ChannelTransactionParameters {
 	/// This channel's type, as negotiated during channel open. For old objects where this field
 	/// wasn't serialized, it will default to static_remote_key at deserialization.
 	pub channel_type_features: ChannelTypeFeatures,
+	/// Optional tapscript root used to tap-tweak simple-taproot MuSig2 funding keys.
+	///
+	/// Taproot Asset overlay channels use this to commit the funding output to
+	/// the asset tree. Plain simple-taproot channels leave it unset and use the
+	/// BIP86 no-script-path tweak.
+	pub simple_taproot_tapscript_root: Option<[u8; 32]>,
 	/// The value locked in the channel, denominated in satoshis.
 	pub channel_value_satoshis: u64,
 }
@@ -1201,7 +1207,7 @@ impl ChannelTransactionParameters {
 					self.holder_pubkeys.funding_pubkey,
 					p.pubkeys.funding_pubkey,
 				)
-				.bip86_funding_script_pubkey(&secp_ctx)
+				.funding_script_pubkey(&secp_ctx, self.simple_taproot_tapscript_root)
 				.ok();
 			}
 			#[cfg(not(feature = "simple_taproot_musig2"))]
@@ -1247,6 +1253,7 @@ impl ChannelTransactionParameters {
 			}),
 			splice_parent_funding_txid: None,
 			channel_type_features: ChannelTypeFeatures::empty(),
+			simple_taproot_tapscript_root: None,
 			channel_value_satoshis,
 		}
 	}
@@ -1271,6 +1278,7 @@ impl Writeable for ChannelTransactionParameters {
 			(11, self.channel_type_features, required),
 			(12, self.splice_parent_funding_txid, option),
 			(13, self.channel_value_satoshis, required),
+			(14, self.simple_taproot_tapscript_root, option),
 		});
 		Ok(())
 	}
@@ -1288,6 +1296,7 @@ impl ReadableArgs<Option<u64>> for ChannelTransactionParameters {
 		let mut _legacy_deserialization_prevention_marker: Option<()> = None;
 		let mut channel_type_features = None;
 		let mut channel_value_satoshis = None;
+		let mut simple_taproot_tapscript_root = None;
 
 		read_tlv_fields!(reader, {
 			(0, holder_pubkeys, required),
@@ -1299,6 +1308,7 @@ impl ReadableArgs<Option<u64>> for ChannelTransactionParameters {
 			(11, channel_type_features, option),
 			(12, splice_parent_funding_txid, option),
 			(13, channel_value_satoshis, option),
+			(14, simple_taproot_tapscript_root, option),
 		});
 
 		let channel_value_satoshis = match read_args {
@@ -1325,6 +1335,7 @@ impl ReadableArgs<Option<u64>> for ChannelTransactionParameters {
 			funding_outpoint,
 			splice_parent_funding_txid,
 			channel_type_features: channel_type_features.unwrap_or(ChannelTypeFeatures::only_static_remote_key()),
+			simple_taproot_tapscript_root,
 			channel_value_satoshis,
 		})
 	}
@@ -1454,6 +1465,7 @@ impl HolderCommitmentTransaction {
 			funding_outpoint: Some(funding_outpoint),
 			splice_parent_funding_txid: None,
 			channel_type_features: ChannelTypeFeatures::only_static_remote_key(),
+			simple_taproot_tapscript_root: None,
 			channel_value_satoshis,
 		};
 		let mut counterparty_htlc_sigs = Vec::new();
@@ -2522,6 +2534,7 @@ mod tests {
 				funding_outpoint: Some(chain::transaction::OutPoint { txid: Txid::all_zeros(), index: 0 }),
 				splice_parent_funding_txid: None,
 				channel_type_features: ChannelTypeFeatures::only_static_remote_key(),
+				simple_taproot_tapscript_root: None,
 				channel_value_satoshis: 4000,
 			};
 
@@ -2585,6 +2598,7 @@ mod tests {
 			funding_outpoint: Some(chain::transaction::OutPoint { txid: Txid::all_zeros(), index: 0 }),
 			splice_parent_funding_txid: None,
 			channel_type_features: ChannelTypeFeatures::simple_taproot_staging(),
+			simple_taproot_tapscript_root: None,
 			channel_value_satoshis: 10_000_000,
 		};
 

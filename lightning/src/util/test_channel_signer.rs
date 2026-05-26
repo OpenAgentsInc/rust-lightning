@@ -273,7 +273,7 @@ impl ChannelSigner for TestChannelSigner {
 	fn simple_taproot_musig_counter_nonce_pair(
 		&self, counterparty_funding_pubkey: PublicKey, funding_txid: Txid, nonce_index: u64,
 		scope: SimpleTaprootNonceScope, message: &[u8], splice_parent_funding_txid: Option<Txid>,
-		secp_ctx: &Secp256k1<secp256k1::All>,
+		tapscript_root: Option<[u8; 32]>, secp_ctx: &Secp256k1<secp256k1::All>,
 	) -> Result<SimpleTaprootNoncePair, SimpleTaprootMusigError> {
 		self.inner.simple_taproot_musig_counter_nonce_pair(
 			counterparty_funding_pubkey,
@@ -282,6 +282,7 @@ impl ChannelSigner for TestChannelSigner {
 			scope,
 			message,
 			splice_parent_funding_txid,
+			tapscript_root,
 			secp_ctx,
 		)
 	}
@@ -290,7 +291,8 @@ impl ChannelSigner for TestChannelSigner {
 	fn simple_taproot_musig_jit_nonce_pair(
 		&self, counterparty_funding_pubkey: PublicKey, funding_txid: Txid, nonce_index: u64,
 		scope: SimpleTaprootNonceScope, entropy: &[u8; 32], message: &[u8],
-		splice_parent_funding_txid: Option<Txid>, secp_ctx: &Secp256k1<secp256k1::All>,
+		splice_parent_funding_txid: Option<Txid>, tapscript_root: Option<[u8; 32]>,
+		secp_ctx: &Secp256k1<secp256k1::All>,
 	) -> Result<SimpleTaprootNoncePair, SimpleTaprootMusigError> {
 		self.inner.simple_taproot_musig_jit_nonce_pair(
 			counterparty_funding_pubkey,
@@ -300,6 +302,7 @@ impl ChannelSigner for TestChannelSigner {
 			entropy,
 			message,
 			splice_parent_funding_txid,
+			tapscript_root,
 			secp_ctx,
 		)
 	}
@@ -309,7 +312,8 @@ impl ChannelSigner for TestChannelSigner {
 		&self, counterparty_funding_pubkey: PublicKey, secret_nonce: SimpleTaprootSecretNonce,
 		public_nonces: &[Musig2PublicNonce], message: &[u8], funding_txid: Txid, nonce_index: u64,
 		scope: SimpleTaprootNonceScope, splice_parent_funding_txid: Option<Txid>,
-		secp_ctx: &Secp256k1<secp256k1::All>, nonce_state: &mut SimpleTaprootNonceState,
+		tapscript_root: Option<[u8; 32]>, secp_ctx: &Secp256k1<secp256k1::All>,
+		nonce_state: &mut SimpleTaprootNonceState,
 	) -> Result<SimpleTaprootPartialSignatureWithNonce, SimpleTaprootMusigError> {
 		self.inner.simple_taproot_musig_sign_partial(
 			counterparty_funding_pubkey,
@@ -320,6 +324,7 @@ impl ChannelSigner for TestChannelSigner {
 			nonce_index,
 			scope,
 			splice_parent_funding_txid,
+			tapscript_root,
 			secp_ctx,
 			nonce_state,
 		)

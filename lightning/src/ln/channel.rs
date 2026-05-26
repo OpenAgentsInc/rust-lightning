@@ -2872,6 +2872,7 @@ impl FundingScope {
 			funding_outpoint: None, // filled later
 			splice_parent_funding_txid: prev_funding.get_funding_txid(),
 			channel_type_features: channel_parameters.channel_type_features.clone(),
+			simple_taproot_tapscript_root: channel_parameters.simple_taproot_tapscript_root,
 			channel_value_satoshis: post_channel_value_sat,
 		};
 		post_channel_transaction_parameters
@@ -4171,6 +4172,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 				funding_outpoint: None,
 				splice_parent_funding_txid: None,
 				channel_type_features: channel_type.clone(),
+				simple_taproot_tapscript_root: None,
 				channel_value_satoshis,
 			},
 			funding_transaction: None,
@@ -4505,6 +4507,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 				funding_outpoint: None,
 				splice_parent_funding_txid: None,
 				channel_type_features: channel_type.clone(),
+				simple_taproot_tapscript_root: None,
 				// We'll add our counterparty's `funding_satoshis` when we receive `accept_channel2`.
 				channel_value_satoshis,
 			},
@@ -5828,6 +5831,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 				SimpleTaprootNonceScope::CooperativeCloseClosee,
 				SIMPLE_TAPROOT_COOPERATIVE_CLOSE_NONCE_PREIMAGE,
 				funding.channel_transaction_parameters.splice_parent_funding_txid,
+				funding.channel_transaction_parameters.simple_taproot_tapscript_root,
 				&self.secp_ctx,
 			)
 			.map(Some)
@@ -6021,6 +6025,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 				SimpleTaprootNonceScope::Commitment,
 				SIMPLE_TAPROOT_COMMITMENT_NONCE_PREIMAGE,
 				funding.channel_transaction_parameters.splice_parent_funding_txid,
+				funding.channel_transaction_parameters.simple_taproot_tapscript_root,
 				&self.secp_ctx,
 			)
 			.map(|nonce_pair| Some(nonce_pair.public_nonce))
@@ -6061,6 +6066,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 				SimpleTaprootNonceScope::Commitment,
 				SIMPLE_TAPROOT_COMMITMENT_NONCE_PREIMAGE,
 				funding.channel_transaction_parameters.splice_parent_funding_txid,
+				funding.channel_transaction_parameters.simple_taproot_tapscript_root,
 				&self.secp_ctx,
 			)
 			.map(|nonce_pair| Some(nonce_pair.public_nonce))
@@ -6123,6 +6129,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 				SimpleTaprootNonceScope::CounterpartyCommitment,
 				SIMPLE_TAPROOT_COUNTERPARTY_COMMITMENT_NONCE_PREIMAGE,
 				funding.channel_transaction_parameters.splice_parent_funding_txid,
+				funding.channel_transaction_parameters.simple_taproot_tapscript_root,
 				&self.secp_ctx,
 			)
 			.map_err(|err| {
@@ -6144,6 +6151,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 				nonce_index,
 				SimpleTaprootNonceScope::CounterpartyCommitment,
 				funding.channel_transaction_parameters.splice_parent_funding_txid,
+				funding.channel_transaction_parameters.simple_taproot_tapscript_root,
 				&self.secp_ctx,
 				&mut self.simple_taproot_nonce_state,
 			)
@@ -6226,12 +6234,13 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 				)
 			})?;
 		key_agg_ctx
-			.verify_partial(
+			.verify_partial_with_tapscript_root(
 				funding.counterparty_funding_pubkey(),
 				&partial_signature_with_nonce.public_nonce,
 				&partial_signature_with_nonce.partial_signature,
 				&public_nonces,
 				&message,
+				funding.channel_transaction_parameters.simple_taproot_tapscript_root,
 			)
 			.map_err(|_| {
 				ChannelError::close(
@@ -12036,6 +12045,7 @@ where
 				&entropy_source.get_secure_random_bytes(),
 				&message,
 				self.funding.channel_transaction_parameters.splice_parent_funding_txid,
+				self.funding.channel_transaction_parameters.simple_taproot_tapscript_root,
 				&self.context.secp_ctx,
 			)
 			.map_err(|_| {
@@ -12054,6 +12064,7 @@ where
 				counterparty_closee_nonce.nonce_index,
 				output_set.closer_nonce_scope(),
 				self.funding.channel_transaction_parameters.splice_parent_funding_txid,
+				self.funding.channel_transaction_parameters.simple_taproot_tapscript_root,
 				&self.context.secp_ctx,
 				&mut self.context.simple_taproot_nonce_state,
 			)
@@ -12113,15 +12124,26 @@ where
 		let message =
 			ChannelContext::<SP>::simple_taproot_closing_sighash(&self.funding, closing_tx)?;
 		let final_signature = key_agg_ctx
-			.aggregate_final_signature(partial_signatures, public_nonces, &message)
+			.aggregate_final_signature_with_tapscript_root(
+				partial_signatures,
+				public_nonces,
+				&message,
+				self.funding.channel_transaction_parameters.simple_taproot_tapscript_root,
+			)
 			.map_err(|_| {
 				ChannelError::close(
 					"Failed to aggregate simple-taproot closing signature".to_owned(),
 				)
 			})?;
-		key_agg_ctx.verify_final_signature(&final_signature, &message).map_err(|_| {
-			ChannelError::close("Invalid aggregate simple-taproot closing signature".to_owned())
-		})?;
+		key_agg_ctx
+			.verify_final_signature_with_tapscript_root(
+				&final_signature,
+				&message,
+				self.funding.channel_transaction_parameters.simple_taproot_tapscript_root,
+			)
+			.map_err(|_| {
+				ChannelError::close("Invalid aggregate simple-taproot closing signature".to_owned())
+			})?;
 		Ok(final_signature)
 	}
 
@@ -12492,12 +12514,13 @@ where
 				)
 			})?;
 		key_agg_ctx
-			.verify_partial(
+			.verify_partial_with_tapscript_root(
 				self.funding.counterparty_funding_pubkey(),
 				&counterparty_partial_with_nonce.public_nonce,
 				&counterparty_partial_with_nonce.partial_signature,
 				&public_nonces,
 				&message,
+				self.funding.channel_transaction_parameters.simple_taproot_tapscript_root,
 			)
 			.map_err(|_| {
 				ChannelError::close(
@@ -12516,6 +12539,7 @@ where
 				local_nonce_index,
 				SimpleTaprootNonceScope::CooperativeCloseClosee,
 				self.funding.channel_transaction_parameters.splice_parent_funding_txid,
+				self.funding.channel_transaction_parameters.simple_taproot_tapscript_root,
 				&self.context.secp_ctx,
 				&mut self.context.simple_taproot_nonce_state,
 			)
@@ -12681,12 +12705,13 @@ where
 				)
 			})?;
 		key_agg_ctx
-			.verify_partial(
+			.verify_partial_with_tapscript_root(
 				self.funding.counterparty_funding_pubkey(),
 				&counterparty_closee_nonce.public_nonce,
 				&counterparty_partial,
 				&public_nonces,
 				&message,
+				self.funding.channel_transaction_parameters.simple_taproot_tapscript_root,
 			)
 			.map_err(|_| {
 				ChannelError::close(

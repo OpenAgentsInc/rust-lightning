@@ -849,7 +849,8 @@ pub trait ChannelSigner {
 	fn simple_taproot_musig_counter_nonce_pair(
 		&self, _counterparty_funding_pubkey: PublicKey, _funding_txid: Txid, _nonce_index: u64,
 		_scope: SimpleTaprootNonceScope, _message: &[u8],
-		_splice_parent_funding_txid: Option<Txid>, _secp_ctx: &Secp256k1<All>,
+		_splice_parent_funding_txid: Option<Txid>, _tapscript_root: Option<[u8; 32]>,
+		_secp_ctx: &Secp256k1<All>,
 	) -> Result<SimpleTaprootNoncePair, SimpleTaprootMusigError> {
 		Err(SimpleTaprootMusigError::InvalidKey)
 	}
@@ -859,7 +860,8 @@ pub trait ChannelSigner {
 	fn simple_taproot_musig_jit_nonce_pair(
 		&self, _counterparty_funding_pubkey: PublicKey, _funding_txid: Txid, _nonce_index: u64,
 		_scope: SimpleTaprootNonceScope, _entropy: &[u8; 32], _message: &[u8],
-		_splice_parent_funding_txid: Option<Txid>, _secp_ctx: &Secp256k1<All>,
+		_splice_parent_funding_txid: Option<Txid>, _tapscript_root: Option<[u8; 32]>,
+		_secp_ctx: &Secp256k1<All>,
 	) -> Result<SimpleTaprootNoncePair, SimpleTaprootMusigError> {
 		Err(SimpleTaprootMusigError::InvalidKey)
 	}
@@ -870,8 +872,8 @@ pub trait ChannelSigner {
 		&self, _counterparty_funding_pubkey: PublicKey, _secret_nonce: SimpleTaprootSecretNonce,
 		_public_nonces: &[Musig2PublicNonce], _message: &[u8], _funding_txid: Txid,
 		_nonce_index: u64, _scope: SimpleTaprootNonceScope,
-		_splice_parent_funding_txid: Option<Txid>, _secp_ctx: &Secp256k1<All>,
-		_nonce_state: &mut SimpleTaprootNonceState,
+		_splice_parent_funding_txid: Option<Txid>, _tapscript_root: Option<[u8; 32]>,
+		_secp_ctx: &Secp256k1<All>, _nonce_state: &mut SimpleTaprootNonceState,
 	) -> Result<SimpleTaprootPartialSignatureWithNonce, SimpleTaprootMusigError> {
 		Err(SimpleTaprootMusigError::InvalidKey)
 	}
@@ -890,14 +892,15 @@ pub trait SimpleTaprootChannelSigner: ChannelSigner {
 	fn simple_taproot_counter_nonce_pair(
 		&self, counterparty_funding_pubkey: PublicKey, funding_txid: Txid, nonce_index: u64,
 		scope: SimpleTaprootNonceScope, message: &[u8], splice_parent_funding_txid: Option<Txid>,
-		secp_ctx: &Secp256k1<All>,
+		tapscript_root: Option<[u8; 32]>, secp_ctx: &Secp256k1<All>,
 	) -> Result<SimpleTaprootNoncePair, SimpleTaprootMusigError>;
 
 	/// Derives a JIT nonce pair from caller-supplied entropy.
 	fn simple_taproot_jit_nonce_pair(
 		&self, counterparty_funding_pubkey: PublicKey, funding_txid: Txid, nonce_index: u64,
 		scope: SimpleTaprootNonceScope, entropy: &[u8; 32], message: &[u8],
-		splice_parent_funding_txid: Option<Txid>, secp_ctx: &Secp256k1<All>,
+		splice_parent_funding_txid: Option<Txid>, tapscript_root: Option<[u8; 32]>,
+		secp_ctx: &Secp256k1<All>,
 	) -> Result<SimpleTaprootNoncePair, SimpleTaprootMusigError>;
 
 	/// Produces a MuSig2 partial signature and records the nonce as consumed.
@@ -905,7 +908,8 @@ pub trait SimpleTaprootChannelSigner: ChannelSigner {
 		&self, counterparty_funding_pubkey: PublicKey, secret_nonce: SimpleTaprootSecretNonce,
 		public_nonces: &[Musig2PublicNonce], message: &[u8], funding_txid: Txid, nonce_index: u64,
 		scope: SimpleTaprootNonceScope, splice_parent_funding_txid: Option<Txid>,
-		secp_ctx: &Secp256k1<All>, nonce_state: &mut SimpleTaprootNonceState,
+		tapscript_root: Option<[u8; 32]>, secp_ctx: &Secp256k1<All>,
+		nonce_state: &mut SimpleTaprootNonceState,
 	) -> Result<SimpleTaprootPartialSignatureWithNonce, SimpleTaprootMusigError>;
 }
 
@@ -1699,7 +1703,7 @@ impl ChannelSigner for InMemorySigner {
 	fn simple_taproot_musig_counter_nonce_pair(
 		&self, counterparty_funding_pubkey: PublicKey, funding_txid: Txid, nonce_index: u64,
 		scope: SimpleTaprootNonceScope, message: &[u8], splice_parent_funding_txid: Option<Txid>,
-		secp_ctx: &Secp256k1<All>,
+		tapscript_root: Option<[u8; 32]>, secp_ctx: &Secp256k1<All>,
 	) -> Result<SimpleTaprootNoncePair, SimpleTaprootMusigError> {
 		<Self as SimpleTaprootChannelSigner>::simple_taproot_counter_nonce_pair(
 			self,
@@ -1709,6 +1713,7 @@ impl ChannelSigner for InMemorySigner {
 			scope,
 			message,
 			splice_parent_funding_txid,
+			tapscript_root,
 			secp_ctx,
 		)
 	}
@@ -1717,7 +1722,8 @@ impl ChannelSigner for InMemorySigner {
 	fn simple_taproot_musig_jit_nonce_pair(
 		&self, counterparty_funding_pubkey: PublicKey, funding_txid: Txid, nonce_index: u64,
 		scope: SimpleTaprootNonceScope, entropy: &[u8; 32], message: &[u8],
-		splice_parent_funding_txid: Option<Txid>, secp_ctx: &Secp256k1<All>,
+		splice_parent_funding_txid: Option<Txid>, tapscript_root: Option<[u8; 32]>,
+		secp_ctx: &Secp256k1<All>,
 	) -> Result<SimpleTaprootNoncePair, SimpleTaprootMusigError> {
 		<Self as SimpleTaprootChannelSigner>::simple_taproot_jit_nonce_pair(
 			self,
@@ -1728,6 +1734,7 @@ impl ChannelSigner for InMemorySigner {
 			entropy,
 			message,
 			splice_parent_funding_txid,
+			tapscript_root,
 			secp_ctx,
 		)
 	}
@@ -1737,7 +1744,8 @@ impl ChannelSigner for InMemorySigner {
 		&self, counterparty_funding_pubkey: PublicKey, secret_nonce: SimpleTaprootSecretNonce,
 		public_nonces: &[Musig2PublicNonce], message: &[u8], funding_txid: Txid, nonce_index: u64,
 		scope: SimpleTaprootNonceScope, splice_parent_funding_txid: Option<Txid>,
-		secp_ctx: &Secp256k1<All>, nonce_state: &mut SimpleTaprootNonceState,
+		tapscript_root: Option<[u8; 32]>, secp_ctx: &Secp256k1<All>,
+		nonce_state: &mut SimpleTaprootNonceState,
 	) -> Result<SimpleTaprootPartialSignatureWithNonce, SimpleTaprootMusigError> {
 		<Self as SimpleTaprootChannelSigner>::simple_taproot_sign_partial(
 			self,
@@ -1749,6 +1757,7 @@ impl ChannelSigner for InMemorySigner {
 			nonce_index,
 			scope,
 			splice_parent_funding_txid,
+			tapscript_root,
 			secp_ctx,
 			nonce_state,
 		)
@@ -1772,7 +1781,7 @@ impl SimpleTaprootChannelSigner for InMemorySigner {
 	fn simple_taproot_counter_nonce_pair(
 		&self, counterparty_funding_pubkey: PublicKey, funding_txid: Txid, nonce_index: u64,
 		scope: SimpleTaprootNonceScope, message: &[u8], splice_parent_funding_txid: Option<Txid>,
-		secp_ctx: &Secp256k1<All>,
+		tapscript_root: Option<[u8; 32]>, secp_ctx: &Secp256k1<All>,
 	) -> Result<SimpleTaprootNoncePair, SimpleTaprootMusigError> {
 		let (funding_secret, key_agg_ctx) = self.simple_taproot_funding_secret_and_context(
 			counterparty_funding_pubkey,
@@ -1782,13 +1791,20 @@ impl SimpleTaprootChannelSigner for InMemorySigner {
 		let nonce_use = SimpleTaprootNonceUse::new(funding_txid, nonce_index, scope);
 		let nonce_seed =
 			derive_simple_taproot_counter_nonce_seed(&self.commitment_seed, &nonce_use);
-		key_agg_ctx.generate_nonce_pair(&funding_secret, nonce_seed, message, &nonce_use)
+		key_agg_ctx.generate_nonce_pair_with_tapscript_root(
+			&funding_secret,
+			nonce_seed,
+			message,
+			&nonce_use,
+			tapscript_root,
+		)
 	}
 
 	fn simple_taproot_jit_nonce_pair(
 		&self, counterparty_funding_pubkey: PublicKey, funding_txid: Txid, nonce_index: u64,
 		scope: SimpleTaprootNonceScope, entropy: &[u8; 32], message: &[u8],
-		splice_parent_funding_txid: Option<Txid>, secp_ctx: &Secp256k1<All>,
+		splice_parent_funding_txid: Option<Txid>, tapscript_root: Option<[u8; 32]>,
+		secp_ctx: &Secp256k1<All>,
 	) -> Result<SimpleTaprootNoncePair, SimpleTaprootMusigError> {
 		let (funding_secret, key_agg_ctx) = self.simple_taproot_funding_secret_and_context(
 			counterparty_funding_pubkey,
@@ -1797,14 +1813,21 @@ impl SimpleTaprootChannelSigner for InMemorySigner {
 		)?;
 		let nonce_use = SimpleTaprootNonceUse::new(funding_txid, nonce_index, scope);
 		let nonce_seed = derive_simple_taproot_jit_nonce_seed(entropy, &nonce_use);
-		key_agg_ctx.generate_nonce_pair(&funding_secret, nonce_seed, message, &nonce_use)
+		key_agg_ctx.generate_nonce_pair_with_tapscript_root(
+			&funding_secret,
+			nonce_seed,
+			message,
+			&nonce_use,
+			tapscript_root,
+		)
 	}
 
 	fn simple_taproot_sign_partial(
 		&self, counterparty_funding_pubkey: PublicKey, secret_nonce: SimpleTaprootSecretNonce,
 		public_nonces: &[Musig2PublicNonce], message: &[u8], funding_txid: Txid, nonce_index: u64,
 		scope: SimpleTaprootNonceScope, splice_parent_funding_txid: Option<Txid>,
-		secp_ctx: &Secp256k1<All>, nonce_state: &mut SimpleTaprootNonceState,
+		tapscript_root: Option<[u8; 32]>, secp_ctx: &Secp256k1<All>,
+		nonce_state: &mut SimpleTaprootNonceState,
 	) -> Result<SimpleTaprootPartialSignatureWithNonce, SimpleTaprootMusigError> {
 		let (funding_secret, key_agg_ctx) = self.simple_taproot_funding_secret_and_context(
 			counterparty_funding_pubkey,
@@ -1812,13 +1835,14 @@ impl SimpleTaprootChannelSigner for InMemorySigner {
 			secp_ctx,
 		)?;
 		let nonce_use = SimpleTaprootNonceUse::new(funding_txid, nonce_index, scope);
-		key_agg_ctx.sign_partial(
+		key_agg_ctx.sign_partial_with_tapscript_root(
 			&funding_secret,
 			secret_nonce,
 			public_nonces,
 			message,
 			nonce_use,
 			nonce_state,
+			tapscript_root,
 		)
 	}
 }
@@ -2976,6 +3000,7 @@ pub fn simple_taproot_in_memory_signer_interface_signs_and_rejects_reuse() {
 			&[100; 32],
 			&message,
 			None,
+			None,
 			&secp_ctx,
 		)
 		.unwrap();
@@ -2986,6 +3011,7 @@ pub fn simple_taproot_in_memory_signer_interface_signs_and_rejects_reuse() {
 			3,
 			SimpleTaprootNonceScope::Commitment,
 			&message,
+			None,
 			None,
 			&secp_ctx,
 		)
@@ -3003,6 +3029,7 @@ pub fn simple_taproot_in_memory_signer_interface_signs_and_rejects_reuse() {
 			3,
 			SimpleTaprootNonceScope::Commitment,
 			None,
+			None,
 			&secp_ctx,
 			&mut alice_nonce_state,
 		)
@@ -3016,6 +3043,7 @@ pub fn simple_taproot_in_memory_signer_interface_signs_and_rejects_reuse() {
 			funding_txid,
 			3,
 			SimpleTaprootNonceScope::Commitment,
+			None,
 			None,
 			&secp_ctx,
 			&mut alice_nonce_state,
@@ -3033,6 +3061,7 @@ pub fn simple_taproot_in_memory_signer_interface_signs_and_rejects_reuse() {
 			funding_txid,
 			3,
 			SimpleTaprootNonceScope::Commitment,
+			None,
 			None,
 			&secp_ctx,
 			&mut bob_nonce_state,

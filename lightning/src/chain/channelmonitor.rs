@@ -7068,6 +7068,7 @@ pub(super) fn dummy_monitor<S: EcdsaChannelSigner + 'static>(
 		funding_outpoint: Some(funding_outpoint),
 		splice_parent_funding_txid: None,
 		channel_type_features: ChannelTypeFeatures::only_static_remote_key(),
+		simple_taproot_tapscript_root: None,
 		channel_value_satoshis: 0,
 	};
 	let shutdown_script = crate::ln::script::ShutdownScript::new_p2wpkh_from_pubkey(dummy_key);
