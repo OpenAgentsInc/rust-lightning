@@ -36,6 +36,13 @@ pub const TAPROOT_ASSET_MONITOR_AUX_BLOB_SCHEMA_VERSION: u16 = 1;
 pub const TAPROOT_ASSET_HTLC_METADATA_PROTOCOL_VERSION: u16 =
 	SUPPORTED_TAPROOT_ASSET_CHANNEL_PROTOCOL_VERSION;
 
+/// Asset proof ownership is attached to the commitment transaction spend path.
+pub const TAPROOT_ASSET_RECOVERY_SPEND_COMMITMENT: u8 = 1;
+/// Asset proof ownership is attached to a second-level HTLC spend path.
+pub const TAPROOT_ASSET_RECOVERY_SPEND_SECOND_LEVEL_HTLC: u8 = 2;
+/// Asset proof ownership is attached to the final wallet sweep output.
+pub const TAPROOT_ASSET_RECOVERY_SPEND_FINAL_SWEEP: u8 = 3;
+
 /// Describes the single asset that an experimental Taproot Asset channel is
 /// allowed to carry.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -397,6 +404,138 @@ pub struct TaprootAssetCloseAllocationExpectation {
 	pub proof_root_sum: u64,
 }
 
+/// Proof-ownership state exported by force-close, second-level HTLC, and final
+/// sweep paths for an asset channel.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct TaprootAssetProofOwnershipState {
+	/// Taproot Asset channel protocol version for this recovery state.
+	pub protocol_version: u16,
+	/// Channel ID whose unilateral close path is being recovered.
+	pub channel_id: ChannelId,
+	/// Asset ID being recovered.
+	pub asset_id: [u8; TAPROOT_ASSET_ID_LEN],
+	/// Lightning commitment number this recovery state belongs to.
+	pub commitment_number: u64,
+	/// Recovery spend path, using `TAPROOT_ASSET_RECOVERY_SPEND_*`.
+	pub spend_kind: u8,
+	/// Whether the Bitcoin spend path has recovered the BTC output.
+	pub btc_recovered: bool,
+	/// Whether the Taproot Asset ownership proof has been reconstructed.
+	pub asset_proof_recovered: bool,
+	/// Taproot Asset proof/root reference hash for the recovered output.
+	pub proof_root_hash: [u8; TAPROOT_ASSET_ID_LEN],
+	/// Taproot Asset proof/root sum for the recovered output.
+	pub proof_root_sum: u64,
+	/// Digest of the proof material handed to the asset owner.
+	pub proof_handoff_digest: [u8; TAPROOT_ASSET_ID_LEN],
+	/// Digest of the output that the final sweep or resolver hands to the wallet.
+	pub sweep_output_digest: [u8; TAPROOT_ASSET_ID_LEN],
+	/// Integrity digest over the proof-ownership recovery state.
+	pub ownership_digest: [u8; TAPROOT_ASSET_ID_LEN],
+}
+
+impl TaprootAssetProofOwnershipState {
+	/// Builds validated proof-ownership recovery state.
+	pub fn new(
+		channel_id: ChannelId, asset_id: [u8; TAPROOT_ASSET_ID_LEN], commitment_number: u64,
+		spend_kind: u8, btc_recovered: bool, asset_proof_recovered: bool,
+		proof_root_hash: [u8; TAPROOT_ASSET_ID_LEN], proof_root_sum: u64,
+		proof_handoff_digest: [u8; TAPROOT_ASSET_ID_LEN],
+		sweep_output_digest: [u8; TAPROOT_ASSET_ID_LEN],
+	) -> Result<Self, TaprootAssetProofOwnershipError> {
+		let mut state = Self {
+			protocol_version: SUPPORTED_TAPROOT_ASSET_CHANNEL_PROTOCOL_VERSION,
+			channel_id,
+			asset_id,
+			commitment_number,
+			spend_kind,
+			btc_recovered,
+			asset_proof_recovered,
+			proof_root_hash,
+			proof_root_sum,
+			proof_handoff_digest,
+			sweep_output_digest,
+			ownership_digest: [0; TAPROOT_ASSET_ID_LEN],
+		};
+		state.ownership_digest = state.digest();
+		state.validate_integrity()?;
+		Ok(state)
+	}
+
+	/// Recomputes the proof-ownership recovery digest.
+	pub fn digest(&self) -> [u8; TAPROOT_ASSET_ID_LEN] {
+		let mut engine = Sha256::engine();
+		engine.input(b"openagents:taproot-asset-proof-ownership:v1");
+		engine.input(&self.protocol_version.to_be_bytes());
+		engine.input(&self.channel_id.0);
+		engine.input(&self.asset_id);
+		engine.input(&self.commitment_number.to_be_bytes());
+		engine.input(&[self.spend_kind]);
+		engine.input(&[self.btc_recovered as u8]);
+		engine.input(&[self.asset_proof_recovered as u8]);
+		engine.input(&self.proof_root_hash);
+		engine.input(&self.proof_root_sum.to_be_bytes());
+		engine.input(&self.proof_handoff_digest);
+		engine.input(&self.sweep_output_digest);
+		Sha256::from_engine(engine).to_byte_array()
+	}
+
+	/// Checks internal proof-ownership integrity before a caller compares it to
+	/// the expected recovery spend path.
+	pub fn validate_integrity(&self) -> Result<(), TaprootAssetProofOwnershipError> {
+		if self.protocol_version != SUPPORTED_TAPROOT_ASSET_CHANNEL_PROTOCOL_VERSION {
+			return Err(TaprootAssetProofOwnershipError::UnsupportedProtocolVersion);
+		}
+		if self.channel_id.is_zero()
+			|| self.asset_id == [0; TAPROOT_ASSET_ID_LEN]
+			|| self.proof_root_hash == [0; TAPROOT_ASSET_ID_LEN]
+			|| self.proof_root_sum == 0
+			|| self.sweep_output_digest == [0; TAPROOT_ASSET_ID_LEN]
+		{
+			return Err(TaprootAssetProofOwnershipError::MalformedProofOwnership);
+		}
+		if !matches!(
+			self.spend_kind,
+			TAPROOT_ASSET_RECOVERY_SPEND_COMMITMENT
+				| TAPROOT_ASSET_RECOVERY_SPEND_SECOND_LEVEL_HTLC
+				| TAPROOT_ASSET_RECOVERY_SPEND_FINAL_SWEEP
+		) {
+			return Err(TaprootAssetProofOwnershipError::MalformedProofOwnership);
+		}
+		if self.btc_recovered && !self.asset_proof_recovered {
+			return Err(TaprootAssetProofOwnershipError::PartialRecovery);
+		}
+		if self.asset_proof_recovered && self.proof_handoff_digest == [0; TAPROOT_ASSET_ID_LEN] {
+			return Err(TaprootAssetProofOwnershipError::MissingProofOwnershipMaterial);
+		}
+		if self.ownership_digest != self.digest() {
+			return Err(TaprootAssetProofOwnershipError::OwnershipDigestMismatch);
+		}
+		Ok(())
+	}
+}
+
+/// Expected proof-ownership state for an asset-channel unilateral recovery
+/// spend path.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct TaprootAssetProofOwnershipExpectation {
+	/// Expected channel ID.
+	pub channel_id: ChannelId,
+	/// Expected asset ID.
+	pub asset_id: [u8; TAPROOT_ASSET_ID_LEN],
+	/// Latest safe commitment number for this recovery path.
+	pub latest_commitment_number: u64,
+	/// Expected recovery spend path.
+	pub spend_kind: u8,
+	/// Expected proof/root hash.
+	pub proof_root_hash: [u8; TAPROOT_ASSET_ID_LEN],
+	/// Expected proof/root sum.
+	pub proof_root_sum: u64,
+	/// Whether this recovery path must include reconstructed asset proof
+	/// ownership to be considered recovered.
+	pub require_asset_proof: bool,
+}
+
 /// Asset-channel state that must be persisted with the matching
 /// [`ChannelMonitorUpdate`](crate::chain::channelmonitor::ChannelMonitorUpdate).
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -627,6 +766,38 @@ pub enum TaprootAssetCloseAllocationError {
 	AllocationDigestMismatch,
 }
 
+/// Errors returned by asset-channel proof-ownership recovery validation.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum TaprootAssetProofOwnershipError {
+	/// The recovery path was used without an asset-channel negotiation.
+	ChannelNotNegotiated,
+	/// An asset-channel recovery path required proof ownership but none was
+	/// present.
+	MissingProofOwnership,
+	/// The recovery state used an unsupported protocol version.
+	UnsupportedProtocolVersion,
+	/// The recovery state was zeroed, used an unknown spend path, or was
+	/// internally malformed.
+	MalformedProofOwnership,
+	/// The recovery state channel ID did not match the expected channel.
+	ChannelIdMismatch,
+	/// The recovery state asset ID did not match the expected asset.
+	AssetIdMismatch,
+	/// The recovery state commitment number was not the latest safe state.
+	CommitmentNumberMismatch,
+	/// The recovery state spend path did not match the expected resolver path.
+	SpendKindMismatch,
+	/// The recovery state proof root did not match the expected proof root.
+	ProofRootMismatch,
+	/// Asset proof ownership was claimed without proof handoff material.
+	MissingProofOwnershipMaterial,
+	/// BTC was recovered but asset proof ownership was not, so recovery is only
+	/// partial.
+	PartialRecovery,
+	/// The recovery state digest did not match the serialized fields.
+	OwnershipDigestMismatch,
+}
+
 /// Errors returned by Taproot Asset monitor aux blob validation.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum TaprootAssetMonitorAuxBlobError {
@@ -810,6 +981,58 @@ pub fn prepare_cooperative_close_asset_allocation(
 	Ok(allocation)
 }
 
+/// Prepares proof-ownership recovery state after confirming the channel
+/// negotiated the experimental single-asset type.
+pub fn prepare_asset_proof_ownership_recovery(
+	local_features: &InitFeatures, remote_features: &InitFeatures,
+	proposed_channel_type: &ChannelTypeFeatures, descriptor: TaprootAssetChannelDescriptor,
+	state: TaprootAssetProofOwnershipState,
+) -> Result<TaprootAssetProofOwnershipState, TaprootAssetProofOwnershipError> {
+	validate_single_asset_channel_open(
+		local_features,
+		remote_features,
+		proposed_channel_type,
+		descriptor,
+	)
+	.map_err(|_| TaprootAssetProofOwnershipError::ChannelNotNegotiated)?;
+	state.validate_integrity()?;
+	if state.asset_id != *descriptor.asset_id() {
+		return Err(TaprootAssetProofOwnershipError::AssetIdMismatch);
+	}
+	Ok(state)
+}
+
+/// Requires and validates proof ownership before an asset-channel unilateral
+/// recovery path is treated as recovered.
+pub fn validate_asset_proof_ownership_recovery<'a>(
+	state: Option<&'a TaprootAssetProofOwnershipState>,
+	expected: &TaprootAssetProofOwnershipExpectation,
+) -> Result<&'a TaprootAssetProofOwnershipState, TaprootAssetProofOwnershipError> {
+	let state = state.ok_or(TaprootAssetProofOwnershipError::MissingProofOwnership)?;
+	state.validate_integrity()?;
+	if state.channel_id != expected.channel_id {
+		return Err(TaprootAssetProofOwnershipError::ChannelIdMismatch);
+	}
+	if state.asset_id != expected.asset_id {
+		return Err(TaprootAssetProofOwnershipError::AssetIdMismatch);
+	}
+	if state.commitment_number != expected.latest_commitment_number {
+		return Err(TaprootAssetProofOwnershipError::CommitmentNumberMismatch);
+	}
+	if state.spend_kind != expected.spend_kind {
+		return Err(TaprootAssetProofOwnershipError::SpendKindMismatch);
+	}
+	if state.proof_root_hash != expected.proof_root_hash
+		|| state.proof_root_sum != expected.proof_root_sum
+	{
+		return Err(TaprootAssetProofOwnershipError::ProofRootMismatch);
+	}
+	if expected.require_asset_proof && !state.asset_proof_recovered {
+		return Err(TaprootAssetProofOwnershipError::PartialRecovery);
+	}
+	Ok(state)
+}
+
 /// Requires and validates the cooperative-close allocation for an asset
 /// channel before the close is treated as final.
 pub fn validate_cooperative_close_asset_allocation<'a>(
@@ -926,6 +1149,21 @@ impl_writeable!(TaprootAssetCloseAllocation, {
 	local_proof_digest,
 	remote_proof_digest,
 	allocation_digest
+});
+
+impl_writeable!(TaprootAssetProofOwnershipState, {
+	protocol_version,
+	channel_id,
+	asset_id,
+	commitment_number,
+	spend_kind,
+	btc_recovered,
+	asset_proof_recovered,
+	proof_root_hash,
+	proof_root_sum,
+	proof_handoff_digest,
+	sweep_output_digest,
+	ownership_digest
 });
 
 impl_writeable!(TaprootAssetHtlcMetadata, {
@@ -1108,6 +1346,34 @@ mod tests {
 			remote_amount: 425,
 			proof_root_hash: [6; TAPROOT_ASSET_ID_LEN],
 			proof_root_sum: 1_000,
+		}
+	}
+
+	fn proof_ownership_state(spend_kind: u8) -> TaprootAssetProofOwnershipState {
+		TaprootAssetProofOwnershipState::new(
+			ChannelId::from_bytes([3; 32]),
+			asset_id(),
+			43,
+			spend_kind,
+			true,
+			true,
+			[6; TAPROOT_ASSET_ID_LEN],
+			1_000,
+			[17; TAPROOT_ASSET_ID_LEN],
+			[18; TAPROOT_ASSET_ID_LEN],
+		)
+		.unwrap()
+	}
+
+	fn proof_ownership_expectation(spend_kind: u8) -> TaprootAssetProofOwnershipExpectation {
+		TaprootAssetProofOwnershipExpectation {
+			channel_id: ChannelId::from_bytes([3; 32]),
+			asset_id: asset_id(),
+			latest_commitment_number: 43,
+			spend_kind,
+			proof_root_hash: [6; TAPROOT_ASSET_ID_LEN],
+			proof_root_sum: 1_000,
+			require_asset_proof: true,
 		}
 	}
 
@@ -1518,6 +1784,153 @@ mod tests {
 		assert_eq!(
 			validate_asset_monitor_aux_blob(&wrong_root, &expected),
 			Err(TaprootAssetMonitorAuxBlobError::ProofRootMismatch)
+		);
+	}
+
+	#[test]
+	fn prepares_asset_proof_ownership_recovery_for_force_close_paths() {
+		let local = asset_features();
+		let remote = asset_features();
+		let channel_type = ChannelTypeFeatures::taproot_asset_single_asset();
+		for spend_kind in [
+			TAPROOT_ASSET_RECOVERY_SPEND_COMMITMENT,
+			TAPROOT_ASSET_RECOVERY_SPEND_SECOND_LEVEL_HTLC,
+			TAPROOT_ASSET_RECOVERY_SPEND_FINAL_SWEEP,
+		] {
+			let state = proof_ownership_state(spend_kind);
+			let prepared = prepare_asset_proof_ownership_recovery(
+				&local,
+				&remote,
+				&channel_type,
+				descriptor(),
+				state,
+			)
+			.unwrap();
+			assert_eq!(prepared, state);
+		}
+	}
+
+	#[test]
+	fn proof_ownership_recovery_requires_asset_channel_gate() {
+		let remote = asset_features();
+		let channel_type = ChannelTypeFeatures::taproot_asset_single_asset();
+		assert_eq!(
+			prepare_asset_proof_ownership_recovery(
+				&InitFeatures::empty(),
+				&remote,
+				&channel_type,
+				descriptor(),
+				proof_ownership_state(TAPROOT_ASSET_RECOVERY_SPEND_COMMITMENT),
+			),
+			Err(TaprootAssetProofOwnershipError::ChannelNotNegotiated)
+		);
+	}
+
+	#[test]
+	fn validates_asset_proof_ownership_recovery_paths() {
+		for spend_kind in [
+			TAPROOT_ASSET_RECOVERY_SPEND_COMMITMENT,
+			TAPROOT_ASSET_RECOVERY_SPEND_SECOND_LEVEL_HTLC,
+			TAPROOT_ASSET_RECOVERY_SPEND_FINAL_SWEEP,
+		] {
+			let state = proof_ownership_state(spend_kind);
+			let expected = proof_ownership_expectation(spend_kind);
+			assert_eq!(
+				validate_asset_proof_ownership_recovery(Some(&state), &expected).unwrap(),
+				&state
+			);
+		}
+	}
+
+	#[test]
+	fn rejects_missing_stale_or_wrong_asset_proof_ownership_recovery() {
+		let state = proof_ownership_state(TAPROOT_ASSET_RECOVERY_SPEND_COMMITMENT);
+		let expected = proof_ownership_expectation(TAPROOT_ASSET_RECOVERY_SPEND_COMMITMENT);
+		assert_eq!(
+			validate_asset_proof_ownership_recovery(None, &expected),
+			Err(TaprootAssetProofOwnershipError::MissingProofOwnership)
+		);
+
+		let mut stale = state;
+		stale.commitment_number = 42;
+		stale.ownership_digest = stale.digest();
+		assert_eq!(
+			validate_asset_proof_ownership_recovery(Some(&stale), &expected),
+			Err(TaprootAssetProofOwnershipError::CommitmentNumberMismatch)
+		);
+
+		let mut wrong_kind = state;
+		wrong_kind.spend_kind = TAPROOT_ASSET_RECOVERY_SPEND_FINAL_SWEEP;
+		wrong_kind.ownership_digest = wrong_kind.digest();
+		assert_eq!(
+			validate_asset_proof_ownership_recovery(Some(&wrong_kind), &expected),
+			Err(TaprootAssetProofOwnershipError::SpendKindMismatch)
+		);
+
+		let mut wrong_root = state;
+		wrong_root.proof_root_hash = [19; TAPROOT_ASSET_ID_LEN];
+		wrong_root.ownership_digest = wrong_root.digest();
+		assert_eq!(
+			validate_asset_proof_ownership_recovery(Some(&wrong_root), &expected),
+			Err(TaprootAssetProofOwnershipError::ProofRootMismatch)
+		);
+
+		let mut wrong_digest = state;
+		wrong_digest.ownership_digest = [19; TAPROOT_ASSET_ID_LEN];
+		assert_eq!(
+			validate_asset_proof_ownership_recovery(Some(&wrong_digest), &expected),
+			Err(TaprootAssetProofOwnershipError::OwnershipDigestMismatch)
+		);
+	}
+
+	#[test]
+	fn refuses_partial_or_malformed_asset_proof_ownership_recovery() {
+		assert_eq!(
+			TaprootAssetProofOwnershipState::new(
+				ChannelId::from_bytes([3; 32]),
+				asset_id(),
+				43,
+				TAPROOT_ASSET_RECOVERY_SPEND_COMMITMENT,
+				true,
+				false,
+				[6; TAPROOT_ASSET_ID_LEN],
+				1_000,
+				[17; TAPROOT_ASSET_ID_LEN],
+				[18; TAPROOT_ASSET_ID_LEN],
+			),
+			Err(TaprootAssetProofOwnershipError::PartialRecovery)
+		);
+
+		assert_eq!(
+			TaprootAssetProofOwnershipState::new(
+				ChannelId::from_bytes([3; 32]),
+				asset_id(),
+				43,
+				TAPROOT_ASSET_RECOVERY_SPEND_COMMITMENT,
+				false,
+				true,
+				[6; TAPROOT_ASSET_ID_LEN],
+				1_000,
+				[0; TAPROOT_ASSET_ID_LEN],
+				[18; TAPROOT_ASSET_ID_LEN],
+			),
+			Err(TaprootAssetProofOwnershipError::MissingProofOwnershipMaterial)
+		);
+
+		assert_eq!(
+			TaprootAssetProofOwnershipState::new(
+				ChannelId::from_bytes([3; 32]),
+				asset_id(),
+				43,
+				99,
+				true,
+				true,
+				[6; TAPROOT_ASSET_ID_LEN],
+				1_000,
+				[17; TAPROOT_ASSET_ID_LEN],
+				[18; TAPROOT_ASSET_ID_LEN],
+			),
+			Err(TaprootAssetProofOwnershipError::MalformedProofOwnership)
 		);
 	}
 }
