@@ -366,6 +366,42 @@ fn test_simple_taproot_funding_generation_uses_p2tr_and_rejects_wrong_script() {
 	}
 }
 
+#[cfg(feature = "simple_taproot_musig2")]
+#[test]
+fn test_taproot_asset_pending_output_keys_public_api() {
+	let mut taproot_asset_config = UserConfig::default();
+	taproot_asset_config.channel_handshake_config.negotiate_taproot_asset_channels = true;
+
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(
+		2,
+		&node_cfgs,
+		&[Some(taproot_asset_config.clone()), Some(taproot_asset_config)],
+	);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node.get_our_node_id();
+	nodes[0].node.create_channel(node_b_id, 1_000_000, 0, 42, None, None).unwrap();
+	let open_channel_msg = get_event_msg!(nodes[0], MessageSendEvent::SendOpenChannel, node_b_id);
+	handle_and_accept_open_channel(&nodes[1], node_a_id, &open_channel_msg);
+
+	let output_keys = nodes[1]
+		.node
+		.pending_simple_taproot_asset_output_keys(
+			open_channel_msg.common_fields.temporary_channel_id,
+			node_a_id,
+		)
+		.unwrap();
+	assert_ne!(output_keys.holder_commitment_to_holder, [0; 32]);
+	assert_ne!(output_keys.holder_commitment_to_counterparty, [0; 32]);
+	assert_ne!(output_keys.counterparty_commitment_to_holder, [0; 32]);
+	assert_ne!(output_keys.counterparty_commitment_to_counterparty, [0; 32]);
+	let _accept_channel_msg =
+		get_event_msg!(nodes[1], MessageSendEvent::SendAcceptChannel, node_a_id);
+}
+
 #[test]
 fn test_anchors_zero_fee_htlc_tx_downgrade() {
 	// Tests that if both nodes support anchors, but the remote node does not want to accept

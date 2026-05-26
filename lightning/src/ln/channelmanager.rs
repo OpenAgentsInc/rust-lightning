@@ -3950,8 +3950,6 @@ impl<
 	pub fn pending_simple_taproot_asset_output_keys(
 		&self, temporary_channel_id: ChannelId, counterparty_node_id: PublicKey,
 	) -> Result<SimpleTaprootAssetCommitmentOutputKeys, APIError> {
-		debug_assert!(&self.total_consistency_lock.try_write().is_err());
-
 		let per_peer_state = self.per_peer_state.read().unwrap();
 		let peer_state_mutex =
 			per_peer_state.get(&counterparty_node_id).ok_or_else(|| APIError::APIMisuseError {
