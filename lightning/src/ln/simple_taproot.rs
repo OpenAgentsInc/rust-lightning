@@ -1161,16 +1161,18 @@ fn p2tr_script_pubkey(spend_info: &TaprootSpendInfo) -> ScriptBuf {
 	ScriptBuf::new_p2tr_tweaked(spend_info.output_key())
 }
 
-/// Returns the BOLT simple-taproot `to_local` delay tapscript.
+/// Returns the staging simple-taproot `to_local` delay tapscript used by LND's
+/// `simple-taproot-overlay` channel type.
 #[cfg(feature = "simple_taproot_musig2")]
 pub fn simple_taproot_to_local_delay_script(
 	local_delayed_pubkey: &PublicKey, contest_delay: u16,
 ) -> ScriptBuf {
 	Builder::new()
 		.push_x_only_key(&xonly_key(local_delayed_pubkey))
-		.push_opcode(opcodes::all::OP_CHECKSIGVERIFY)
+		.push_opcode(opcodes::all::OP_CHECKSIG)
 		.push_int(contest_delay as i64)
 		.push_opcode(opcodes::all::OP_CSV)
+		.push_opcode(opcodes::all::OP_DROP)
 		.into_script()
 }
 
@@ -1245,14 +1247,16 @@ pub fn simple_taproot_to_local_spend_info_with_aux_leaf<C: Verification>(
 	})
 }
 
-/// Returns the BOLT simple-taproot `to_remote` settlement tapscript.
+/// Returns the staging simple-taproot `to_remote` settlement tapscript used by
+/// LND's `simple-taproot-overlay` channel type.
 #[cfg(feature = "simple_taproot_musig2")]
 pub fn simple_taproot_to_remote_script(remote_pubkey: &PublicKey) -> ScriptBuf {
 	Builder::new()
 		.push_x_only_key(&xonly_key(remote_pubkey))
-		.push_opcode(opcodes::all::OP_CHECKSIGVERIFY)
+		.push_opcode(opcodes::all::OP_CHECKSIG)
 		.push_opcode(opcodes::all::OP_PUSHNUM_1)
 		.push_opcode(opcodes::all::OP_CSV)
+		.push_opcode(opcodes::all::OP_DROP)
 		.into_script()
 }
 
@@ -2232,7 +2236,7 @@ mod tests {
 
 	#[cfg(feature = "simple_taproot_musig2")]
 	fn assert_script_hex(script: &ScriptBuf, expected_hex: &str) {
-		assert_eq!(script.as_bytes(), &Vec::<u8>::from_hex(expected_hex).unwrap()[..]);
+		assert_eq!(script.to_hex_string(), expected_hex);
 	}
 
 	#[cfg(feature = "simple_taproot_musig2")]
@@ -2250,7 +2254,7 @@ mod tests {
 
 	#[cfg(feature = "simple_taproot_musig2")]
 	#[test]
-	fn commitment_output_scripts_match_bolt_vectors() {
+	fn commitment_output_scripts_match_lnd_staging_overlay_vectors() {
 		let secp_ctx = Secp256k1::new();
 		let local_delayed_pubkey =
 			pubkey_from_hex("0315ec0138eb42f1ab4603042123988d53c854e89d1d87aa4dbb97a57482029c05");
@@ -2276,19 +2280,19 @@ mod tests {
 		);
 		assert_script_hex(
 			&to_local.delay.script,
-			"2015ec0138eb42f1ab4603042123988d53c854e89d1d87aa4dbb97a57482029c05ad029000b2",
+			"2015ec0138eb42f1ab4603042123988d53c854e89d1d87aa4dbb97a57482029c05ac029000b275",
 		);
 		assert_leaf_hash(
 			&to_local.delay.script,
-			"dbf0400e9c7c57f30b6ad0b0677e396b5a002cbf050d873c8925b966048e6a62",
+			"c8fdbfe551448cc7a8b825a713e7c3af0e0776db6f77b0a911c1da8443e167cc",
 		);
 		assert_eq!(
 			to_local.tapscript_root,
-			hash_from_hex("b8b76c2e893ca785072f0d7393e35d5bd72adf8b7ff2a53538aa664378a38a36")
+			hash_from_hex("3727872ab504288d1c0608abadfa0e4cf4a7bda51f0314473115f10e0e41e285")
 		);
 		assert_script_hex(
 			&to_local.script_pubkey,
-			"51203e1fcbbd06c8a7414704612c72be9834a75d86ed85b29f0ef0c52e1950afaff3",
+			"51207b49ec6082e5fe6cd59ab23ab3030a918928dab1e3ea202b5c0faba770a830bf",
 		);
 		assert_eq!(to_local.delay.control_block.len(), 65);
 		assert_eq!(to_local.revocation.control_block.len(), 65);
@@ -2298,19 +2302,19 @@ mod tests {
 			simple_taproot_to_remote_spend_info(&secp_ctx, &remote_payment_pubkey).unwrap();
 		assert_script_hex(
 			&to_remote.spend.script,
-			"20595f2ef2a51d2250a21077dbea4a7fc3ce550f10676996bf63719e2a71d1f4c9ad51b2",
+			"20595f2ef2a51d2250a21077dbea4a7fc3ce550f10676996bf63719e2a71d1f4c9ac51b275",
 		);
 		assert_leaf_hash(
 			&to_remote.spend.script,
-			"63ce35b16eb8f8687293d5a88c1d8ada3236843b79ca315fe9dd7c47f30f2bc9",
+			"657f34b36707dae72b379e576c6b888c15df491a400a0bcd8eda4731771385b9",
 		);
 		assert_eq!(
 			to_remote.tapscript_root,
-			hash_from_hex("63ce35b16eb8f8687293d5a88c1d8ada3236843b79ca315fe9dd7c47f30f2bc9")
+			hash_from_hex("657f34b36707dae72b379e576c6b888c15df491a400a0bcd8eda4731771385b9")
 		);
 		assert_script_hex(
 			&to_remote.script_pubkey,
-			"51203609bb705034e5629aa6ec05c5ca906ac89ac08b34c4583c259521ec30174408",
+			"51206b1a8421cb92be16a6a754426d4a6df8bfb7e2cd16d07c654039294a1df7328b",
 		);
 		assert_eq!(to_remote.spend.control_block.len(), 33);
 		assert_ne!(to_remote.tap_tweak, [0; 32]);
@@ -2490,19 +2494,19 @@ mod tests {
 		.unwrap();
 		assert_script_hex(
 			&second_level.spend.script,
-			"2015ec0138eb42f1ab4603042123988d53c854e89d1d87aa4dbb97a57482029c05ad029000b2",
+			"2015ec0138eb42f1ab4603042123988d53c854e89d1d87aa4dbb97a57482029c05ac029000b275",
 		);
 		assert_leaf_hash(
 			&second_level.spend.script,
-			"dbf0400e9c7c57f30b6ad0b0677e396b5a002cbf050d873c8925b966048e6a62",
+			"c8fdbfe551448cc7a8b825a713e7c3af0e0776db6f77b0a911c1da8443e167cc",
 		);
 		assert_eq!(
 			second_level.tapscript_root,
-			hash_from_hex("dbf0400e9c7c57f30b6ad0b0677e396b5a002cbf050d873c8925b966048e6a62")
+			hash_from_hex("c8fdbfe551448cc7a8b825a713e7c3af0e0776db6f77b0a911c1da8443e167cc")
 		);
 		assert_script_hex(
 			&second_level.script_pubkey,
-			"5120df20bcec43daa75161f7d013254e401812e0fee8bc3369220b6a33672fc18ba0",
+			"51205cf3964a0c10272a8fb62e9e1b87afb712265641eb89462f2df18cf1f43cf0c3",
 		);
 		assert_eq!(second_level.spend.control_block.len(), 33);
 		assert_ne!(second_level.tap_tweak, [0; 32]);

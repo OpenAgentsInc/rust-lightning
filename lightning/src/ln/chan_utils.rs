@@ -2870,8 +2870,8 @@ mod tests {
 		assert_eq!(outputs.len(), 4);
 		assert_txout(&outputs[0], 330, "51201249c50576fdf914caa14f9221370b986df520bdbc73f57d5056a86ee03e5ac4");
 		assert_txout(&outputs[1], 330, "5120f67ab012701705f3203d132f909a6810ef18c5da4c11d986cb50818803b8344e");
-		assert_txout(&outputs[2], 3_000_000, "5120eda023c764b3118b37028b4c37ac55e26b5359ee441b49e496af064b12e463f6");
-		assert_txout(&outputs[3], 6_984_820, "51203e1fcbbd06c8a7414704612c72be9834a75d86ed85b29f0ef0c52e1950afaff3");
+		assert_txout(&outputs[2], 3_000_000, "512014ab1c44604d7722a33efb5cdb837696afdc40fe218675718c67dd4ebe8b89f0");
+		assert_txout(&outputs[3], 6_984_820, "51207b49ec6082e5fe6cd59ab23ab3030a918928dab1e3ea202b5c0faba770a830bf");
 		assert_eq!(tx.trust().revokeable_output_index(), Some(3));
 		assert!(builder.verify(&tx).is_ok());
 	}
@@ -2917,11 +2917,11 @@ mod tests {
 		assert_eq!(outputs[3].script_pubkey, expected_to_broadcaster);
 		assert_ne!(
 			outputs[2].script_pubkey.as_bytes(),
-			&<Vec<u8>>::from_hex("51203609bb705034e5629aa6ec05c5ca906ac89ac08b34c4583c259521ec30174408").unwrap()[..]
+			&<Vec<u8>>::from_hex("512014ab1c44604d7722a33efb5cdb837696afdc40fe218675718c67dd4ebe8b89f0").unwrap()[..]
 		);
 		assert_ne!(
 			outputs[3].script_pubkey.as_bytes(),
-			&<Vec<u8>>::from_hex("51203e1fcbbd06c8a7414704612c72be9834a75d86ed85b29f0ef0c52e1950afaff3").unwrap()[..]
+			&<Vec<u8>>::from_hex("51207b49ec6082e5fe6cd59ab23ab3030a918928dab1e3ea202b5c0faba770a830bf").unwrap()[..]
 		);
 		assert!(builder.verify(&tx).is_ok());
 	}
@@ -2963,7 +2963,7 @@ mod tests {
 		);
 		assert_eq!(htlc_success.input[0].sequence, Sequence(1));
 		assert_eq!(htlc_success.output[0].value.to_sat(), 1_000);
-		assert_eq!(htlc_success.output[0].script_pubkey.as_bytes(), &<Vec<u8>>::from_hex("5120df20bcec43daa75161f7d013254e401812e0fee8bc3369220b6a33672fc18ba0").unwrap()[..]);
+		assert_eq!(htlc_success.output[0].script_pubkey.as_bytes(), &<Vec<u8>>::from_hex("51205cf3964a0c10272a8fb62e9e1b87afb712265641eb89462f2df18cf1f43cf0c3").unwrap()[..]);
 
 		assert_eq!(commit_tx_fee_sat(15_000, 0, &ChannelTypeFeatures::simple_taproot_staging()), 14_520);
 	}
