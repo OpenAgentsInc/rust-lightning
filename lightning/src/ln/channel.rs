@@ -1649,6 +1649,49 @@ where
 		}
 	}
 
+	#[cfg(feature = "simple_taproot_musig2")]
+	pub fn set_pending_simple_taproot_tapscript_root(
+		&mut self, tapscript_root: [u8; 32],
+	) -> Result<(), ChannelError> {
+		let funding = match &mut self.phase {
+			ChannelPhase::UnfundedOutboundV1(chan) => &mut chan.funding,
+			ChannelPhase::UnfundedInboundV1(chan) => &mut chan.funding,
+			_ => {
+				return Err(ChannelError::close(
+					"Taproot Asset tapscript root can only be set on an unfunded V1 channel"
+						.to_owned(),
+				));
+			},
+		};
+		if !funding.get_channel_type().requires_taproot_asset_channel() {
+			return Err(ChannelError::close(
+				"Taproot Asset tapscript root requires a Taproot Asset channel".to_owned(),
+			));
+		}
+		if funding.channel_transaction_parameters.funding_outpoint.is_some() {
+			return Err(ChannelError::close(
+				"Taproot Asset tapscript root must be set before funding outpoint binding"
+					.to_owned(),
+			));
+		}
+		if tapscript_root == [0; 32] {
+			return Err(ChannelError::close(
+				"Taproot Asset tapscript root cannot be all zeros".to_owned(),
+			));
+		}
+		match funding.channel_transaction_parameters.simple_taproot_tapscript_root {
+			Some(existing) if existing != tapscript_root => Err(ChannelError::close(
+				"Taproot Asset tapscript root changed for pending channel".to_owned(),
+			)),
+			Some(_) => Ok(()),
+			None => {
+				funding.channel_transaction_parameters.simple_taproot_tapscript_root =
+					Some(tapscript_root);
+				Ok(())
+			},
+		}
+	}
+
 	#[cfg(any(test, feature = "_externalize_tests"))]
 	pub fn is_unfunded_v1(&self) -> bool {
 		matches!(

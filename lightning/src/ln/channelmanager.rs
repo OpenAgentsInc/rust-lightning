@@ -3872,6 +3872,36 @@ impl<
 		)
 	}
 
+	/// Sets the Taproot Asset tapscript root on a pending simple-taproot funding flow.
+	///
+	/// This must be called after the Taproot Asset funding proof set has been validated and before
+	/// the funding outpoint is bound through `funding_created`/`funding_signed`. BTC-only and
+	/// non-asset channels reject this call.
+	#[cfg(feature = "simple_taproot_musig2")]
+	pub fn set_pending_simple_taproot_tapscript_root(
+		&self, temporary_channel_id: ChannelId, counterparty_node_id: PublicKey,
+		tapscript_root: [u8; 32],
+	) -> Result<(), APIError> {
+		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
+		debug_assert!(&self.total_consistency_lock.try_write().is_err());
+
+		let per_peer_state = self.per_peer_state.read().unwrap();
+		let peer_state_mutex =
+			per_peer_state.get(&counterparty_node_id).ok_or_else(|| APIError::APIMisuseError {
+				err: format!("Not connected to node: {counterparty_node_id}"),
+			})?;
+		let mut peer_state = peer_state_mutex.lock().unwrap();
+		let chan = peer_state.channel_by_id.get_mut(&temporary_channel_id).ok_or_else(|| {
+			APIError::ChannelUnavailable {
+				err: format!(
+					"Channel {temporary_channel_id} with counterparty {counterparty_node_id} not found"
+				),
+			}
+		})?;
+		chan.set_pending_simple_taproot_tapscript_root(tapscript_root)
+			.map_err(|err| APIError::APIMisuseError { err: err.to_string() })
+	}
+
 	/// Creates a new outbound channel to the given remote node and with the given value.
 	///
 	/// The only difference between this method and [`ChannelManager::create_channel`] is that this method sets

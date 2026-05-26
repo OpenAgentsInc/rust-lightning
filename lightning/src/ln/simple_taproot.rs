@@ -956,12 +956,17 @@ impl SimpleTaprootKeyAggContext {
 	/// Generates a BIP-327 secret/public nonce pair from caller-supplied entropy.
 	pub fn generate_nonce_pair_with_tapscript_root(
 		&self, signer_secret_key: &SecretKey, nonce_seed: [u8; 32], message: &[u8],
-		nonce_use: &SimpleTaprootNonceUse, tapscript_root: Option<[u8; 32]>,
+		nonce_use: &SimpleTaprootNonceUse, _tapscript_root: Option<[u8; 32]>,
 	) -> Result<SimpleTaprootNoncePair, SimpleTaprootMusigError> {
 		let signer_scalar = musig_scalar(signer_secret_key)?;
-		let musig_ctx = self.taproot_musig_context(tapscript_root)?;
+		let musig_ctx = self.musig_context()?;
 		let aggregate: musig2::secp::Point = musig_ctx.aggregated_pubkey();
 		let extra_input = nonce_use.extra_input();
+		// The Taproot Asset tapscript root is learned after the initial
+		// simple-taproot nonces are exchanged. Keep nonce derivation bound to
+		// the untweaked key set so the nonce we verify later is the same nonce
+		// we already sent, while signing and verification below still bind the
+		// final partial signatures to the root-tweaked output key.
 		let secret_nonce =
 			musig2::SecNonce::generate(nonce_seed, signer_scalar, aggregate, message, extra_input);
 		let public_nonce = musig_public_nonce_to_wire(&secret_nonce.public_nonce())?;
@@ -1982,6 +1987,13 @@ mod tests {
 				Some(asset_root),
 			)
 			.unwrap();
+		assert_eq!(
+			alice_nonce.public_nonce,
+			key_agg_ctx
+				.generate_nonce_pair(&alice_secret, alice_seed, &message, &nonce_use)
+				.unwrap()
+				.public_nonce
+		);
 		let bob_nonce = key_agg_ctx
 			.generate_nonce_pair_with_tapscript_root(
 				&bob_secret,
