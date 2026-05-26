@@ -1,5 +1,7 @@
 use crate::chain::chaininterface::LowerBoundedFeeEstimator;
-use crate::ln::channel::{get_initial_channel_type, InboundV1Channel, OutboundV1Channel};
+use crate::ln::channel::{
+	channel_type_from_open_channel, get_initial_channel_type, InboundV1Channel, OutboundV1Channel,
+};
 use crate::ln::channelmanager;
 use crate::prelude::*;
 use crate::util::config::UserConfig;
@@ -148,6 +150,56 @@ fn test_experimental_taproot_asset_channel_requires_simple_taproot_base() {
 		get_initial_channel_type(&config, &remote_features),
 		ChannelTypeFeatures::only_static_remote_key()
 	);
+}
+
+#[cfg(feature = "simple_taproot_musig2")]
+#[test]
+fn test_experimental_taproot_asset_channel_open_accepts_overlay_type() {
+	let test_est = TestFeeEstimator::new(15000);
+	let feeest = LowerBoundedFeeEstimator::new(&test_est);
+	let secp_ctx = Secp256k1::new();
+	let seed = [42; 32];
+	let network = Network::Testnet;
+	let keys_provider = TestKeysInterface::new(&seed, network);
+	let logger = TestLogger::new();
+
+	let node_b_node_id =
+		PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[42; 32]).unwrap());
+	let mut config = UserConfig::default();
+	config.channel_handshake_config.negotiate_taproot_asset_channels = true;
+	let mut node_a_chan = OutboundV1Channel::<&TestKeysInterface>::new(
+		&feeest,
+		&&keys_provider,
+		&&keys_provider,
+		node_b_node_id,
+		&channelmanager::provided_init_features(&config),
+		10000000,
+		100000,
+		42,
+		&config,
+		0,
+		42,
+		None,
+		&logger,
+		None,
+	)
+	.unwrap();
+
+	let mut open_channel_msg =
+		node_a_chan.get_open_channel(ChainHash::using_genesis_block(network), &&logger).unwrap();
+	open_channel_msg.common_fields.channel_type =
+		Some(ChannelTypeFeatures::taproot_asset_single_asset());
+
+	let mut init_features = InitFeatures::empty();
+	init_features.set_static_remote_key_optional();
+	init_features.set_simple_taproot_staging_optional();
+	init_features.set_taproot_asset_channel_optional();
+	let supported_channel_types = ChannelTypeFeatures::from_init(&init_features);
+
+	let accepted_type =
+		channel_type_from_open_channel(&open_channel_msg.common_fields, &supported_channel_types)
+			.unwrap();
+	assert_eq!(accepted_type, ChannelTypeFeatures::taproot_asset_single_asset());
 }
 
 fn do_test_get_initial_channel_type<F1, F2>(
