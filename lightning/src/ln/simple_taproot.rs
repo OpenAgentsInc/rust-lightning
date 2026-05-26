@@ -20,6 +20,8 @@ use bitcoin::hash_types::Txid;
 #[cfg(feature = "simple_taproot_musig2")]
 use bitcoin::hashes::hmac::{Hmac, HmacEngine};
 #[cfg(feature = "simple_taproot_musig2")]
+use bitcoin::hashes::ripemd160::Hash as Ripemd160;
+#[cfg(feature = "simple_taproot_musig2")]
 use bitcoin::hashes::sha256::Hash as Sha256;
 #[cfg(feature = "simple_taproot_musig2")]
 use bitcoin::hashes::{Hash, HashEngine};
@@ -29,13 +31,23 @@ use bitcoin::opcodes;
 use bitcoin::script::{Builder, ScriptBuf};
 use bitcoin::secp256k1::PublicKey;
 #[cfg(feature = "simple_taproot_musig2")]
-use bitcoin::secp256k1::{schnorr, Secp256k1, SecretKey, Verification, XOnlyPublicKey};
+use bitcoin::secp256k1::{
+	schnorr, Keypair, Message, Secp256k1, SecretKey, Signing, Verification, XOnlyPublicKey,
+};
 #[cfg(feature = "simple_taproot_musig2")]
-use bitcoin::taproot::{LeafVersion, TaprootBuilder, TaprootSpendInfo};
+use bitcoin::sighash::{self, SighashCache, TapSighashType};
+#[cfg(feature = "simple_taproot_musig2")]
+use bitcoin::taproot::{
+	LeafVersion, Signature as TaprootSignature, TapLeafHash, TaprootBuilder, TaprootSpendInfo,
+};
+#[cfg(feature = "simple_taproot_musig2")]
+use bitcoin::{Amount, Transaction, TxOut, Witness};
 
 use crate::io::{self, Read};
 use crate::ln::msgs::DecodeError;
 use crate::prelude::*;
+#[cfg(feature = "simple_taproot_musig2")]
+use crate::types::payment::PaymentHash;
 use crate::util::ser::{
 	CollectionLength, LengthLimitedRead, LengthReadable, Readable, Writeable, Writer,
 };
@@ -144,6 +156,50 @@ pub struct SimpleTaprootSingleLeafSpendInfo {
 	pub tap_tweak: [u8; 32],
 	/// The only script spend path for this output.
 	pub spend: SimpleTaprootLeafSpendInfo,
+}
+
+/// Spend data for a simple-taproot HTLC output.
+#[cfg(feature = "simple_taproot_musig2")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SimpleTaprootHtlcSpendInfo {
+	/// The P2TR commitment output script.
+	pub script_pubkey: ScriptBuf,
+	/// The tapscript root committed to by the output key.
+	pub tapscript_root: [u8; 32],
+	/// The BIP341 tap tweak committed to by the output key.
+	pub tap_tweak: [u8; 32],
+	/// The timeout spend path.
+	pub timeout: SimpleTaprootLeafSpendInfo,
+	/// The success spend path.
+	pub success: SimpleTaprootLeafSpendInfo,
+}
+
+/// A fully specified tapscript spend for a simple-taproot second-level HTLC transaction.
+#[cfg(feature = "simple_taproot_musig2")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SimpleTaprootHtlcSpendPath {
+	/// Offered HTLC timeout path: local HTLC signature, then remote HTLC signature.
+	OfferedTimeout,
+	/// Offered HTLC success path: remote HTLC signature and payment preimage.
+	OfferedSuccess,
+	/// Accepted HTLC timeout path: local HTLC signature.
+	AcceptedTimeout,
+	/// Accepted HTLC success path: remote HTLC signature, local HTLC signature, and payment preimage.
+	AcceptedSuccess,
+}
+
+/// A fully specified tapscript spend for a simple-taproot second-level HTLC transaction.
+#[cfg(feature = "simple_taproot_musig2")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SimpleTaprootSignedHtlcSpend {
+	/// The BIP341/BIP342 sighash covered by the HTLC signatures.
+	pub sighash: [u8; 32],
+	/// The local HTLC signature, when the selected spend path requires it.
+	pub local_signature: Option<TaprootSignature>,
+	/// The remote HTLC signature, when the selected spend path requires it.
+	pub remote_signature: Option<TaprootSignature>,
+	/// The complete witness stack for the HTLC transaction input.
+	pub witness: Witness,
 }
 
 /// A BIP-327 MuSig2 public nonce encoded as two compressed secp256k1 points.
@@ -1103,6 +1159,306 @@ pub fn simple_taproot_anchor_spend_info<C: Verification>(
 	Ok(SimpleTaprootSingleLeafSpendInfo { script_pubkey, tapscript_root, tap_tweak, spend })
 }
 
+/// Returns the BOLT simple-taproot offered-HTLC timeout tapscript.
+#[cfg(feature = "simple_taproot_musig2")]
+pub fn simple_taproot_offered_htlc_timeout_script(
+	local_htlc_pubkey: &PublicKey, remote_htlc_pubkey: &PublicKey,
+) -> ScriptBuf {
+	Builder::new()
+		.push_x_only_key(&xonly_key(local_htlc_pubkey))
+		.push_opcode(opcodes::all::OP_CHECKSIGVERIFY)
+		.push_x_only_key(&xonly_key(remote_htlc_pubkey))
+		.push_opcode(opcodes::all::OP_CHECKSIG)
+		.into_script()
+}
+
+/// Returns the BOLT simple-taproot offered-HTLC success tapscript.
+#[cfg(feature = "simple_taproot_musig2")]
+pub fn simple_taproot_offered_htlc_success_script(
+	remote_htlc_pubkey: &PublicKey, payment_hash: &PaymentHash,
+) -> ScriptBuf {
+	let payment_hash160 = Ripemd160::hash(&payment_hash.0[..]).to_byte_array();
+	Builder::new()
+		.push_opcode(opcodes::all::OP_SIZE)
+		.push_int(32)
+		.push_opcode(opcodes::all::OP_EQUALVERIFY)
+		.push_opcode(opcodes::all::OP_HASH160)
+		.push_slice(&payment_hash160)
+		.push_opcode(opcodes::all::OP_EQUALVERIFY)
+		.push_x_only_key(&xonly_key(remote_htlc_pubkey))
+		.push_opcode(opcodes::all::OP_CHECKSIGVERIFY)
+		.push_opcode(opcodes::all::OP_PUSHNUM_1)
+		.push_opcode(opcodes::all::OP_CSV)
+		.into_script()
+}
+
+/// Returns the BOLT simple-taproot accepted-HTLC timeout tapscript.
+#[cfg(feature = "simple_taproot_musig2")]
+pub fn simple_taproot_accepted_htlc_timeout_script(
+	remote_htlc_pubkey: &PublicKey, cltv_expiry: u32,
+) -> ScriptBuf {
+	Builder::new()
+		.push_x_only_key(&xonly_key(remote_htlc_pubkey))
+		.push_opcode(opcodes::all::OP_CHECKSIGVERIFY)
+		.push_opcode(opcodes::all::OP_PUSHNUM_1)
+		.push_opcode(opcodes::all::OP_CSV)
+		.push_opcode(opcodes::all::OP_VERIFY)
+		.push_int(cltv_expiry as i64)
+		.push_opcode(opcodes::all::OP_CLTV)
+		.into_script()
+}
+
+/// Returns the BOLT simple-taproot accepted-HTLC success tapscript.
+#[cfg(feature = "simple_taproot_musig2")]
+pub fn simple_taproot_accepted_htlc_success_script(
+	local_htlc_pubkey: &PublicKey, remote_htlc_pubkey: &PublicKey, payment_hash: &PaymentHash,
+) -> ScriptBuf {
+	let payment_hash160 = Ripemd160::hash(&payment_hash.0[..]).to_byte_array();
+	Builder::new()
+		.push_opcode(opcodes::all::OP_SIZE)
+		.push_int(32)
+		.push_opcode(opcodes::all::OP_EQUALVERIFY)
+		.push_opcode(opcodes::all::OP_HASH160)
+		.push_slice(&payment_hash160)
+		.push_opcode(opcodes::all::OP_EQUALVERIFY)
+		.push_x_only_key(&xonly_key(remote_htlc_pubkey))
+		.push_opcode(opcodes::all::OP_CHECKSIGVERIFY)
+		.push_x_only_key(&xonly_key(local_htlc_pubkey))
+		.push_opcode(opcodes::all::OP_CHECKSIG)
+		.into_script()
+}
+
+/// Returns all script-path spend data for a BOLT simple-taproot HTLC output.
+#[cfg(feature = "simple_taproot_musig2")]
+pub fn simple_taproot_htlc_spend_info<C: Verification>(
+	secp_ctx: &Secp256k1<C>, offered: bool, payment_hash: &PaymentHash, cltv_expiry: u32,
+	local_htlc_pubkey: &PublicKey, remote_htlc_pubkey: &PublicKey, revocation_pubkey: &PublicKey,
+) -> Result<SimpleTaprootHtlcSpendInfo, SimpleTaprootMusigError> {
+	let (timeout_script, success_script) = if offered {
+		(
+			simple_taproot_offered_htlc_timeout_script(local_htlc_pubkey, remote_htlc_pubkey),
+			simple_taproot_offered_htlc_success_script(remote_htlc_pubkey, payment_hash),
+		)
+	} else {
+		(
+			simple_taproot_accepted_htlc_timeout_script(local_htlc_pubkey, cltv_expiry),
+			simple_taproot_accepted_htlc_success_script(
+				local_htlc_pubkey,
+				remote_htlc_pubkey,
+				payment_hash,
+			),
+		)
+	};
+	let spend_info = TaprootBuilder::new()
+		.add_leaf(1, timeout_script.clone())
+		.map_err(|_| SimpleTaprootMusigError::InvalidKey)?
+		.add_leaf(1, success_script.clone())
+		.map_err(|_| SimpleTaprootMusigError::InvalidKey)?
+		.finalize(secp_ctx, xonly_key(revocation_pubkey))
+		.map_err(|_| SimpleTaprootMusigError::InvalidKey)?;
+	let script_pubkey = p2tr_script_pubkey(&spend_info);
+	let tapscript_root = tapscript_root(&spend_info)?;
+	let tap_tweak = spend_info.tap_tweak().to_byte_array();
+	let timeout = leaf_spend_info(&spend_info, timeout_script)?;
+	let success = leaf_spend_info(&spend_info, success_script)?;
+	Ok(SimpleTaprootHtlcSpendInfo { script_pubkey, tapscript_root, tap_tweak, timeout, success })
+}
+
+/// Returns all script-path spend data for a simple-taproot second-level HTLC output.
+#[cfg(feature = "simple_taproot_musig2")]
+pub fn simple_taproot_second_level_htlc_spend_info<C: Verification>(
+	secp_ctx: &Secp256k1<C>, local_delayed_pubkey: &PublicKey, revocation_pubkey: &PublicKey,
+	contest_delay: u16,
+) -> Result<SimpleTaprootSingleLeafSpendInfo, SimpleTaprootMusigError> {
+	let script = simple_taproot_to_local_delay_script(local_delayed_pubkey, contest_delay);
+	let spend_info = TaprootBuilder::new()
+		.add_leaf(0, script.clone())
+		.map_err(|_| SimpleTaprootMusigError::InvalidKey)?
+		.finalize(secp_ctx, xonly_key(revocation_pubkey))
+		.map_err(|_| SimpleTaprootMusigError::InvalidKey)?;
+	let script_pubkey = p2tr_script_pubkey(&spend_info);
+	let tapscript_root = tapscript_root(&spend_info)?;
+	let tap_tweak = spend_info.tap_tweak().to_byte_array();
+	let spend = leaf_spend_info(&spend_info, script)?;
+	Ok(SimpleTaprootSingleLeafSpendInfo { script_pubkey, tapscript_root, tap_tweak, spend })
+}
+
+/// Computes the BIP342 script-spend sighash for a second-level simple-taproot HTLC transaction.
+#[cfg(feature = "simple_taproot_musig2")]
+pub fn simple_taproot_htlc_tapscript_sighash(
+	htlc_tx: &Transaction, input_index: usize, previous_output: TxOut,
+	leaf: &SimpleTaprootLeafSpendInfo,
+) -> Result<[u8; 32], SimpleTaprootMusigError> {
+	let prevouts = [previous_output];
+	let prevouts = sighash::Prevouts::All(&prevouts);
+	let leaf_hash = TapLeafHash::from_script(&leaf.script, LeafVersion::TapScript);
+	let sighash = SighashCache::new(htlc_tx)
+		.taproot_script_spend_signature_hash(
+			input_index,
+			&prevouts,
+			leaf_hash,
+			TapSighashType::SinglePlusAnyoneCanPay,
+		)
+		.map_err(|_| SimpleTaprootMusigError::InvalidSignature)?;
+	Ok(sighash.to_byte_array())
+}
+
+/// Signs a second-level simple-taproot HTLC transaction with a BIP340 tapscript signature.
+#[cfg(feature = "simple_taproot_musig2")]
+pub fn simple_taproot_sign_htlc_tapscript<C: Signing>(
+	secp_ctx: &Secp256k1<C>, htlc_tx: &Transaction, input_index: usize, previous_output: TxOut,
+	leaf: &SimpleTaprootLeafSpendInfo, signer_secret_key: &SecretKey, aux_rand: &[u8; 32],
+) -> Result<TaprootSignature, SimpleTaprootMusigError> {
+	let sighash =
+		simple_taproot_htlc_tapscript_sighash(htlc_tx, input_index, previous_output, leaf)?;
+	let message = Message::from_digest(sighash);
+	let keypair = Keypair::from_secret_key(secp_ctx, signer_secret_key);
+	let signature = secp_ctx.sign_schnorr_with_aux_rand(&message, &keypair, aux_rand);
+	Ok(TaprootSignature { signature, sighash_type: TapSighashType::SinglePlusAnyoneCanPay })
+}
+
+/// Verifies a BIP340 tapscript signature for a second-level simple-taproot HTLC transaction.
+#[cfg(feature = "simple_taproot_musig2")]
+pub fn simple_taproot_verify_htlc_tapscript_signature<C: Verification>(
+	secp_ctx: &Secp256k1<C>, htlc_tx: &Transaction, input_index: usize, previous_output: TxOut,
+	leaf: &SimpleTaprootLeafSpendInfo, signer_pubkey: &PublicKey, signature: &TaprootSignature,
+) -> Result<(), SimpleTaprootMusigError> {
+	if signature.sighash_type != TapSighashType::SinglePlusAnyoneCanPay {
+		return Err(SimpleTaprootMusigError::InvalidSignature);
+	}
+	let sighash =
+		simple_taproot_htlc_tapscript_sighash(htlc_tx, input_index, previous_output, leaf)?;
+	let message = Message::from_digest(sighash);
+	secp_ctx
+		.verify_schnorr(&signature.signature, &message, &xonly_key(signer_pubkey))
+		.map_err(|_| SimpleTaprootMusigError::InvalidSignature)
+}
+
+/// Builds the BOLT simple-taproot second-level HTLC witness stack.
+#[cfg(feature = "simple_taproot_musig2")]
+pub fn simple_taproot_htlc_input_witness(
+	spend_path: SimpleTaprootHtlcSpendPath, remote_signature: Option<&TaprootSignature>,
+	local_signature: Option<&TaprootSignature>, preimage: Option<&[u8; 32]>,
+	leaf: &SimpleTaprootLeafSpendInfo,
+) -> Result<Witness, SimpleTaprootMusigError> {
+	let mut witness = Witness::new();
+	match spend_path {
+		SimpleTaprootHtlcSpendPath::OfferedTimeout => {
+			witness
+				.push(remote_signature.ok_or(SimpleTaprootMusigError::InvalidSignature)?.to_vec());
+			witness
+				.push(local_signature.ok_or(SimpleTaprootMusigError::InvalidSignature)?.to_vec());
+		},
+		SimpleTaprootHtlcSpendPath::OfferedSuccess => {
+			witness
+				.push(remote_signature.ok_or(SimpleTaprootMusigError::InvalidSignature)?.to_vec());
+			witness.push(preimage.ok_or(SimpleTaprootMusigError::InvalidSignature)?.to_vec());
+		},
+		SimpleTaprootHtlcSpendPath::AcceptedTimeout => {
+			witness
+				.push(local_signature.ok_or(SimpleTaprootMusigError::InvalidSignature)?.to_vec());
+		},
+		SimpleTaprootHtlcSpendPath::AcceptedSuccess => {
+			witness
+				.push(local_signature.ok_or(SimpleTaprootMusigError::InvalidSignature)?.to_vec());
+			witness
+				.push(remote_signature.ok_or(SimpleTaprootMusigError::InvalidSignature)?.to_vec());
+			witness.push(preimage.ok_or(SimpleTaprootMusigError::InvalidSignature)?.to_vec());
+		},
+	}
+	witness.push(leaf.script.to_bytes());
+	witness.push(leaf.control_block.clone());
+	Ok(witness)
+}
+
+/// Signs and assembles a BOLT simple-taproot second-level HTLC witness.
+#[cfg(feature = "simple_taproot_musig2")]
+pub fn simple_taproot_sign_htlc_spend<C: Signing + Verification>(
+	secp_ctx: &Secp256k1<C>, htlc_tx: &Transaction, input_index: usize, previous_amount: Amount,
+	previous_spend_info: &SimpleTaprootHtlcSpendInfo, leaf: &SimpleTaprootLeafSpendInfo,
+	spend_path: SimpleTaprootHtlcSpendPath, local_htlc_secret_key: Option<&SecretKey>,
+	remote_htlc_secret_key: Option<&SecretKey>, preimage: Option<&[u8; 32]>, aux_rand: &[u8; 32],
+) -> Result<SimpleTaprootSignedHtlcSpend, SimpleTaprootMusigError> {
+	let previous_output =
+		TxOut { value: previous_amount, script_pubkey: previous_spend_info.script_pubkey.clone() };
+	let needs_local_signature = matches!(
+		spend_path,
+		SimpleTaprootHtlcSpendPath::OfferedTimeout
+			| SimpleTaprootHtlcSpendPath::AcceptedTimeout
+			| SimpleTaprootHtlcSpendPath::AcceptedSuccess
+	);
+	let needs_remote_signature = matches!(
+		spend_path,
+		SimpleTaprootHtlcSpendPath::OfferedTimeout
+			| SimpleTaprootHtlcSpendPath::OfferedSuccess
+			| SimpleTaprootHtlcSpendPath::AcceptedSuccess
+	);
+	let local_signature = if needs_local_signature {
+		let local_htlc_secret_key =
+			local_htlc_secret_key.ok_or(SimpleTaprootMusigError::InvalidSignature)?;
+		let signature = simple_taproot_sign_htlc_tapscript(
+			secp_ctx,
+			htlc_tx,
+			input_index,
+			previous_output.clone(),
+			leaf,
+			local_htlc_secret_key,
+			aux_rand,
+		)?;
+		simple_taproot_verify_htlc_tapscript_signature(
+			secp_ctx,
+			htlc_tx,
+			input_index,
+			previous_output.clone(),
+			leaf,
+			&PublicKey::from_secret_key(secp_ctx, local_htlc_secret_key),
+			&signature,
+		)?;
+		Some(signature)
+	} else {
+		None
+	};
+	let remote_signature = if needs_remote_signature {
+		let remote_htlc_secret_key =
+			remote_htlc_secret_key.ok_or(SimpleTaprootMusigError::InvalidSignature)?;
+		let signature = simple_taproot_sign_htlc_tapscript(
+			secp_ctx,
+			htlc_tx,
+			input_index,
+			previous_output.clone(),
+			leaf,
+			remote_htlc_secret_key,
+			aux_rand,
+		)?;
+		simple_taproot_verify_htlc_tapscript_signature(
+			secp_ctx,
+			htlc_tx,
+			input_index,
+			previous_output.clone(),
+			leaf,
+			&PublicKey::from_secret_key(secp_ctx, remote_htlc_secret_key),
+			&signature,
+		)?;
+		Some(signature)
+	} else {
+		None
+	};
+	let sighash = simple_taproot_htlc_tapscript_sighash(
+		htlc_tx,
+		input_index,
+		TxOut { value: previous_amount, script_pubkey: previous_spend_info.script_pubkey.clone() },
+		leaf,
+	)?;
+	let witness = simple_taproot_htlc_input_witness(
+		spend_path,
+		remote_signature.as_ref(),
+		local_signature.as_ref(),
+		preimage,
+		leaf,
+	)?;
+	Ok(SimpleTaprootSignedHtlcSpend { sighash, local_signature, remote_signature, witness })
+}
+
 /// Derives a deterministic simple-taproot counter nonce seed from LDK's shachain seed.
 #[cfg(feature = "simple_taproot_musig2")]
 pub fn derive_simple_taproot_counter_nonce_seed(
@@ -1593,6 +1949,267 @@ mod tests {
 			&remote_anchor.script_pubkey,
 			"51201249c50576fdf914caa14f9221370b986df520bdbc73f57d5056a86ee03e5ac4",
 		);
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	#[test]
+	fn htlc_and_second_level_scripts_match_bolt_vectors() {
+		let secp_ctx = Secp256k1::new();
+		let local_delayed_pubkey =
+			pubkey_from_hex("0315ec0138eb42f1ab4603042123988d53c854e89d1d87aa4dbb97a57482029c05");
+		let revocation_pubkey =
+			pubkey_from_hex("03d4c77088d346bce67c13bbbf82ca112588f4b1c9595a1f8af3be9b2f95a109a0");
+		let local_htlc_pubkey =
+			pubkey_from_hex("0271e82ef65d5c667159036bfcf662cac2f6c41e38323d148bbbd00fdcd923739e");
+		let remote_htlc_pubkey =
+			pubkey_from_hex("032deba21cf03c42362c9f912094f62ba045a040a2060882ba1ed3abf1f664a47d");
+		let payment_hash = PaymentHash(Sha256::hash(&[0; 32]).to_byte_array());
+
+		let offered = simple_taproot_htlc_spend_info(
+			&secp_ctx,
+			true,
+			&payment_hash,
+			500,
+			&local_htlc_pubkey,
+			&remote_htlc_pubkey,
+			&revocation_pubkey,
+		)
+		.unwrap();
+		assert_script_hex(
+			&offered.success.script,
+			"82012088a914b8bcb07f6344b42ab04250c86a6e8b75d3fdbbc688202deba21cf03c42362c9f912094f62ba045a040a2060882ba1ed3abf1f664a47dad51b2",
+		);
+		assert_script_hex(
+			&offered.timeout.script,
+			"2071e82ef65d5c667159036bfcf662cac2f6c41e38323d148bbbd00fdcd923739ead202deba21cf03c42362c9f912094f62ba045a040a2060882ba1ed3abf1f664a47dac",
+		);
+		assert_eq!(
+			offered.tapscript_root,
+			hash_from_hex("f36c8bd45002c5264cfce9944211e7bc6ea974a6b90cf99a87812d18acf28a2a")
+		);
+		assert_script_hex(
+			&offered.script_pubkey,
+			"51203e5c3be9f4ce7ae07c28ad5e0eb0ab617c06eeb82b8d6ef10a5bf561848df5f0",
+		);
+		assert_eq!(offered.success.control_block.len(), 65);
+		assert_eq!(offered.timeout.control_block.len(), 65);
+		assert_ne!(offered.tap_tweak, [0; 32]);
+
+		let accepted = simple_taproot_htlc_spend_info(
+			&secp_ctx,
+			false,
+			&payment_hash,
+			500,
+			&local_htlc_pubkey,
+			&remote_htlc_pubkey,
+			&revocation_pubkey,
+		)
+		.unwrap();
+		assert_script_hex(
+			&accepted.success.script,
+			"82012088a914b8bcb07f6344b42ab04250c86a6e8b75d3fdbbc688202deba21cf03c42362c9f912094f62ba045a040a2060882ba1ed3abf1f664a47dad2071e82ef65d5c667159036bfcf662cac2f6c41e38323d148bbbd00fdcd923739eac",
+		);
+		assert_script_hex(
+			&accepted.timeout.script,
+			"2071e82ef65d5c667159036bfcf662cac2f6c41e38323d148bbbd00fdcd923739ead51b26902f401b1",
+		);
+		assert_eq!(
+			accepted.tapscript_root,
+			hash_from_hex("1a990caa4bb0ed41ceb19e7466fcea5d9b31e3da968f348f6223201c5831d0a3")
+		);
+		assert_script_hex(
+			&accepted.script_pubkey,
+			"51209aadbdd9aff986e5ea086cf53ae062972d33d0a5c7f5fb986dafec7fa6d7e6ea",
+		);
+		assert_eq!(accepted.success.control_block.len(), 65);
+		assert_eq!(accepted.timeout.control_block.len(), 65);
+		assert_ne!(accepted.tap_tweak, [0; 32]);
+
+		let second_level = simple_taproot_second_level_htlc_spend_info(
+			&secp_ctx,
+			&local_delayed_pubkey,
+			&revocation_pubkey,
+			144,
+		)
+		.unwrap();
+		assert_script_hex(
+			&second_level.spend.script,
+			"2015ec0138eb42f1ab4603042123988d53c854e89d1d87aa4dbb97a57482029c05ad029000b2",
+		);
+		assert_eq!(
+			second_level.tapscript_root,
+			hash_from_hex("dbf0400e9c7c57f30b6ad0b0677e396b5a002cbf050d873c8925b966048e6a62")
+		);
+		assert_script_hex(
+			&second_level.script_pubkey,
+			"5120df20bcec43daa75161f7d013254e401812e0fee8bc3369220b6a33672fc18ba0",
+		);
+		assert_eq!(second_level.spend.control_block.len(), 33);
+		assert_ne!(second_level.tap_tweak, [0; 32]);
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	#[test]
+	fn htlc_second_level_spends_sign_and_build_witnesses() {
+		let secp_ctx = Secp256k1::new();
+		let local_secret = SecretKey::from_slice(&[2; 32]).unwrap();
+		let remote_secret = SecretKey::from_slice(&[3; 32]).unwrap();
+		let revocation_secret = SecretKey::from_slice(&[4; 32]).unwrap();
+		let delayed_secret = SecretKey::from_slice(&[5; 32]).unwrap();
+		let local_htlc_pubkey = PublicKey::from_secret_key(&secp_ctx, &local_secret);
+		let remote_htlc_pubkey = PublicKey::from_secret_key(&secp_ctx, &remote_secret);
+		let revocation_pubkey = PublicKey::from_secret_key(&secp_ctx, &revocation_secret);
+		let delayed_pubkey = PublicKey::from_secret_key(&secp_ctx, &delayed_secret);
+		let preimage = [42; 32];
+		let payment_hash = PaymentHash(Sha256::hash(&preimage).to_byte_array());
+		let commitment_txid = Txid::from_slice(&[7; 32]).unwrap();
+		let aux_rand = [0; 32];
+
+		let offered = simple_taproot_htlc_spend_info(
+			&secp_ctx,
+			true,
+			&payment_hash,
+			500,
+			&local_htlc_pubkey,
+			&remote_htlc_pubkey,
+			&revocation_pubkey,
+		)
+		.unwrap();
+		let second_level = simple_taproot_second_level_htlc_spend_info(
+			&secp_ctx,
+			&delayed_pubkey,
+			&revocation_pubkey,
+			144,
+		)
+		.unwrap();
+		let timeout_tx = Transaction {
+			version: bitcoin::transaction::Version::TWO,
+			lock_time: bitcoin::absolute::LockTime::from_consensus(500),
+			input: vec![bitcoin::TxIn {
+				previous_output: bitcoin::OutPoint { txid: commitment_txid, vout: 0 },
+				script_sig: ScriptBuf::new(),
+				sequence: bitcoin::Sequence(1),
+				witness: Witness::new(),
+			}],
+			output: vec![TxOut {
+				value: Amount::from_sat(50_000),
+				script_pubkey: second_level.script_pubkey.clone(),
+			}],
+		};
+		let signed_timeout = simple_taproot_sign_htlc_spend(
+			&secp_ctx,
+			&timeout_tx,
+			0,
+			Amount::from_sat(50_000),
+			&offered,
+			&offered.timeout,
+			SimpleTaprootHtlcSpendPath::OfferedTimeout,
+			Some(&local_secret),
+			Some(&remote_secret),
+			None,
+			&aux_rand,
+		)
+		.unwrap();
+		assert_ne!(signed_timeout.sighash, [0; 32]);
+		assert_eq!(signed_timeout.witness.len(), 4);
+		let local_timeout_signature = signed_timeout.local_signature.as_ref().unwrap().to_vec();
+		let remote_timeout_signature = signed_timeout.remote_signature.as_ref().unwrap().to_vec();
+		assert_eq!(local_timeout_signature.len(), 65);
+		assert_eq!(remote_timeout_signature.len(), 65);
+		assert_eq!(&signed_timeout.witness[0], remote_timeout_signature.as_slice());
+		assert_eq!(&signed_timeout.witness[1], local_timeout_signature.as_slice());
+
+		let accepted = simple_taproot_htlc_spend_info(
+			&secp_ctx,
+			false,
+			&payment_hash,
+			500,
+			&local_htlc_pubkey,
+			&remote_htlc_pubkey,
+			&revocation_pubkey,
+		)
+		.unwrap();
+		let signed_accepted_timeout = simple_taproot_sign_htlc_spend(
+			&secp_ctx,
+			&timeout_tx,
+			0,
+			Amount::from_sat(50_000),
+			&accepted,
+			&accepted.timeout,
+			SimpleTaprootHtlcSpendPath::AcceptedTimeout,
+			Some(&local_secret),
+			None,
+			None,
+			&aux_rand,
+		)
+		.unwrap();
+		assert_eq!(signed_accepted_timeout.witness.len(), 3);
+		let local_accepted_timeout_signature =
+			signed_accepted_timeout.local_signature.as_ref().unwrap().to_vec();
+		assert!(signed_accepted_timeout.remote_signature.is_none());
+		assert_eq!(
+			&signed_accepted_timeout.witness[0],
+			local_accepted_timeout_signature.as_slice()
+		);
+
+		let success_tx = Transaction {
+			version: bitcoin::transaction::Version::TWO,
+			lock_time: bitcoin::absolute::LockTime::ZERO,
+			input: vec![bitcoin::TxIn {
+				previous_output: bitcoin::OutPoint { txid: commitment_txid, vout: 1 },
+				script_sig: ScriptBuf::new(),
+				sequence: bitcoin::Sequence(1),
+				witness: Witness::new(),
+			}],
+			output: vec![TxOut {
+				value: Amount::from_sat(50_000),
+				script_pubkey: second_level.script_pubkey,
+			}],
+		};
+		let signed_offered_success = simple_taproot_sign_htlc_spend(
+			&secp_ctx,
+			&success_tx,
+			0,
+			Amount::from_sat(50_000),
+			&offered,
+			&offered.success,
+			SimpleTaprootHtlcSpendPath::OfferedSuccess,
+			None,
+			Some(&remote_secret),
+			Some(&preimage),
+			&aux_rand,
+		)
+		.unwrap();
+		assert_eq!(signed_offered_success.witness.len(), 4);
+		assert!(signed_offered_success.local_signature.is_none());
+		let remote_offered_success_signature =
+			signed_offered_success.remote_signature.as_ref().unwrap().to_vec();
+		assert_eq!(&signed_offered_success.witness[0], remote_offered_success_signature.as_slice());
+		assert_eq!(&signed_offered_success.witness[1], &preimage[..]);
+
+		let signed_success = simple_taproot_sign_htlc_spend(
+			&secp_ctx,
+			&success_tx,
+			0,
+			Amount::from_sat(50_000),
+			&accepted,
+			&accepted.success,
+			SimpleTaprootHtlcSpendPath::AcceptedSuccess,
+			Some(&local_secret),
+			Some(&remote_secret),
+			Some(&preimage),
+			&aux_rand,
+		)
+		.unwrap();
+		assert_ne!(signed_success.sighash, [0; 32]);
+		assert_eq!(signed_success.witness.len(), 5);
+		let local_success_signature = signed_success.local_signature.as_ref().unwrap().to_vec();
+		let remote_success_signature = signed_success.remote_signature.as_ref().unwrap().to_vec();
+		assert_eq!(local_success_signature.len(), 65);
+		assert_eq!(remote_success_signature.len(), 65);
+		assert_eq!(&signed_success.witness[0], local_success_signature.as_slice());
+		assert_eq!(&signed_success.witness[1], remote_success_signature.as_slice());
+		assert_eq!(&signed_success.witness[2], &preimage[..]);
 	}
 
 	#[cfg(feature = "simple_taproot_musig2")]

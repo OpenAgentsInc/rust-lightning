@@ -14,6 +14,12 @@ use crate::ln::chan_utils::{
 use crate::ln::channel::{ANCHOR_OUTPUT_VALUE_SATOSHI, MIN_CHAN_DUST_LIMIT_SATOSHIS};
 use crate::ln::channel_keys::HtlcKey;
 use crate::ln::msgs;
+#[cfg(feature = "simple_taproot_musig2")]
+use crate::ln::simple_taproot::{
+	Musig2PublicNonce, SimpleTaprootKeyAggContext, SimpleTaprootMusigError, SimpleTaprootNoncePair,
+	SimpleTaprootNonceScope, SimpleTaprootNonceState, SimpleTaprootPartialSignatureWithNonce,
+	SimpleTaprootSecretNonce,
+};
 use crate::sign::ecdsa::EcdsaChannelSigner;
 use crate::sign::ChannelSigner;
 use crate::types::payment::PaymentPreimage;
@@ -249,6 +255,74 @@ impl ChannelSigner for TestChannelSigner {
 
 	fn channel_keys_id(&self) -> [u8; 32] {
 		self.inner.channel_keys_id()
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	fn simple_taproot_musig_key_agg_context(
+		&self, counterparty_funding_pubkey: PublicKey, splice_parent_funding_txid: Option<Txid>,
+		secp_ctx: &Secp256k1<secp256k1::All>,
+	) -> Result<SimpleTaprootKeyAggContext, SimpleTaprootMusigError> {
+		self.inner.simple_taproot_musig_key_agg_context(
+			counterparty_funding_pubkey,
+			splice_parent_funding_txid,
+			secp_ctx,
+		)
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	fn simple_taproot_musig_counter_nonce_pair(
+		&self, counterparty_funding_pubkey: PublicKey, funding_txid: Txid, nonce_index: u64,
+		scope: SimpleTaprootNonceScope, message: &[u8], splice_parent_funding_txid: Option<Txid>,
+		secp_ctx: &Secp256k1<secp256k1::All>,
+	) -> Result<SimpleTaprootNoncePair, SimpleTaprootMusigError> {
+		self.inner.simple_taproot_musig_counter_nonce_pair(
+			counterparty_funding_pubkey,
+			funding_txid,
+			nonce_index,
+			scope,
+			message,
+			splice_parent_funding_txid,
+			secp_ctx,
+		)
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	fn simple_taproot_musig_jit_nonce_pair(
+		&self, counterparty_funding_pubkey: PublicKey, funding_txid: Txid, nonce_index: u64,
+		scope: SimpleTaprootNonceScope, entropy: &[u8; 32], message: &[u8],
+		splice_parent_funding_txid: Option<Txid>, secp_ctx: &Secp256k1<secp256k1::All>,
+	) -> Result<SimpleTaprootNoncePair, SimpleTaprootMusigError> {
+		self.inner.simple_taproot_musig_jit_nonce_pair(
+			counterparty_funding_pubkey,
+			funding_txid,
+			nonce_index,
+			scope,
+			entropy,
+			message,
+			splice_parent_funding_txid,
+			secp_ctx,
+		)
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	fn simple_taproot_musig_sign_partial(
+		&self, counterparty_funding_pubkey: PublicKey, secret_nonce: SimpleTaprootSecretNonce,
+		public_nonces: &[Musig2PublicNonce], message: &[u8], funding_txid: Txid, nonce_index: u64,
+		scope: SimpleTaprootNonceScope, splice_parent_funding_txid: Option<Txid>,
+		secp_ctx: &Secp256k1<secp256k1::All>, nonce_state: &mut SimpleTaprootNonceState,
+	) -> Result<SimpleTaprootPartialSignatureWithNonce, SimpleTaprootMusigError> {
+		self.inner.simple_taproot_musig_sign_partial(
+			counterparty_funding_pubkey,
+			secret_nonce,
+			public_nonces,
+			message,
+			funding_txid,
+			nonce_index,
+			scope,
+			splice_parent_funding_txid,
+			secp_ctx,
+			nonce_state,
+		)
 	}
 }
 

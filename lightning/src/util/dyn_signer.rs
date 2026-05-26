@@ -11,6 +11,12 @@ use crate::ln::chan_utils::{
 use crate::ln::inbound_payment::ExpandedKey;
 use crate::ln::msgs::{UnsignedChannelAnnouncement, UnsignedGossipMessage};
 use crate::ln::script::ShutdownScript;
+#[cfg(feature = "simple_taproot_musig2")]
+use crate::ln::simple_taproot::{
+	SimpleTaprootKeyAggContext, SimpleTaprootMusigError, SimpleTaprootNoncePair,
+	SimpleTaprootNonceScope, SimpleTaprootNonceState, SimpleTaprootPartialSignatureWithNonce,
+	SimpleTaprootSecretNonce,
+};
 use crate::sign::ecdsa::EcdsaChannelSigner;
 use crate::sign::InMemorySigner;
 use crate::sign::{ChannelSigner, ReceiveAuthKey};
@@ -111,7 +117,32 @@ delegate!(DynSigner, ChannelSigner,
 		splice_parent_funding_txid: Txid, secp_ctx: &Secp256k1<secp256k1::All>
 	) -> PublicKey,
 	fn channel_keys_id(,) -> [u8; 32],
-	fn validate_counterparty_revocation(, idx: u64, secret: &SecretKey) -> Result<(), ()>
+	fn validate_counterparty_revocation(, idx: u64, secret: &SecretKey) -> Result<(), ()>,
+	#[cfg(feature = "simple_taproot_musig2")]
+	fn simple_taproot_musig_key_agg_context(,
+		counterparty_funding_pubkey: PublicKey, splice_parent_funding_txid: Option<Txid>,
+		secp_ctx: &Secp256k1<All>
+	) -> Result<SimpleTaprootKeyAggContext, SimpleTaprootMusigError>,
+	#[cfg(feature = "simple_taproot_musig2")]
+	fn simple_taproot_musig_counter_nonce_pair(,
+		counterparty_funding_pubkey: PublicKey, funding_txid: Txid, nonce_index: u64,
+		scope: SimpleTaprootNonceScope, message: &[u8],
+		splice_parent_funding_txid: Option<Txid>, secp_ctx: &Secp256k1<All>
+	) -> Result<SimpleTaprootNoncePair, SimpleTaprootMusigError>,
+	#[cfg(feature = "simple_taproot_musig2")]
+	fn simple_taproot_musig_jit_nonce_pair(,
+		counterparty_funding_pubkey: PublicKey, funding_txid: Txid, nonce_index: u64,
+		scope: SimpleTaprootNonceScope, entropy: &[u8; 32], message: &[u8],
+		splice_parent_funding_txid: Option<Txid>, secp_ctx: &Secp256k1<All>
+	) -> Result<SimpleTaprootNoncePair, SimpleTaprootMusigError>,
+	#[cfg(feature = "simple_taproot_musig2")]
+	fn simple_taproot_musig_sign_partial(,
+		counterparty_funding_pubkey: PublicKey, secret_nonce: SimpleTaprootSecretNonce,
+		public_nonces: &[crate::ln::simple_taproot::Musig2PublicNonce], message: &[u8],
+		funding_txid: Txid, nonce_index: u64, scope: SimpleTaprootNonceScope,
+		splice_parent_funding_txid: Option<Txid>, secp_ctx: &Secp256k1<All>,
+		nonce_state: &mut SimpleTaprootNonceState
+	) -> Result<SimpleTaprootPartialSignatureWithNonce, SimpleTaprootMusigError>
 );
 
 impl DynSignerTrait for InMemorySigner {}

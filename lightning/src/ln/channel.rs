@@ -5983,8 +5983,11 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 				&self.secp_ctx,
 			)
 			.map(|nonce_pair| Some(nonce_pair.public_nonce))
-			.map_err(|_| {
-				ChannelError::close("Failed to derive simple-taproot commitment nonce".to_owned())
+			.map_err(|err| {
+				ChannelError::close(format!(
+					"Failed to derive simple-taproot commitment nonce: {:?}",
+					err
+				))
 			})
 	}
 
@@ -6034,8 +6037,11 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 				funding.channel_transaction_parameters.splice_parent_funding_txid,
 				&self.secp_ctx,
 			)
-			.map_err(|_| {
-				ChannelError::close("Failed to derive simple-taproot commitment nonce".to_owned())
+			.map_err(|err| {
+				ChannelError::close(format!(
+					"Failed to derive simple-taproot commitment nonce: {:?}",
+					err
+				))
 			})?;
 		let message = Self::simple_taproot_commitment_sighash(funding, transaction)?;
 		let public_nonces = [local_nonce_pair.public_nonce, counterparty_public_nonce];
@@ -15536,6 +15542,15 @@ where
 				true
 			},
 		};
+		let simple_taproot_shutdown_nonce = self
+			.context
+			.simple_taproot_local_closee_public_nonce(
+				&self.funding,
+				self.context.simple_taproot_local_closee_nonce_index,
+			)
+			.map_err(|_| APIError::ChannelUnavailable {
+				err: "Failed to derive simple-taproot shutdown closee nonce".to_owned(),
+			})?;
 
 		// From here on out, we may not fail!
 		self.context.target_closing_feerate_sats_per_kw = target_feerate_sats_per_kw;
@@ -15568,7 +15583,7 @@ where
 		let shutdown = msgs::Shutdown {
 			channel_id: self.context.channel_id,
 			scriptpubkey: self.get_closing_scriptpubkey(),
-			simple_taproot_shutdown_nonce: None,
+			simple_taproot_shutdown_nonce,
 		};
 
 		// Go ahead and drop holding cell updates as we'd rather fail payments than wait to send

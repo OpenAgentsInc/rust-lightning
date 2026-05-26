@@ -42,7 +42,6 @@ use crate::ln::functional_test_utils::*;
 
 #[cfg(all(simple_close, feature = "simple_taproot_musig2"))]
 #[test]
-#[ignore = "requires #69 simple-taproot commitment output accounting before functional channel open can round-trip monitors"]
 fn simple_taproot_cooperative_close_uses_closing_complete_and_sig() {
 	let mut simple_taproot_config = UserConfig::default();
 	simple_taproot_config.channel_handshake_config.negotiate_simple_taproot_channels = true;

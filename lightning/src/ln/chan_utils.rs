@@ -48,7 +48,8 @@ use super::channel_keys::{
 };
 #[cfg(feature = "simple_taproot_musig2")]
 use super::simple_taproot::{
-	simple_taproot_anchor_spend_info, simple_taproot_to_local_spend_info,
+	simple_taproot_anchor_spend_info, simple_taproot_htlc_spend_info,
+	simple_taproot_second_level_htlc_spend_info, simple_taproot_to_local_spend_info,
 	simple_taproot_to_remote_spend_info, SimpleTaprootKeyAggContext,
 };
 use crate::chain;
@@ -160,7 +161,7 @@ pub(crate) const P2WSH_TXOUT_WEIGHT: u64 =
 pub fn htlc_success_tx_weight(channel_type_features: &ChannelTypeFeatures) -> u64 {
 	const HTLC_SUCCESS_TX_WEIGHT: u64 = 703;
 	const HTLC_SUCCESS_ANCHOR_TX_WEIGHT: u64 = 706;
-	if channel_type_features.supports_anchors_zero_fee_htlc_tx() { HTLC_SUCCESS_ANCHOR_TX_WEIGHT } else { HTLC_SUCCESS_TX_WEIGHT }
+	if channel_type_features.supports_anchors_zero_fee_htlc_tx() || requires_simple_taproot_outputs(channel_type_features) { HTLC_SUCCESS_ANCHOR_TX_WEIGHT } else { HTLC_SUCCESS_TX_WEIGHT }
 }
 
 /// Gets the weight of a single input-output pair in externally funded HTLC-success transactions
@@ -181,7 +182,7 @@ pub fn aggregated_htlc_success_input_output_pair_weight(
 pub fn htlc_timeout_tx_weight(channel_type_features: &ChannelTypeFeatures) -> u64 {
 	const HTLC_TIMEOUT_TX_WEIGHT: u64 = 663;
 	const HTLC_TIMEOUT_ANCHOR_TX_WEIGHT: u64 = 666;
-	if channel_type_features.supports_anchors_zero_fee_htlc_tx() { HTLC_TIMEOUT_ANCHOR_TX_WEIGHT } else { HTLC_TIMEOUT_TX_WEIGHT }
+	if channel_type_features.supports_anchors_zero_fee_htlc_tx() || requires_simple_taproot_outputs(channel_type_features) { HTLC_TIMEOUT_ANCHOR_TX_WEIGHT } else { HTLC_TIMEOUT_TX_WEIGHT }
 }
 
 /// Gets the weight of a single input-output pair in externally funded HTLC-timeout transactions
@@ -285,7 +286,14 @@ pub const COMMITMENT_TX_WEIGHT_PER_HTLC: u64 = 172;
 pub(crate) fn commitment_tx_base_weight(channel_type_features: &ChannelTypeFeatures) -> u64 {
 	const COMMITMENT_TX_BASE_WEIGHT: u64 = 724;
 	const COMMITMENT_TX_BASE_ANCHOR_WEIGHT: u64 = 1124;
-	if channel_type_features.supports_anchors_zero_fee_htlc_tx() { COMMITMENT_TX_BASE_ANCHOR_WEIGHT } else { COMMITMENT_TX_BASE_WEIGHT }
+	const COMMITMENT_TX_BASE_SIMPLE_TAPROOT_WEIGHT: u64 = 968;
+	if requires_simple_taproot_outputs(channel_type_features) {
+		COMMITMENT_TX_BASE_SIMPLE_TAPROOT_WEIGHT
+	} else if channel_type_features.supports_anchors_zero_fee_htlc_tx() {
+		COMMITMENT_TX_BASE_ANCHOR_WEIGHT
+	} else {
+		COMMITMENT_TX_BASE_WEIGHT
+	}
 }
 
 /// Get the fee cost of a commitment tx with a given number of HTLC outputs.
@@ -304,6 +312,7 @@ pub(crate) fn second_stage_tx_fees_sat(
 ) -> (u64, u64) {
 	if channel_type.supports_anchors_zero_fee_htlc_tx()
 		|| channel_type.supports_anchor_zero_fee_commitments()
+		|| requires_simple_taproot_outputs(channel_type)
 	{
 		(0, 0)
 	} else {
@@ -867,7 +876,13 @@ pub(crate) fn make_funding_redeemscript_from_slices(broadcaster_funding_key: &[u
 }
 
 #[cfg(feature = "simple_taproot_musig2")]
-fn requires_simple_taproot_outputs(channel_type_features: &ChannelTypeFeatures) -> bool {
+pub(crate) fn requires_simple_taproot_outputs(channel_type_features: &ChannelTypeFeatures) -> bool {
+	channel_type_features.requires_simple_taproot()
+		|| channel_type_features.requires_simple_taproot_staging()
+}
+
+#[cfg(not(feature = "simple_taproot_musig2"))]
+pub(crate) fn requires_simple_taproot_outputs(channel_type_features: &ChannelTypeFeatures) -> bool {
 	channel_type_features.requires_simple_taproot()
 		|| channel_type_features.requires_simple_taproot_staging()
 }
@@ -917,7 +932,7 @@ pub(crate) fn build_htlc_input(commitment_txid: &Txid, htlc: &HTLCOutputInCommit
 			vout: htlc.transaction_output_index.expect("Can't build an HTLC transaction for a dust output"),
 		},
 		script_sig: ScriptBuf::new(),
-		sequence: Sequence(if channel_type_features.supports_anchors_zero_fee_htlc_tx() { 1 } else { 0 }),
+		sequence: Sequence(if channel_type_features.supports_anchors_zero_fee_htlc_tx() || requires_simple_taproot_outputs(channel_type_features) { 1 } else { 0 }),
 		witness: Witness::new(),
 	}
 }
@@ -940,7 +955,26 @@ pub(crate) fn build_htlc_output(
 	};
 
 	TxOut {
-		script_pubkey: get_revokeable_redeemscript(revocation_key, contest_delay, broadcaster_delayed_payment_key).to_p2wsh(),
+		script_pubkey: {
+			#[cfg(feature = "simple_taproot_musig2")]
+			if requires_simple_taproot_outputs(channel_type_features) {
+				let secp_ctx = Secp256k1::verification_only();
+				simple_taproot_second_level_htlc_spend_info(
+					&secp_ctx,
+					&broadcaster_delayed_payment_key.to_public_key(),
+					&revocation_key.to_public_key(),
+					contest_delay,
+				)
+				.expect("valid simple-taproot second-level HTLC output")
+				.script_pubkey
+			} else {
+				get_revokeable_redeemscript(revocation_key, contest_delay, broadcaster_delayed_payment_key).to_p2wsh()
+			}
+			#[cfg(not(feature = "simple_taproot_musig2"))]
+			{
+				get_revokeable_redeemscript(revocation_key, contest_delay, broadcaster_delayed_payment_key).to_p2wsh()
+			}
+		},
 		value: output_value,
 	}
 }
@@ -2081,9 +2115,30 @@ impl CommitmentTransaction {
 		let mut txouts = Vec::with_capacity(nondust_htlcs.len() + 4);
 
 		for htlc in nondust_htlcs {
-			let script = get_htlc_redeemscript(htlc, channel_type, keys);
 			let txout = TxOut {
-				script_pubkey: script.to_p2wsh(),
+				script_pubkey: {
+					#[cfg(feature = "simple_taproot_musig2")]
+					if requires_simple_taproot_outputs(channel_type) {
+						let secp_ctx = Secp256k1::verification_only();
+						simple_taproot_htlc_spend_info(
+							&secp_ctx,
+							htlc.offered,
+							&htlc.payment_hash,
+							htlc.cltv_expiry,
+							&keys.broadcaster_htlc_key.to_public_key(),
+							&keys.countersignatory_htlc_key.to_public_key(),
+							&keys.revocation_key.to_public_key(),
+						)
+						.expect("valid simple-taproot HTLC output")
+						.script_pubkey
+					} else {
+						get_htlc_redeemscript(htlc, channel_type, keys).to_p2wsh()
+					}
+					#[cfg(not(feature = "simple_taproot_musig2"))]
+					{
+						get_htlc_redeemscript(htlc, channel_type, keys).to_p2wsh()
+					}
+				},
 				value: htlc.to_bitcoin_amount(),
 			};
 			txouts.push(txout);
@@ -2412,10 +2467,10 @@ mod tests {
 	use super::{ChannelPublicKeys, CounterpartyCommitmentSecrets};
 	use crate::chain;
 	use crate::ln::chan_utils::{
-		get_htlc_redeemscript, get_keyed_anchor_redeemscript,
-		get_to_countersigner_keyed_anchor_redeemscript, shared_anchor_script_pubkey,
-		BuiltCommitmentTransaction, ChannelTransactionParameters, CommitmentTransaction,
-		CounterpartyChannelTransactionParameters, HTLCOutputInCommitment,
+		build_htlc_transaction, commit_tx_fee_sat, get_htlc_redeemscript,
+		get_keyed_anchor_redeemscript, get_to_countersigner_keyed_anchor_redeemscript,
+		shared_anchor_script_pubkey, BuiltCommitmentTransaction, ChannelTransactionParameters,
+		CommitmentTransaction, CounterpartyChannelTransactionParameters, HTLCOutputInCommitment,
 		TrustedCommitmentTransaction,
 	};
 	#[cfg(feature = "simple_taproot_musig2")]
@@ -2424,13 +2479,14 @@ mod tests {
 	use crate::types::features::ChannelTypeFeatures;
 	use crate::types::payment::PaymentHash;
 	use crate::util::test_utils;
+	use bitcoin::hashes::sha256::Hash as Sha256;
 	use bitcoin::hashes::Hash;
 	use bitcoin::hex::FromHex;
 	use bitcoin::secp256k1::{self, PublicKey, Secp256k1, SecretKey};
 	#[cfg(feature = "simple_taproot_musig2")]
 	use bitcoin::transaction::TxOut;
 	use bitcoin::PublicKey as BitcoinPublicKey;
-	use bitcoin::{CompressedPublicKey, Network, ScriptBuf, Txid};
+	use bitcoin::{CompressedPublicKey, Network, ScriptBuf, Sequence, Txid};
 
 	#[allow(unused_imports)]
 	use crate::prelude::*;
@@ -2680,6 +2736,48 @@ mod tests {
 		assert_txout(&outputs[3], 6_984_820, "51203e1fcbbd06c8a7414704612c72be9834a75d86ed85b29f0ef0c52e1950afaff3");
 		assert_eq!(tx.trust().revokeable_output_index(), Some(3));
 		assert!(builder.verify(&tx).is_ok());
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	#[test]
+	#[rustfmt::skip]
+	fn test_simple_taproot_htlc_outputs_and_fees_match_bolt_vectors() {
+		let mut builder = simple_taproot_vector_builder();
+		builder.feerate_per_kw = 644;
+		let payment_hash = PaymentHash(Sha256::hash(&[0; 32]).to_byte_array());
+		let accepted_htlc = HTLCOutputInCommitment {
+			offered: false,
+			amount_msat: 1_000_000,
+			cltv_expiry: 500,
+			payment_hash,
+			transaction_output_index: None,
+		};
+		let offered_htlc = HTLCOutputInCommitment {
+			offered: true,
+			amount_msat: 2_000_000,
+			cltv_expiry: 500,
+			payment_hash,
+			transaction_output_index: None,
+		};
+		let tx = builder.build(6_988_000, 3_000_000, vec![accepted_htlc.clone(), offered_htlc.clone()]);
+		let outputs = &tx.built.transaction.output;
+		assert!(outputs.iter().any(|out| out.value.to_sat() == 1_000 && out.script_pubkey.as_bytes() == &<Vec<u8>>::from_hex("51209aadbdd9aff986e5ea086cf53ae062972d33d0a5c7f5fb986dafec7fa6d7e6ea").unwrap()[..]));
+		assert!(outputs.iter().any(|out| out.value.to_sat() == 2_000 && out.script_pubkey.as_bytes() == &<Vec<u8>>::from_hex("51203e5c3be9f4ce7ae07c28ad5e0eb0ab617c06eeb82b8d6ef10a5bf561848df5f0").unwrap()[..]));
+
+		let htlc_success = build_htlc_transaction(
+			&tx.trust().txid(),
+			builder.feerate_per_kw,
+			builder.channel_parameters.holder_selected_contest_delay,
+			tx.nondust_htlcs().iter().find(|htlc| !htlc.offered).unwrap(),
+			&builder.channel_parameters.channel_type_features,
+			&tx.trust().keys().broadcaster_delayed_payment_key,
+			&tx.trust().keys().revocation_key,
+		);
+		assert_eq!(htlc_success.input[0].sequence, Sequence(1));
+		assert_eq!(htlc_success.output[0].value.to_sat(), 1_000);
+		assert_eq!(htlc_success.output[0].script_pubkey.as_bytes(), &<Vec<u8>>::from_hex("5120df20bcec43daa75161f7d013254e401812e0fee8bc3369220b6a33672fc18ba0").unwrap()[..]);
+
+		assert_eq!(commit_tx_fee_sat(15_000, 0, &ChannelTypeFeatures::simple_taproot_staging()), 14_520);
 	}
 
 	#[test]

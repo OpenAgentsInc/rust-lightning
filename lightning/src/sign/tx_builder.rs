@@ -6,8 +6,8 @@ use bitcoin::secp256k1::{self, PublicKey, Secp256k1};
 
 use crate::ln::chan_utils::{
 	commit_tx_fee_sat, htlc_success_tx_weight, htlc_timeout_tx_weight, htlc_tx_fees_sat,
-	second_stage_tx_fees_sat, ChannelTransactionParameters, CommitmentTransaction,
-	HTLCOutputInCommitment,
+	requires_simple_taproot_outputs, second_stage_tx_fees_sat, ChannelTransactionParameters,
+	CommitmentTransaction, HTLCOutputInCommitment,
 };
 use crate::ln::channel::{
 	get_v2_channel_reserve_satoshis, CommitmentStats, ANCHOR_OUTPUT_VALUE_SATOSHI,
@@ -99,7 +99,9 @@ fn commit_plus_htlc_tx_fees_msat(
 }
 
 fn total_anchors_sat(channel_type: &ChannelTypeFeatures) -> u64 {
-	if channel_type.supports_anchors_zero_fee_htlc_tx() {
+	if channel_type.supports_anchors_zero_fee_htlc_tx()
+		|| requires_simple_taproot_outputs(channel_type)
+	{
 		ANCHOR_OUTPUT_VALUE_SATOSHI * 2
 	} else {
 		0
@@ -270,7 +272,10 @@ fn get_next_commitment_stats(
 		channel_type,
 	);
 
-	let spiked_feerate = if assume_fee_spike && !channel_type.supports_anchors_zero_fee_htlc_tx() {
+	let spiked_feerate = if assume_fee_spike
+		&& !channel_type.supports_anchors_zero_fee_htlc_tx()
+		&& !requires_simple_taproot_outputs(channel_type)
+	{
 		feerate_per_kw.saturating_mul(FEE_SPIKE_BUFFER_FEE_INCREASE_MULTIPLE as u32)
 	} else {
 		feerate_per_kw
@@ -668,12 +673,15 @@ fn get_available_balances(
 	// validating our own HTLC add. These HTLCs would also revert to `Committed` upon a disconnection.
 
 	// Note that the feerate is 0 in zero-fee commitment channels, so this statement is a noop
-	let spiked_feerate =
-		feerate_per_kw.saturating_mul(if !channel_type.supports_anchors_zero_fee_htlc_tx() {
+	let spiked_feerate = feerate_per_kw.saturating_mul(
+		if !channel_type.supports_anchors_zero_fee_htlc_tx()
+			&& !requires_simple_taproot_outputs(channel_type)
+		{
 			crate::ln::channel::FEE_SPIKE_BUFFER_FEE_INCREASE_MULTIPLE as u32
 		} else {
 			1
-		});
+		},
+	);
 
 	let local_nondust_htlc_count = pending_htlcs
 		.iter()
@@ -990,7 +998,9 @@ impl TxBuilder for SpecTxBuilder {
 		let channel_type = &channel_parameters.channel_type_features;
 
 		let is_dust = |offered: bool, amount_msat: u64| -> bool {
-			let htlc_tx_fee_sat = if channel_type.supports_anchors_zero_fee_htlc_tx() {
+			let htlc_tx_fee_sat = if channel_type.supports_anchors_zero_fee_htlc_tx()
+				|| requires_simple_taproot_outputs(channel_type)
+			{
 				0
 			} else {
 				let htlc_tx_weight = if offered {
