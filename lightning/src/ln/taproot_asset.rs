@@ -659,6 +659,218 @@ pub struct TaprootAssetMonitorAuxBlobExpectation {
 	pub proof_root_sum: u64,
 }
 
+/// Bounded lifecycle state for an experimental single-asset channel layered on
+/// the simple-taproot channel type.
+///
+/// This is the rust-lightning-side state machine boundary used by `tap-ldk`.
+/// It deliberately keeps asset state explicit: callers must negotiate the
+/// simple-taproot + asset channel type, validate proof-backed funding, attach a
+/// monitor aux blob before each asset commitment is accepted, and validate
+/// close/recovery material against the latest safe commitment.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct TaprootAssetChannelState {
+	/// The single asset this channel is allowed to carry.
+	pub descriptor: TaprootAssetChannelDescriptor,
+	/// The final channel ID used by monitor, HTLC, close, and recovery state.
+	pub channel_id: ChannelId,
+	/// The funding outpoint backing the channel.
+	pub funding_outpoint: OutPoint,
+	/// Local asset balance at the latest safe Lightning commitment.
+	pub local_balance: u64,
+	/// Remote asset balance at the latest safe Lightning commitment.
+	pub remote_balance: u64,
+	/// Total asset balance committed by the channel funding output.
+	pub total_amount: u64,
+	/// Taproot Asset proof/root reference hash for the latest state.
+	pub proof_root_hash: [u8; TAPROOT_ASSET_ID_LEN],
+	/// Taproot Asset proof/root sum for the latest state.
+	pub proof_root_sum: u64,
+	/// Latest Lightning commitment number for which asset state is durable.
+	pub latest_commitment_number: u64,
+	/// Whether a cooperative close allocation has finalized this asset state.
+	pub closed: bool,
+}
+
+impl TaprootAssetChannelState {
+	/// Creates asset-channel lifecycle state from a negotiated simple-taproot
+	/// asset channel and a proof-backed funding request.
+	pub fn from_funding_request(
+		local_features: &InitFeatures, remote_features: &InitFeatures,
+		proposed_channel_type: &ChannelTypeFeatures, channel_id: ChannelId,
+		request: &TaprootAssetFundingRequest,
+	) -> Result<Self, TaprootAssetChannelStateError> {
+		if channel_id.is_zero() {
+			return Err(TaprootAssetChannelStateError::MalformedChannelId);
+		}
+		validate_single_asset_channel_open(
+			local_features,
+			remote_features,
+			proposed_channel_type,
+			request.descriptor,
+		)
+		.map_err(TaprootAssetChannelStateError::ChannelNotNegotiated)?;
+		let approval = validate_asset_channel_funding(request)
+			.map_err(TaprootAssetChannelStateError::Funding)?;
+		let total_amount = request
+			.allocation
+			.local_amount
+			.checked_add(request.allocation.remote_amount)
+			.ok_or(TaprootAssetChannelStateError::AmountMismatch)?;
+		if total_amount != approval.total_amount {
+			return Err(TaprootAssetChannelStateError::AmountMismatch);
+		}
+		Ok(Self {
+			descriptor: request.descriptor,
+			channel_id,
+			funding_outpoint: approval.funding_outpoint,
+			local_balance: request.allocation.local_amount,
+			remote_balance: request.allocation.remote_amount,
+			total_amount,
+			proof_root_hash: request.proof_material.proof_root_hash,
+			proof_root_sum: request.proof_material.proof_root_sum,
+			latest_commitment_number: 0,
+			closed: false,
+		})
+	}
+
+	/// Returns the monitor aux expectation for the current state and the given
+	/// caller-owned state digest.
+	pub fn monitor_aux_expectation(
+		&self, state_digest: [u8; TAPROOT_ASSET_ID_LEN],
+	) -> TaprootAssetMonitorAuxBlobExpectation {
+		TaprootAssetMonitorAuxBlobExpectation {
+			channel_id: self.channel_id,
+			asset_id: *self.descriptor.asset_id(),
+			commitment_number: self.latest_commitment_number,
+			local_balance: self.local_balance,
+			remote_balance: self.remote_balance,
+			state_digest,
+			proof_root_hash: self.proof_root_hash,
+			proof_root_sum: self.proof_root_sum,
+		}
+	}
+
+	/// Requires the current state's asset monitor aux blob before the matching
+	/// Lightning commitment is treated as durable.
+	pub fn require_current_monitor_aux_blob<'a>(
+		&self, blob: Option<&'a TaprootAssetMonitorAuxBlob>,
+		state_digest: [u8; TAPROOT_ASSET_ID_LEN],
+	) -> Result<&'a TaprootAssetMonitorAuxBlob, TaprootAssetChannelStateError> {
+		require_asset_monitor_aux_blob(blob, &self.monitor_aux_expectation(state_digest))
+			.map_err(TaprootAssetChannelStateError::Monitor)
+	}
+
+	/// Applies an asset commitment transition only after the next-state monitor
+	/// aux blob is present and valid.
+	pub fn apply_commitment_update<'a>(
+		&mut self, next_commitment_number: u64, local_to_remote: u64, remote_to_local: u64,
+		state_digest: [u8; TAPROOT_ASSET_ID_LEN],
+		monitor_blob: Option<&'a TaprootAssetMonitorAuxBlob>,
+	) -> Result<&'a TaprootAssetMonitorAuxBlob, TaprootAssetChannelStateError> {
+		if self.closed {
+			return Err(TaprootAssetChannelStateError::ClosedChannel);
+		}
+		let expected_next = self
+			.latest_commitment_number
+			.checked_add(1)
+			.ok_or(TaprootAssetChannelStateError::CommitmentNumberOverflow)?;
+		if next_commitment_number != expected_next {
+			return Err(TaprootAssetChannelStateError::StaleCommitmentNumber);
+		}
+		let local_after_send = self
+			.local_balance
+			.checked_sub(local_to_remote)
+			.ok_or(TaprootAssetChannelStateError::AmountMismatch)?;
+		let remote_after_send = self
+			.remote_balance
+			.checked_sub(remote_to_local)
+			.ok_or(TaprootAssetChannelStateError::AmountMismatch)?;
+		let local_balance = local_after_send
+			.checked_add(remote_to_local)
+			.ok_or(TaprootAssetChannelStateError::AmountMismatch)?;
+		let remote_balance = remote_after_send
+			.checked_add(local_to_remote)
+			.ok_or(TaprootAssetChannelStateError::AmountMismatch)?;
+		if local_balance
+			.checked_add(remote_balance)
+			.ok_or(TaprootAssetChannelStateError::AmountMismatch)?
+			!= self.total_amount
+		{
+			return Err(TaprootAssetChannelStateError::AmountMismatch);
+		}
+		let expected = TaprootAssetMonitorAuxBlobExpectation {
+			channel_id: self.channel_id,
+			asset_id: *self.descriptor.asset_id(),
+			commitment_number: next_commitment_number,
+			local_balance,
+			remote_balance,
+			state_digest,
+			proof_root_hash: self.proof_root_hash,
+			proof_root_sum: self.proof_root_sum,
+		};
+		let blob = require_asset_monitor_aux_blob(monitor_blob, &expected)
+			.map_err(TaprootAssetChannelStateError::Monitor)?;
+		self.latest_commitment_number = next_commitment_number;
+		self.local_balance = local_balance;
+		self.remote_balance = remote_balance;
+		Ok(blob)
+	}
+
+	/// Validates final-hop HTLC metadata against this asset channel's current
+	/// proof root.
+	pub fn validate_htlc_metadata<'a>(
+		&self, metadata: Option<&'a TaprootAssetHtlcMetadata>,
+		expected: &TaprootAssetHtlcMetadataExpectation,
+	) -> Result<&'a TaprootAssetHtlcMetadata, TaprootAssetChannelStateError> {
+		if expected.asset_id != *self.descriptor.asset_id()
+			|| expected.proof_root_hash != self.proof_root_hash
+			|| expected.proof_root_sum != self.proof_root_sum
+		{
+			return Err(TaprootAssetChannelStateError::Htlc(
+				TaprootAssetHtlcMetadataError::ProofRootMismatch,
+			));
+		}
+		validate_asset_htlc_final_hop(metadata, expected)
+			.map_err(TaprootAssetChannelStateError::Htlc)
+	}
+
+	/// Finalizes cooperative close allocation for the latest safe asset state.
+	pub fn validate_cooperative_close<'a>(
+		&mut self, allocation: Option<&'a TaprootAssetCloseAllocation>,
+	) -> Result<&'a TaprootAssetCloseAllocation, TaprootAssetChannelStateError> {
+		let expected = TaprootAssetCloseAllocationExpectation {
+			channel_id: self.channel_id,
+			asset_id: *self.descriptor.asset_id(),
+			latest_commitment_number: self.latest_commitment_number,
+			local_amount: self.local_balance,
+			remote_amount: self.remote_balance,
+			proof_root_hash: self.proof_root_hash,
+			proof_root_sum: self.proof_root_sum,
+		};
+		let allocation = validate_cooperative_close_asset_allocation(allocation, &expected)
+			.map_err(TaprootAssetChannelStateError::Close)?;
+		self.closed = true;
+		Ok(allocation)
+	}
+
+	/// Validates proof ownership for a unilateral recovery spend path.
+	pub fn validate_proof_ownership<'a>(
+		&self, state: Option<&'a TaprootAssetProofOwnershipState>, spend_kind: u8,
+	) -> Result<&'a TaprootAssetProofOwnershipState, TaprootAssetChannelStateError> {
+		let expected = TaprootAssetProofOwnershipExpectation {
+			channel_id: self.channel_id,
+			asset_id: *self.descriptor.asset_id(),
+			latest_commitment_number: self.latest_commitment_number,
+			spend_kind,
+			proof_root_hash: self.proof_root_hash,
+			proof_root_sum: self.proof_root_sum,
+			require_asset_proof: true,
+		};
+		validate_asset_proof_ownership_recovery(state, &expected)
+			.map_err(TaprootAssetChannelStateError::ProofOwnership)
+	}
+}
+
 /// Errors returned while checking an experimental Taproot Asset channel
 /// negotiation.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -827,6 +1039,34 @@ pub enum TaprootAssetMonitorAuxBlobError {
 	ProofRootMismatch,
 	/// The aux blob integrity digest did not match the serialized fields.
 	BlobDigestMismatch,
+}
+
+/// Errors returned by the bounded rust-lightning asset-channel lifecycle
+/// state machine.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum TaprootAssetChannelStateError {
+	/// The final channel ID was zero.
+	MalformedChannelId,
+	/// The simple-taproot asset channel was not explicitly negotiated.
+	ChannelNotNegotiated(TaprootAssetChannelNegotiationError),
+	/// Funding validation failed.
+	Funding(TaprootAssetFundingError),
+	/// The matching channel monitor aux blob was missing or invalid.
+	Monitor(TaprootAssetMonitorAuxBlobError),
+	/// HTLC metadata validation failed.
+	Htlc(TaprootAssetHtlcMetadataError),
+	/// Cooperative close allocation validation failed.
+	Close(TaprootAssetCloseAllocationError),
+	/// Proof-ownership recovery validation failed.
+	ProofOwnership(TaprootAssetProofOwnershipError),
+	/// The commitment number did not advance by exactly one.
+	StaleCommitmentNumber,
+	/// The commitment number overflowed.
+	CommitmentNumberOverflow,
+	/// The transition did not conserve the channel's asset amount.
+	AmountMismatch,
+	/// The asset channel was already cooperatively closed.
+	ClosedChannel,
 }
 
 /// Builds the required channel type for a single-asset Taproot Asset channel.
@@ -1312,6 +1552,25 @@ mod tests {
 		}
 	}
 
+	fn state_monitor_aux_blob(
+		commitment_number: u64, local_balance: u64, remote_balance: u64,
+		state_digest: [u8; TAPROOT_ASSET_ID_LEN],
+	) -> TaprootAssetMonitorAuxBlob {
+		TaprootAssetMonitorAuxBlob::new(
+			ChannelId::from_bytes([3; 32]),
+			asset_id(),
+			commitment_number,
+			local_balance,
+			remote_balance,
+			state_digest,
+			[6; TAPROOT_ASSET_ID_LEN],
+			1_000,
+			[10; TAPROOT_ASSET_ID_LEN],
+			[11; TAPROOT_ASSET_ID_LEN],
+		)
+		.unwrap()
+	}
+
 	fn htlc_metadata() -> TaprootAssetHtlcMetadata {
 		TaprootAssetHtlcMetadata::new(
 			asset_id(),
@@ -1498,6 +1757,110 @@ mod tests {
 		assert_eq!(approval.asset_id, asset_id());
 		assert_eq!(approval.total_amount, 1_000);
 		assert_eq!(approval.funding_outpoint, funding_outpoint());
+	}
+
+	#[test]
+	fn asset_channel_state_runs_full_simple_taproot_asset_lifecycle() {
+		let local = asset_features();
+		let remote = asset_features();
+		let channel_type = ChannelTypeFeatures::taproot_asset_single_asset();
+		let mut state = TaprootAssetChannelState::from_funding_request(
+			&local,
+			&remote,
+			&channel_type,
+			ChannelId::from_bytes([3; 32]),
+			&funding_request(),
+		)
+		.unwrap();
+		assert_eq!(state.local_balance, 700);
+		assert_eq!(state.remote_balance, 300);
+		assert_eq!(state.latest_commitment_number, 0);
+		assert!(!state.closed);
+
+		let next_digest = [20; TAPROOT_ASSET_ID_LEN];
+		let next_blob = state_monitor_aux_blob(1, 575, 425, next_digest);
+		state.apply_commitment_update(1, 125, 0, next_digest, Some(&next_blob)).unwrap();
+		assert_eq!(state.local_balance, 575);
+		assert_eq!(state.remote_balance, 425);
+		assert_eq!(state.latest_commitment_number, 1);
+
+		let metadata = htlc_metadata();
+		let expected_htlc = htlc_expectation();
+		assert_eq!(
+			state.validate_htlc_metadata(Some(&metadata), &expected_htlc).unwrap(),
+			&metadata
+		);
+
+		let allocation = TaprootAssetCloseAllocation::new(
+			ChannelId::from_bytes([3; 32]),
+			asset_id(),
+			1,
+			575,
+			425,
+			[6; TAPROOT_ASSET_ID_LEN],
+			1_000,
+			[14; TAPROOT_ASSET_ID_LEN],
+			[15; TAPROOT_ASSET_ID_LEN],
+		)
+		.unwrap();
+		assert_eq!(state.validate_cooperative_close(Some(&allocation)).unwrap(), &allocation);
+		assert!(state.closed);
+
+		let recovery = TaprootAssetProofOwnershipState::new(
+			ChannelId::from_bytes([3; 32]),
+			asset_id(),
+			1,
+			TAPROOT_ASSET_RECOVERY_SPEND_COMMITMENT,
+			true,
+			true,
+			[6; TAPROOT_ASSET_ID_LEN],
+			1_000,
+			[17; TAPROOT_ASSET_ID_LEN],
+			[18; TAPROOT_ASSET_ID_LEN],
+		)
+		.unwrap();
+		assert_eq!(
+			state
+				.validate_proof_ownership(Some(&recovery), TAPROOT_ASSET_RECOVERY_SPEND_COMMITMENT)
+				.unwrap(),
+			&recovery
+		);
+	}
+
+	#[test]
+	fn asset_channel_state_requires_monitor_before_commitment_advances() {
+		let local = asset_features();
+		let remote = asset_features();
+		let channel_type = ChannelTypeFeatures::taproot_asset_single_asset();
+		let mut state = TaprootAssetChannelState::from_funding_request(
+			&local,
+			&remote,
+			&channel_type,
+			ChannelId::from_bytes([3; 32]),
+			&funding_request(),
+		)
+		.unwrap();
+		let next_digest = [20; TAPROOT_ASSET_ID_LEN];
+		assert_eq!(
+			state.apply_commitment_update(1, 125, 0, next_digest, None),
+			Err(TaprootAssetChannelStateError::Monitor(
+				TaprootAssetMonitorAuxBlobError::MissingAssetBlob
+			))
+		);
+		assert_eq!(state.local_balance, 700);
+		assert_eq!(state.remote_balance, 300);
+		assert_eq!(state.latest_commitment_number, 0);
+
+		let stale_blob = state_monitor_aux_blob(0, 575, 425, next_digest);
+		assert_eq!(
+			state.apply_commitment_update(1, 125, 0, next_digest, Some(&stale_blob)),
+			Err(TaprootAssetChannelStateError::Monitor(
+				TaprootAssetMonitorAuxBlobError::CommitmentNumberMismatch
+			))
+		);
+		assert_eq!(state.local_balance, 700);
+		assert_eq!(state.remote_balance, 300);
+		assert_eq!(state.latest_commitment_number, 0);
 	}
 
 	#[test]
