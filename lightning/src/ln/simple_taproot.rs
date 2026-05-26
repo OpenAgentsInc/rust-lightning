@@ -908,13 +908,23 @@ impl SimpleTaprootKeyAggContext {
 		Ok(ScriptBuf::new_p2tr(secp_ctx, internal_key, None))
 	}
 
+	/// Returns the aggregate x-only public key after the BIP86 taproot tweak.
+	pub fn bip86_aggregate_xonly_public_key(
+		&self,
+	) -> Result<XOnlyPublicKey, SimpleTaprootMusigError> {
+		let musig_ctx = self.bip86_musig_context()?;
+		let aggregate: musig2::secp::Point = musig_ctx.aggregated_pubkey();
+		XOnlyPublicKey::from_slice(&aggregate.serialize_xonly())
+			.map_err(|_| SimpleTaprootMusigError::InvalidKey)
+	}
+
 	/// Generates a BIP-327 secret/public nonce pair from caller-supplied entropy.
 	pub fn generate_nonce_pair(
 		&self, signer_secret_key: &SecretKey, nonce_seed: [u8; 32], message: &[u8],
 		nonce_use: &SimpleTaprootNonceUse,
 	) -> Result<SimpleTaprootNoncePair, SimpleTaprootMusigError> {
 		let signer_scalar = musig_scalar(signer_secret_key)?;
-		let musig_ctx = self.musig_context()?;
+		let musig_ctx = self.bip86_musig_context()?;
 		let aggregate: musig2::secp::Point = musig_ctx.aggregated_pubkey();
 		let extra_input = nonce_use.extra_input();
 		let secret_nonce =
@@ -939,7 +949,7 @@ impl SimpleTaprootKeyAggContext {
 		let local_public_nonce = musig_public_nonce_to_wire(&secret_nonce.public_nonce())?;
 		let aggregate_nonce = aggregate_musig_public_nonces(public_nonces)?;
 		let signer_scalar = musig_scalar(signer_secret_key)?;
-		let musig_ctx = self.musig_context()?;
+		let musig_ctx = self.bip86_musig_context()?;
 		let partial_signature: musig2::PartialSignature = musig2::sign_partial(
 			&musig_ctx,
 			signer_scalar,
@@ -961,7 +971,7 @@ impl SimpleTaprootKeyAggContext {
 		partial_signature: &SimpleTaprootPartialSignature, public_nonces: &[Musig2PublicNonce],
 		message: &[u8],
 	) -> Result<(), SimpleTaprootMusigError> {
-		let musig_ctx = self.musig_context()?;
+		let musig_ctx = self.bip86_musig_context()?;
 		let aggregate_nonce = aggregate_musig_public_nonces(public_nonces)?;
 		let signer_pubkey = musig_point(signer_pubkey)?;
 		let signer_public_nonce = musig_public_nonce_from_wire(signer_public_nonce)?;
@@ -982,7 +992,7 @@ impl SimpleTaprootKeyAggContext {
 		&self, partial_signatures: &[SimpleTaprootPartialSignature],
 		public_nonces: &[Musig2PublicNonce], message: &[u8],
 	) -> Result<schnorr::Signature, SimpleTaprootMusigError> {
-		let musig_ctx = self.musig_context()?;
+		let musig_ctx = self.bip86_musig_context()?;
 		let aggregate_nonce = aggregate_musig_public_nonces(public_nonces)?;
 		let mut signatures = Vec::new();
 		for partial_signature in partial_signatures.iter() {
@@ -999,10 +1009,16 @@ impl SimpleTaprootKeyAggContext {
 	pub fn verify_final_signature(
 		&self, signature: &schnorr::Signature, message: &[u8],
 	) -> Result<(), SimpleTaprootMusigError> {
-		let musig_ctx = self.musig_context()?;
+		let musig_ctx = self.bip86_musig_context()?;
 		let aggregate: musig2::secp::Point = musig_ctx.aggregated_pubkey();
 		musig2::verify_single(aggregate, signature.serialize(), message)
 			.map_err(|_| SimpleTaprootMusigError::InvalidSignature)
+	}
+
+	fn bip86_musig_context(&self) -> Result<musig2::KeyAggContext, SimpleTaprootMusigError> {
+		self.musig_context()?
+			.with_unspendable_taproot_tweak()
+			.map_err(|_| SimpleTaprootMusigError::InvalidKey)
 	}
 
 	fn musig_context(&self) -> Result<musig2::KeyAggContext, SimpleTaprootMusigError> {
@@ -1825,6 +1841,11 @@ mod tests {
 			)
 			.unwrap();
 		key_agg_ctx.verify_final_signature(&final_signature, &message).unwrap();
+		let bip86_key = key_agg_ctx.bip86_aggregate_xonly_public_key().unwrap();
+		let message = Message::from_digest_slice(&message).unwrap();
+		secp_ctx.verify_schnorr(&final_signature, &message, &bip86_key).unwrap();
+		let untweaked_key = key_agg_ctx.aggregate_xonly_public_key().unwrap();
+		assert!(secp_ctx.verify_schnorr(&final_signature, &message, &untweaked_key).is_err());
 	}
 
 	#[cfg(feature = "simple_taproot_musig2")]
