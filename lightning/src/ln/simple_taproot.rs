@@ -2134,6 +2134,88 @@ mod tests {
 
 	#[cfg(feature = "simple_taproot_musig2")]
 	#[test]
+	fn verifies_lnd_simple_taproot_commitment_vector() {
+		use bitcoin::consensus::encode::deserialize;
+		use bitcoin::hex::FromHex as _;
+
+		let secp_ctx = Secp256k1::verification_only();
+		let local_pubkey = PublicKey::from_slice(
+			&Vec::<u8>::from_hex(
+				"03b7203dec7c13896b6ff1f58b24f84458c441720a12b5a57426397e22f0a8c78b",
+			)
+			.unwrap(),
+		)
+		.unwrap();
+		let remote_pubkey = PublicKey::from_slice(
+			&Vec::<u8>::from_hex(
+				"02956e6845a6f346f97c5e028c0f8ab38a76b0124fd7184deab60f682b3e657fdb",
+			)
+			.unwrap(),
+		)
+		.unwrap();
+		let local_nonce = Musig2PublicNonce::from_slice(
+			&Vec::<u8>::from_hex(
+				"025f2272ea289c5fe9d52d411f5a50a6d4882341bf0ecb201d5675850a2ba0b09d025bc489cf67752134ba81f8d7f1146d7455baf3190de75a6a661e2405212991a9",
+			)
+			.unwrap(),
+		)
+		.unwrap();
+		let remote_nonce = Musig2PublicNonce::from_slice(
+			&Vec::<u8>::from_hex(
+				"02d324627074522af8cf4287caf1e073a3493550b99aed2697e58f476ec402e272039c25fc616207e15917b7145cefcb4c9c702580baf255597d2fa115564a74a130",
+			)
+			.unwrap(),
+		)
+		.unwrap();
+		let remote_partial = SimpleTaprootPartialSignature::from_slice(
+			&Vec::<u8>::from_hex(
+				"3fa93659d4c2d590eadbd422595a37597ed58607e026a91f4e6e19329134a931",
+			)
+			.unwrap(),
+		)
+		.unwrap();
+		let commitment_tx: Transaction = deserialize(
+			&Vec::<u8>::from_hex(
+				"020000000001015474cba49124ab0c4327c244bb2907059585c4af3fa5f3469701534120fec0170000000000c5fe1780044a010000000000002251201249c50576fdf914caa14f9221370b986df520bdbc73f57d5056a86ee03e5ac44a01000000000000225120f67ab012701705f3203d132f909a6810ef18c5da4c11d986cb50818803b8344ec0c62d00000000002251203609bb705034e5629aa6ec05c5ca906ac89ac08b34c4583c259521ec3017440874946a00000000002251203e1fcbbd06c8a7414704612c72be9834a75d86ed85b29f0ef0c52e1950afaff30140a4a9eb512a2f4094efdd2c566f1f20cc8a6e2c307a4a44cc3f9fea7fa147dd7038f1b048aa43fa0b4009175c1c37c37b96c01058541f9e1b61110fce4e831d9f55dc1920",
+			)
+			.unwrap(),
+		)
+		.unwrap();
+		let funding_output = TxOut {
+			value: Amount::from_sat(10_000_000),
+			script_pubkey: ScriptBuf::from_hex(
+				"5120d0ebb4909d563a7ae1213fddede4ae54132fba0ef0b97ee3f8469191fecd348e",
+			)
+			.unwrap(),
+		};
+		let prevouts = [funding_output];
+		let prevouts = sighash::Prevouts::All(&prevouts);
+		let message = SighashCache::new(&commitment_tx)
+			.taproot_key_spend_signature_hash(0, &prevouts, TapSighashType::Default)
+			.unwrap()
+			.to_byte_array();
+		let key_agg_ctx = SimpleTaprootKeyAggContext::for_funding_keys(local_pubkey, remote_pubkey);
+
+		assert_eq!(
+			key_agg_ctx.bip86_funding_script_pubkey(&secp_ctx).unwrap(),
+			ScriptBuf::from_hex(
+				"5120d0ebb4909d563a7ae1213fddede4ae54132fba0ef0b97ee3f8469191fecd348e",
+			)
+			.unwrap()
+		);
+		key_agg_ctx
+			.verify_partial(
+				&remote_pubkey,
+				&remote_nonce,
+				&remote_partial,
+				&[local_nonce, remote_nonce],
+				&message,
+			)
+			.unwrap();
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	#[test]
 	fn bip86_funding_script_matches_bolt_vector() {
 		let secp_ctx = Secp256k1::new();
 		let local_funding_pubkey = PublicKey::from_slice(

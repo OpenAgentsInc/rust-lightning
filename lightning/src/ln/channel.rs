@@ -6556,8 +6556,26 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 				funding.channel_transaction_parameters.simple_taproot_tapscript_root,
 			)
 			.map_err(|_| {
+				let tapscript_root_debug = match funding
+					.channel_transaction_parameters
+					.simple_taproot_tapscript_root
+				{
+					Some(root) => format!("{}", log_bytes!(root[..])),
+					None => "none".to_owned(),
+				};
 				ChannelError::close(
-					"Invalid simple-taproot commitment partial signature".to_owned(),
+					format!(
+						"Invalid simple-taproot commitment partial signature: funding_txid={}, nonce_index={}, counterparty_funding_pubkey={}, local_nonce={}, counterparty_nonce={}, partial_sig={}, sighash={}, tapscript_root={}, tx={}",
+						funding_txid,
+						nonce_index,
+						log_bytes!(funding.counterparty_funding_pubkey().serialize()),
+						log_bytes!(local_public_nonce.as_bytes()[..]),
+						log_bytes!(partial_signature_with_nonce.public_nonce.as_bytes()[..]),
+						log_bytes!(partial_signature_with_nonce.partial_signature.as_bytes()[..]),
+						log_bytes!(message[..]),
+						tapscript_root_debug,
+						encode::serialize_hex(transaction),
+					)
 				)
 			})
 	}
