@@ -10,9 +10,10 @@
 //! OpenAgentsInc experimental Taproot Asset channel negotiation helpers.
 //!
 //! This module intentionally handles only the explicit feature and channel-type
-//! gate for single-asset Taproot Asset channels. Funding proof validation,
-//! asset allocation, commitment persistence, HTLC metadata, and recovery hooks
-//! are separate integration surfaces.
+//! gate for single-asset Taproot Asset channels. The funding, monitor, and
+//! HTLC helpers below are deliberately bounded integration surfaces that let
+//! `tap-ldk` wire asset-channel state into LDK without changing BTC-only
+//! behavior.
 
 use crate::chain::transaction::OutPoint;
 use crate::ln::types::ChannelId;
@@ -30,6 +31,10 @@ pub const TAPROOT_ASSET_ID_LEN: usize = 32;
 
 /// The schema version for Taproot Asset monitor aux blobs.
 pub const TAPROOT_ASSET_MONITOR_AUX_BLOB_SCHEMA_VERSION: u16 = 1;
+
+/// The protocol version for Taproot Asset HTLC metadata.
+pub const TAPROOT_ASSET_HTLC_METADATA_PROTOCOL_VERSION: u16 =
+	SUPPORTED_TAPROOT_ASSET_CHANNEL_PROTOCOL_VERSION;
 
 /// Describes the single asset that an experimental Taproot Asset channel is
 /// allowed to carry.
@@ -172,6 +177,109 @@ pub struct TaprootAssetFundingApproval {
 	pub asset_id: [u8; TAPROOT_ASSET_ID_LEN],
 	/// The approved total asset amount.
 	pub total_amount: u64,
+}
+
+/// Metadata carried with an asset-channel HTLC.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct TaprootAssetHtlcMetadata {
+	/// Taproot Asset channel protocol version for this metadata.
+	pub protocol_version: u16,
+	/// Asset ID being transferred.
+	pub asset_id: [u8; TAPROOT_ASSET_ID_LEN],
+	/// Asset amount being transferred.
+	pub asset_amount: u64,
+	/// Taproot Asset proof/root reference hash.
+	pub proof_root_hash: [u8; TAPROOT_ASSET_ID_LEN],
+	/// Taproot Asset proof/root sum.
+	pub proof_root_sum: u64,
+	/// Quote ID authorizing this asset HTLC.
+	pub quote_id: [u8; TAPROOT_ASSET_ID_LEN],
+	/// Payment hash for the final-hop payment.
+	pub payment_hash: [u8; TAPROOT_ASSET_ID_LEN],
+	/// Integrity digest over the final-hop asset metadata.
+	pub final_hop_digest: [u8; TAPROOT_ASSET_ID_LEN],
+}
+
+impl TaprootAssetHtlcMetadata {
+	/// Builds protocol-versioned asset HTLC metadata.
+	pub fn new(
+		asset_id: [u8; TAPROOT_ASSET_ID_LEN], asset_amount: u64,
+		proof_root_hash: [u8; TAPROOT_ASSET_ID_LEN], proof_root_sum: u64,
+		quote_id: [u8; TAPROOT_ASSET_ID_LEN], payment_hash: [u8; TAPROOT_ASSET_ID_LEN],
+	) -> Result<Self, TaprootAssetHtlcMetadataError> {
+		let mut metadata = Self {
+			protocol_version: TAPROOT_ASSET_HTLC_METADATA_PROTOCOL_VERSION,
+			asset_id,
+			asset_amount,
+			proof_root_hash,
+			proof_root_sum,
+			quote_id,
+			payment_hash,
+			final_hop_digest: [0; TAPROOT_ASSET_ID_LEN],
+		};
+		metadata.final_hop_digest = metadata.digest();
+		metadata.validate_integrity()?;
+		Ok(metadata)
+	}
+
+	/// Recomputes the final-hop metadata digest.
+	pub fn digest(&self) -> [u8; TAPROOT_ASSET_ID_LEN] {
+		let mut engine = Sha256::engine();
+		engine.input(b"openagents:taproot-asset-htlc-final-hop:v1");
+		engine.input(&self.protocol_version.to_be_bytes());
+		engine.input(&self.asset_id);
+		engine.input(&self.asset_amount.to_be_bytes());
+		engine.input(&self.proof_root_hash);
+		engine.input(&self.proof_root_sum.to_be_bytes());
+		engine.input(&self.quote_id);
+		engine.input(&self.payment_hash);
+		Sha256::from_engine(engine).to_byte_array()
+	}
+
+	/// Checks the metadata's internal integrity before a caller compares it to
+	/// an expected quote/payment.
+	pub fn validate_integrity(&self) -> Result<(), TaprootAssetHtlcMetadataError> {
+		if self.protocol_version != TAPROOT_ASSET_HTLC_METADATA_PROTOCOL_VERSION {
+			return Err(TaprootAssetHtlcMetadataError::UnsupportedProtocolVersion);
+		}
+		if self.asset_id == [0; TAPROOT_ASSET_ID_LEN]
+			|| self.asset_amount == 0
+			|| self.proof_root_hash == [0; TAPROOT_ASSET_ID_LEN]
+			|| self.proof_root_sum == 0
+			|| self.proof_root_sum < self.asset_amount
+			|| self.quote_id == [0; TAPROOT_ASSET_ID_LEN]
+			|| self.payment_hash == [0; TAPROOT_ASSET_ID_LEN]
+		{
+			return Err(TaprootAssetHtlcMetadataError::MalformedMetadata);
+		}
+		if self.final_hop_digest != self.digest() {
+			return Err(TaprootAssetHtlcMetadataError::FinalHopDigestMismatch);
+		}
+		Ok(())
+	}
+}
+
+/// Expected final-hop metadata for an asset-channel HTLC.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct TaprootAssetHtlcMetadataExpectation {
+	/// Expected asset ID.
+	pub asset_id: [u8; TAPROOT_ASSET_ID_LEN],
+	/// Expected asset amount.
+	pub asset_amount: u64,
+	/// Expected proof/root reference hash.
+	pub proof_root_hash: [u8; TAPROOT_ASSET_ID_LEN],
+	/// Expected proof/root sum.
+	pub proof_root_sum: u64,
+	/// Expected accepted quote ID.
+	pub quote_id: [u8; TAPROOT_ASSET_ID_LEN],
+	/// Expected payment hash.
+	pub payment_hash: [u8; TAPROOT_ASSET_ID_LEN],
+	/// Whether the quote has been accepted before attaching metadata.
+	pub quote_accepted: bool,
+	/// Current unix time used for stale quote checks.
+	pub now_unix_seconds: u64,
+	/// Quote expiry time.
+	pub quote_expiry_unix_seconds: u64,
 }
 
 /// Asset-channel state that must be persisted with the matching
@@ -349,6 +457,36 @@ pub enum TaprootAssetFundingError {
 	AmountMismatch,
 }
 
+/// Errors returned by asset HTLC metadata preparation and final-hop
+/// validation.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum TaprootAssetHtlcMetadataError {
+	/// The HTLC metadata path was used without an asset-channel negotiation.
+	ChannelNotNegotiated,
+	/// An asset-channel HTLC required metadata but none was present.
+	MissingAssetMetadata,
+	/// The RFQ quote was not accepted before metadata attachment.
+	MissingAcceptedQuote,
+	/// The metadata used an unsupported protocol version.
+	UnsupportedProtocolVersion,
+	/// The metadata was zeroed or internally malformed.
+	MalformedMetadata,
+	/// The metadata asset ID did not match the expected asset.
+	AssetIdMismatch,
+	/// The metadata asset amount did not match the expected amount.
+	AssetAmountMismatch,
+	/// The proof/root reference did not match the expected asset proof root.
+	ProofRootMismatch,
+	/// The quote ID did not match the accepted quote.
+	QuoteMismatch,
+	/// The accepted quote has expired.
+	StaleQuote,
+	/// The payment hash did not match the final-hop payment.
+	PaymentHashMismatch,
+	/// The final-hop metadata digest did not match the serialized fields.
+	FinalHopDigestMismatch,
+}
+
 /// Errors returned by Taproot Asset monitor aux blob validation.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum TaprootAssetMonitorAuxBlobError {
@@ -487,6 +625,62 @@ pub fn validate_asset_channel_funding(
 	})
 }
 
+/// Prepares asset HTLC metadata after confirming the channel negotiated the
+/// experimental single-asset type and the RFQ quote was accepted.
+pub fn prepare_asset_htlc_metadata(
+	local_features: &InitFeatures, remote_features: &InitFeatures,
+	proposed_channel_type: &ChannelTypeFeatures, descriptor: TaprootAssetChannelDescriptor,
+	quote_accepted: bool, metadata: TaprootAssetHtlcMetadata,
+) -> Result<TaprootAssetHtlcMetadata, TaprootAssetHtlcMetadataError> {
+	validate_single_asset_channel_open(
+		local_features,
+		remote_features,
+		proposed_channel_type,
+		descriptor,
+	)
+	.map_err(|_| TaprootAssetHtlcMetadataError::ChannelNotNegotiated)?;
+	if !quote_accepted {
+		return Err(TaprootAssetHtlcMetadataError::MissingAcceptedQuote);
+	}
+	metadata.validate_integrity()?;
+	if metadata.asset_id != *descriptor.asset_id() {
+		return Err(TaprootAssetHtlcMetadataError::AssetIdMismatch);
+	}
+	Ok(metadata)
+}
+
+/// Requires and validates asset HTLC metadata before final-hop settlement.
+pub fn validate_asset_htlc_final_hop<'a>(
+	metadata: Option<&'a TaprootAssetHtlcMetadata>, expected: &TaprootAssetHtlcMetadataExpectation,
+) -> Result<&'a TaprootAssetHtlcMetadata, TaprootAssetHtlcMetadataError> {
+	let metadata = metadata.ok_or(TaprootAssetHtlcMetadataError::MissingAssetMetadata)?;
+	metadata.validate_integrity()?;
+	if !expected.quote_accepted {
+		return Err(TaprootAssetHtlcMetadataError::MissingAcceptedQuote);
+	}
+	if expected.now_unix_seconds > expected.quote_expiry_unix_seconds {
+		return Err(TaprootAssetHtlcMetadataError::StaleQuote);
+	}
+	if metadata.asset_id != expected.asset_id {
+		return Err(TaprootAssetHtlcMetadataError::AssetIdMismatch);
+	}
+	if metadata.asset_amount != expected.asset_amount {
+		return Err(TaprootAssetHtlcMetadataError::AssetAmountMismatch);
+	}
+	if metadata.proof_root_hash != expected.proof_root_hash
+		|| metadata.proof_root_sum != expected.proof_root_sum
+	{
+		return Err(TaprootAssetHtlcMetadataError::ProofRootMismatch);
+	}
+	if metadata.quote_id != expected.quote_id {
+		return Err(TaprootAssetHtlcMetadataError::QuoteMismatch);
+	}
+	if metadata.payment_hash != expected.payment_hash {
+		return Err(TaprootAssetHtlcMetadataError::PaymentHashMismatch);
+	}
+	Ok(metadata)
+}
+
 /// Requires and validates a Taproot Asset monitor aux blob for a monitor
 /// update.
 pub fn require_asset_monitor_aux_blob<'a>(
@@ -528,6 +722,17 @@ pub fn validate_asset_monitor_aux_blob(
 	}
 	Ok(())
 }
+
+impl_writeable!(TaprootAssetHtlcMetadata, {
+	protocol_version,
+	asset_id,
+	asset_amount,
+	proof_root_hash,
+	proof_root_sum,
+	quote_id,
+	payment_hash,
+	final_hop_digest
+});
 
 impl_writeable!(TaprootAssetMonitorAuxBlob, {
 	schema_version,
@@ -645,6 +850,32 @@ mod tests {
 			state_digest: [8; TAPROOT_ASSET_ID_LEN],
 			proof_root_hash: [6; TAPROOT_ASSET_ID_LEN],
 			proof_root_sum: 1_000,
+		}
+	}
+
+	fn htlc_metadata() -> TaprootAssetHtlcMetadata {
+		TaprootAssetHtlcMetadata::new(
+			asset_id(),
+			125,
+			[6; TAPROOT_ASSET_ID_LEN],
+			1_000,
+			[12; TAPROOT_ASSET_ID_LEN],
+			[13; TAPROOT_ASSET_ID_LEN],
+		)
+		.unwrap()
+	}
+
+	fn htlc_expectation() -> TaprootAssetHtlcMetadataExpectation {
+		TaprootAssetHtlcMetadataExpectation {
+			asset_id: asset_id(),
+			asset_amount: 125,
+			proof_root_hash: [6; TAPROOT_ASSET_ID_LEN],
+			proof_root_sum: 1_000,
+			quote_id: [12; TAPROOT_ASSET_ID_LEN],
+			payment_hash: [13; TAPROOT_ASSET_ID_LEN],
+			quote_accepted: true,
+			now_unix_seconds: 1_002,
+			quote_expiry_unix_seconds: 1_100,
 		}
 	}
 
@@ -799,6 +1030,133 @@ mod tests {
 		assert_eq!(
 			validate_asset_channel_funding(&request),
 			Err(TaprootAssetFundingError::AmountMismatch)
+		);
+	}
+
+	#[test]
+	fn prepares_asset_htlc_metadata_after_quote_acceptance() {
+		let local = asset_features();
+		let remote = asset_features();
+		let channel_type = ChannelTypeFeatures::taproot_asset_single_asset();
+		let metadata = htlc_metadata();
+		let prepared = prepare_asset_htlc_metadata(
+			&local,
+			&remote,
+			&channel_type,
+			descriptor(),
+			true,
+			metadata,
+		)
+		.unwrap();
+		assert_eq!(prepared, metadata);
+	}
+
+	#[test]
+	fn asset_htlc_metadata_requires_quote_and_asset_channel_gate() {
+		let local = asset_features();
+		let remote = asset_features();
+		let channel_type = ChannelTypeFeatures::taproot_asset_single_asset();
+		assert_eq!(
+			prepare_asset_htlc_metadata(
+				&local,
+				&remote,
+				&channel_type,
+				descriptor(),
+				false,
+				htlc_metadata(),
+			),
+			Err(TaprootAssetHtlcMetadataError::MissingAcceptedQuote)
+		);
+
+		let btc_only_features = InitFeatures::empty();
+		assert_eq!(
+			prepare_asset_htlc_metadata(
+				&btc_only_features,
+				&remote,
+				&channel_type,
+				descriptor(),
+				true,
+				htlc_metadata(),
+			),
+			Err(TaprootAssetHtlcMetadataError::ChannelNotNegotiated)
+		);
+	}
+
+	#[test]
+	fn validates_asset_htlc_final_hop_metadata() {
+		let metadata = htlc_metadata();
+		let expected = htlc_expectation();
+		assert_eq!(validate_asset_htlc_final_hop(Some(&metadata), &expected).unwrap(), &metadata);
+	}
+
+	#[test]
+	fn rejects_missing_stale_or_wrong_asset_htlc_metadata() {
+		let metadata = htlc_metadata();
+		let expected = htlc_expectation();
+		assert_eq!(
+			validate_asset_htlc_final_hop(None, &expected),
+			Err(TaprootAssetHtlcMetadataError::MissingAssetMetadata)
+		);
+
+		let mut not_accepted = expected;
+		not_accepted.quote_accepted = false;
+		assert_eq!(
+			validate_asset_htlc_final_hop(Some(&metadata), &not_accepted),
+			Err(TaprootAssetHtlcMetadataError::MissingAcceptedQuote)
+		);
+
+		let mut stale = expected;
+		stale.now_unix_seconds = stale.quote_expiry_unix_seconds + 1;
+		assert_eq!(
+			validate_asset_htlc_final_hop(Some(&metadata), &stale),
+			Err(TaprootAssetHtlcMetadataError::StaleQuote)
+		);
+
+		let mut wrong_asset = metadata;
+		wrong_asset.asset_id = [14; TAPROOT_ASSET_ID_LEN];
+		wrong_asset.final_hop_digest = wrong_asset.digest();
+		assert_eq!(
+			validate_asset_htlc_final_hop(Some(&wrong_asset), &expected),
+			Err(TaprootAssetHtlcMetadataError::AssetIdMismatch)
+		);
+
+		let mut wrong_amount = metadata;
+		wrong_amount.asset_amount = 126;
+		wrong_amount.final_hop_digest = wrong_amount.digest();
+		assert_eq!(
+			validate_asset_htlc_final_hop(Some(&wrong_amount), &expected),
+			Err(TaprootAssetHtlcMetadataError::AssetAmountMismatch)
+		);
+
+		let mut wrong_root = metadata;
+		wrong_root.proof_root_hash = [14; TAPROOT_ASSET_ID_LEN];
+		wrong_root.final_hop_digest = wrong_root.digest();
+		assert_eq!(
+			validate_asset_htlc_final_hop(Some(&wrong_root), &expected),
+			Err(TaprootAssetHtlcMetadataError::ProofRootMismatch)
+		);
+
+		let mut wrong_quote = metadata;
+		wrong_quote.quote_id = [14; TAPROOT_ASSET_ID_LEN];
+		wrong_quote.final_hop_digest = wrong_quote.digest();
+		assert_eq!(
+			validate_asset_htlc_final_hop(Some(&wrong_quote), &expected),
+			Err(TaprootAssetHtlcMetadataError::QuoteMismatch)
+		);
+
+		let mut wrong_payment = metadata;
+		wrong_payment.payment_hash = [14; TAPROOT_ASSET_ID_LEN];
+		wrong_payment.final_hop_digest = wrong_payment.digest();
+		assert_eq!(
+			validate_asset_htlc_final_hop(Some(&wrong_payment), &expected),
+			Err(TaprootAssetHtlcMetadataError::PaymentHashMismatch)
+		);
+
+		let mut wrong_digest = metadata;
+		wrong_digest.final_hop_digest = [14; TAPROOT_ASSET_ID_LEN];
+		assert_eq!(
+			validate_asset_htlc_final_hop(Some(&wrong_digest), &expected),
+			Err(TaprootAssetHtlcMetadataError::FinalHopDigestMismatch)
 		);
 	}
 
