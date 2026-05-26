@@ -6571,6 +6571,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 		signature.map(|(signature, _)| msgs::FundingSigned {
 			channel_id: self.channel_id(),
 			signature,
+			simple_taproot_partial_signature_with_nonce: None,
 		})
 	}
 
@@ -6696,6 +6697,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 				htlc_signatures,
 				signature,
 				funding_txid: funding.get_funding_txo().map(|funding_txo| funding_txo.txid),
+				simple_taproot_partial_signature_with_nonce: None,
 			})
 		} else {
 			log_debug!(
@@ -10311,6 +10313,7 @@ where
 					per_commitment_secret,
 					next_per_commitment_point: self.holder_commitment_point.next_point(),
 					release_htlc_message_paths,
+					simple_taproot_next_local_nonces: None,
 				});
 			}
 		}
@@ -10444,6 +10447,7 @@ where
 			Some(msgs::Shutdown {
 				channel_id: self.context.channel_id,
 				scriptpubkey: self.get_closing_scriptpubkey(),
+				simple_taproot_shutdown_nonce: None,
 			})
 		} else {
 			None
@@ -11183,6 +11187,7 @@ where
 			Some(msgs::Shutdown {
 				channel_id: self.context.channel_id,
 				scriptpubkey: self.get_closing_scriptpubkey(),
+				simple_taproot_shutdown_nonce: None,
 			})
 		} else {
 			None
@@ -11816,6 +11821,7 @@ where
 				channel_id: self.context.channel_id(),
 				next_per_commitment_point: self.holder_commitment_point.next_point(),
 				short_channel_id_alias: Some(self.context.outbound_scid_alias),
+				simple_taproot_next_local_nonce: None,
 			})
 		} else {
 			log_debug!(logger, "Not producing channel_ready: the holder commitment point is not available.");
@@ -12567,6 +12573,7 @@ where
 			my_current_per_commitment_point: dummy_pubkey,
 			next_funding: self.maybe_get_next_funding(),
 			my_current_funding_locked,
+			simple_taproot_next_local_nonces: None,
 		}
 	}
 
@@ -14227,6 +14234,7 @@ where
 			signature,
 			htlc_signatures,
 			funding_txid: funding.get_funding_txo().map(|funding_txo| funding_txo.txid),
+			simple_taproot_partial_signature_with_nonce: None,
 		})
 	}
 
@@ -14405,6 +14413,7 @@ where
 		let shutdown = msgs::Shutdown {
 			channel_id: self.context.channel_id,
 			scriptpubkey: self.get_closing_scriptpubkey(),
+			simple_taproot_shutdown_nonce: None,
 		};
 
 		// Go ahead and drop holding cell updates as we'd rather fail payments than wait to send
@@ -14917,6 +14926,7 @@ impl<SP: SignerProvider> OutboundV1Channel<SP> {
 			funding_txid: self.funding.channel_transaction_parameters.funding_outpoint.as_ref().unwrap().txid,
 			funding_output_index: self.funding.channel_transaction_parameters.funding_outpoint.as_ref().unwrap().index,
 			signature,
+			simple_taproot_partial_signature_with_nonce: None,
 		})
 	}
 
@@ -15035,6 +15045,7 @@ impl<SP: SignerProvider> OutboundV1Channel<SP> {
 					None => Builder::new().into_script(),
 				}),
 				channel_type: Some(self.funding.get_channel_type().clone()),
+				simple_taproot_next_local_nonce: None,
 			},
 			push_msat: self.funding.get_value_satoshis() * 1000 - self.funding.value_to_self_msat,
 			channel_reserve_satoshis: self.funding.holder_selected_channel_reserve_satoshis,
@@ -15343,6 +15354,7 @@ impl<SP: SignerProvider> InboundV1Channel<SP> {
 					None => Builder::new().into_script(),
 				}),
 				channel_type: Some(self.funding.get_channel_type().clone()),
+				simple_taproot_next_local_nonce: None,
 			},
 			channel_reserve_satoshis: self.funding.holder_selected_channel_reserve_satoshis,
 		})
@@ -15613,6 +15625,7 @@ impl<SP: SignerProvider> PendingV2Channel<SP> {
 					None => Builder::new().into_script(),
 				}),
 				channel_type: Some(self.funding.get_channel_type().clone()),
+				simple_taproot_next_local_nonce: None,
 			},
 			funding_feerate_sat_per_1000_weight: self.context.feerate_per_kw,
 			second_per_commitment_point,
@@ -15785,6 +15798,7 @@ impl<SP: SignerProvider> PendingV2Channel<SP> {
 					None => Builder::new().into_script(),
 				}),
 				channel_type: Some(self.funding.get_channel_type().clone()),
+				simple_taproot_next_local_nonce: None,
 			},
 			funding_satoshis: self.funding_negotiation_context.our_funding_contribution.to_sat()
 				as u64,

@@ -318,6 +318,7 @@ fn shutdown_on_unfunded_channel() {
 		&msgs::Shutdown {
 			channel_id: open_chan.common_fields.temporary_channel_id,
 			scriptpubkey: script,
+			simple_taproot_shutdown_nonce: None,
 		},
 	);
 	let reason = ClosureReason::CounterpartyCoopClosedUnfundedChannel;

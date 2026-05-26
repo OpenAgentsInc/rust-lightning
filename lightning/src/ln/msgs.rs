@@ -35,6 +35,10 @@ use crate::blinded_path::message::BlindedMessagePath;
 use crate::blinded_path::payment::{BlindedPaymentTlvs, DummyTlvs, ForwardTlvs, ReceiveTlvs};
 use crate::blinded_path::payment::{BlindedTrampolineTlvs, TrampolineForwardTlvs};
 use crate::ln::onion_utils;
+use crate::ln::simple_taproot::{
+	Musig2PublicNonce, SimpleTaprootNextLocalNonces, SimpleTaprootPartialSignature,
+	SimpleTaprootPartialSignatureWithNonce,
+};
 use crate::ln::types::ChannelId;
 use crate::offers::invoice_request::InvoiceRequest;
 use crate::onion_message;
@@ -234,6 +238,8 @@ pub struct CommonOpenChannelFields {
 	/// The channel type that this channel will represent. As defined in the latest
 	/// specification, this field is required. However, it is an `Option` for legacy reasons.
 	pub channel_type: Option<ChannelTypeFeatures>,
+	/// The MuSig2 public nonce required by simple-taproot channel opens.
+	pub simple_taproot_next_local_nonce: Option<Musig2PublicNonce>,
 }
 
 impl CommonOpenChannelFields {
@@ -351,6 +357,8 @@ pub struct CommonAcceptChannelFields {
 	/// This is required to match the equivalent field in [`OpenChannel`] or [`OpenChannelV2`]'s
 	/// [`CommonOpenChannelFields::channel_type`].
 	pub channel_type: Option<ChannelTypeFeatures>,
+	/// The MuSig2 public nonce required by simple-taproot channel acceptance.
+	pub simple_taproot_next_local_nonce: Option<Musig2PublicNonce>,
 }
 
 /// An [`accept_channel`] message to be sent to or received from a peer.
@@ -400,6 +408,8 @@ pub struct FundingCreated {
 	pub funding_output_index: u16,
 	/// The signature of the channel initiator (funder) on the initial commitment transaction
 	pub signature: Signature,
+	/// The simple-taproot MuSig2 partial signature and signing nonce.
+	pub simple_taproot_partial_signature_with_nonce: Option<SimpleTaprootPartialSignatureWithNonce>,
 }
 
 /// A [`funding_signed`] message to be sent to or received from a peer.
@@ -413,6 +423,8 @@ pub struct FundingSigned {
 	pub channel_id: ChannelId,
 	/// The signature of the channel acceptor (fundee) on the initial commitment transaction
 	pub signature: Signature,
+	/// The simple-taproot MuSig2 partial signature and signing nonce.
+	pub simple_taproot_partial_signature_with_nonce: Option<SimpleTaprootPartialSignatureWithNonce>,
 }
 
 /// A [`channel_ready`] message to be sent to or received from a peer.
@@ -429,6 +441,8 @@ pub struct ChannelReady {
 	/// The sender will accept payments to be forwarded over this SCID and forward them to this
 	/// messages' recipient.
 	pub short_channel_id_alias: Option<u64>,
+	/// The next MuSig2 public nonce required by simple-taproot channels.
+	pub simple_taproot_next_local_nonce: Option<Musig2PublicNonce>,
 }
 
 /// A randomly chosen number that is used to identify inputs within an interactive transaction
@@ -630,6 +644,8 @@ pub struct Shutdown {
 	///
 	/// Must be in one of these forms: P2PKH, P2SH, P2WPKH, P2WSH, P2TR.
 	pub scriptpubkey: ScriptBuf,
+	/// The cooperative-close MuSig2 public nonce required by simple-taproot channels.
+	pub simple_taproot_shutdown_nonce: Option<Musig2PublicNonce>,
 }
 
 /// The minimum and maximum fees which the sender is willing to place on the closing transaction.
@@ -683,6 +699,12 @@ pub struct ClosingComplete {
 	pub closee_output_only: Option<Signature>,
 	/// A signature on the closing transaction covering both `closer` and `closee` outputs.
 	pub closer_and_closee_outputs: Option<Signature>,
+	/// The simple-taproot partial signature and nonce omitting the `closee` output.
+	pub simple_taproot_closer_output_only: Option<SimpleTaprootPartialSignatureWithNonce>,
+	/// The simple-taproot partial signature and nonce omitting the `closer` output.
+	pub simple_taproot_closee_output_only: Option<SimpleTaprootPartialSignatureWithNonce>,
+	/// The simple-taproot partial signature and nonce covering both outputs.
+	pub simple_taproot_closer_and_closee_outputs: Option<SimpleTaprootPartialSignatureWithNonce>,
 }
 
 /// A [`closing_sig`] message to be sent to or received from a peer.
@@ -706,6 +728,14 @@ pub struct ClosingSig {
 	pub closee_output_only: Option<Signature>,
 	/// A signature on the closing transaction covering both `closer` and `closee` outputs.
 	pub closer_and_closee_outputs: Option<Signature>,
+	/// The simple-taproot partial signature omitting the `closee` output.
+	pub simple_taproot_closer_output_only: Option<SimpleTaprootPartialSignature>,
+	/// The simple-taproot partial signature omitting the `closer` output.
+	pub simple_taproot_closee_output_only: Option<SimpleTaprootPartialSignature>,
+	/// The simple-taproot partial signature covering both outputs.
+	pub simple_taproot_closer_and_closee_outputs: Option<SimpleTaprootPartialSignature>,
+	/// The next closee MuSig2 public nonce for simple-taproot RBF cooperative closes.
+	pub simple_taproot_next_closee_nonce: Option<Musig2PublicNonce>,
 }
 
 /// A [`start_batch`] message to be sent to group together multiple channel messages as a single
@@ -890,6 +920,8 @@ pub struct CommitmentSigned {
 	pub htlc_signatures: Vec<Signature>,
 	/// The funding transaction, to discriminate among multiple pending funding transactions (e.g. in case of splicing)
 	pub funding_txid: Option<Txid>,
+	/// The simple-taproot MuSig2 partial signature and signing nonce.
+	pub simple_taproot_partial_signature_with_nonce: Option<SimpleTaprootPartialSignatureWithNonce>,
 }
 
 /// A [`revoke_and_ack`] message to be sent to or received from a peer.
@@ -910,6 +942,8 @@ pub struct RevokeAndACK {
 	///
 	/// [`HeldHtlcAvailable`]: crate::onion_message::async_payments::HeldHtlcAvailable
 	pub release_htlc_message_paths: Vec<(u64, BlindedMessagePath)>,
+	/// Per-funding-transaction next local MuSig2 nonces for simple-taproot commitments.
+	pub simple_taproot_next_local_nonces: Option<SimpleTaprootNextLocalNonces>,
 }
 
 /// An [`update_fee`] message to be sent to or received from a peer
@@ -960,6 +994,8 @@ pub struct ChannelReestablish {
 	///
 	/// Also contains a bitfield indicating which messages should be retransmitted.
 	pub my_current_funding_locked: Option<FundingLocked>,
+	/// Per-funding-transaction next local MuSig2 nonces for simple-taproot retransmission.
+	pub simple_taproot_next_local_nonces: Option<SimpleTaprootNextLocalNonces>,
 }
 
 /// Information exchanged during channel reestablishment about the next funding from interactive
@@ -2890,6 +2926,7 @@ impl Writeable for AcceptChannel {
 		encode_tlv_stream!(w, {
 			(0, self.common_fields.shutdown_scriptpubkey.as_ref().map(|s| WithoutLength(s)), option), // Don't encode length twice.
 			(1, self.common_fields.channel_type, option),
+			(4, self.common_fields.simple_taproot_next_local_nonce, option),
 		});
 		Ok(())
 	}
@@ -2914,9 +2951,11 @@ impl LengthReadable for AcceptChannel {
 
 		let mut shutdown_scriptpubkey: Option<ScriptBuf> = None;
 		let mut channel_type: Option<ChannelTypeFeatures> = None;
+		let mut simple_taproot_next_local_nonce: Option<Musig2PublicNonce> = None;
 		decode_tlv_stream!(r, {
 			(0, shutdown_scriptpubkey, (option, encoding: (ScriptBuf, WithoutLength))),
 			(1, channel_type, option),
+			(4, simple_taproot_next_local_nonce, option),
 		});
 
 		Ok(AcceptChannel {
@@ -2936,6 +2975,7 @@ impl LengthReadable for AcceptChannel {
 				first_per_commitment_point,
 				shutdown_scriptpubkey,
 				channel_type,
+				simple_taproot_next_local_nonce,
 			},
 			channel_reserve_satoshis,
 		})
@@ -2964,6 +3004,7 @@ impl Writeable for AcceptChannelV2 {
 			(0, self.common_fields.shutdown_scriptpubkey.as_ref().map(|s| WithoutLength(s)), option), // Don't encode length twice.
 			(1, self.common_fields.channel_type, option),
 			(2, self.require_confirmed_inputs, option),
+			(4, self.common_fields.simple_taproot_next_local_nonce, option),
 			(103, self.disable_channel_reserve, option),
 		});
 		Ok(())
@@ -2991,11 +3032,13 @@ impl LengthReadable for AcceptChannelV2 {
 		let mut shutdown_scriptpubkey: Option<ScriptBuf> = None;
 		let mut channel_type: Option<ChannelTypeFeatures> = None;
 		let mut require_confirmed_inputs: Option<()> = None;
+		let mut simple_taproot_next_local_nonce: Option<Musig2PublicNonce> = None;
 		let mut disable_channel_reserve: Option<()> = None;
 		decode_tlv_stream!(r, {
 			(0, shutdown_scriptpubkey, (option, encoding: (ScriptBuf, WithoutLength))),
 			(1, channel_type, option),
 			(2, require_confirmed_inputs, option),
+			(4, simple_taproot_next_local_nonce, option),
 			(103, disable_channel_reserve, option),
 		});
 
@@ -3016,6 +3059,7 @@ impl LengthReadable for AcceptChannelV2 {
 				first_per_commitment_point,
 				shutdown_scriptpubkey,
 				channel_type,
+				simple_taproot_next_local_nonce,
 			},
 			funding_satoshis,
 			second_per_commitment_point,
@@ -3169,6 +3213,7 @@ impl_writeable_msg!(ChannelReestablish, {
 }, {
 	(1, next_funding, option),
 	(5, my_current_funding_locked, option),
+	(22, simple_taproot_next_local_nonces, option),
 });
 
 impl_writeable!(NextFunding, {
@@ -3191,7 +3236,10 @@ impl_writeable_msg!(ClosingComplete,
 	{
 		(1, closer_output_only, option),
 		(2, closee_output_only, option),
-		(3, closer_and_closee_outputs, option)
+		(3, closer_and_closee_outputs, option),
+		(5, simple_taproot_closer_output_only, option),
+		(6, simple_taproot_closee_output_only, option),
+		(7, simple_taproot_closer_and_closee_outputs, option)
 	}
 );
 
@@ -3200,7 +3248,11 @@ impl_writeable_msg!(ClosingSig,
 	{
 		(1, closer_output_only, option),
 		(2, closee_output_only, option),
-		(3, closer_and_closee_outputs, option)
+		(3, closer_and_closee_outputs, option),
+		(5, simple_taproot_closer_output_only, option),
+		(6, simple_taproot_closee_output_only, option),
+		(7, simple_taproot_closer_and_closee_outputs, option),
+		(22, simple_taproot_next_closee_nonce, option)
 	}
 );
 
@@ -3215,6 +3267,7 @@ impl_writeable_msg!(CommitmentSigned, {
 	htlc_signatures
 }, {
 	(1, funding_txid, option),
+	(2, simple_taproot_partial_signature_with_nonce, option),
 });
 
 impl_writeable!(DecodedOnionErrorPacket, {
@@ -3228,18 +3281,23 @@ impl_writeable_msg!(FundingCreated, {
 	funding_txid,
 	funding_output_index,
 	signature
-}, {});
+}, {
+	(2, simple_taproot_partial_signature_with_nonce, option),
+});
 
 impl_writeable_msg!(FundingSigned, {
 	channel_id,
 	signature
-}, {});
+}, {
+	(2, simple_taproot_partial_signature_with_nonce, option),
+});
 
 impl_writeable_msg!(ChannelReady, {
 	channel_id,
 	next_per_commitment_point,
 }, {
 	(1, short_channel_id_alias, option),
+	(4, simple_taproot_next_local_nonce, option),
 });
 
 pub(crate) fn write_features_up_to_13<W: Writer>(
@@ -3314,6 +3372,7 @@ impl Writeable for OpenChannel {
 		encode_tlv_stream!(w, {
 			(0, self.common_fields.shutdown_scriptpubkey.as_ref().map(|s| WithoutLength(s)), option), // Don't encode length twice.
 			(1, self.common_fields.channel_type, option),
+			(4, self.common_fields.simple_taproot_next_local_nonce, option),
 		});
 		Ok(())
 	}
@@ -3342,9 +3401,11 @@ impl LengthReadable for OpenChannel {
 
 		let mut shutdown_scriptpubkey: Option<ScriptBuf> = None;
 		let mut channel_type: Option<ChannelTypeFeatures> = None;
+		let mut simple_taproot_next_local_nonce: Option<Musig2PublicNonce> = None;
 		decode_tlv_stream!(r, {
 			(0, shutdown_scriptpubkey, (option, encoding: (ScriptBuf, WithoutLength))),
 			(1, channel_type, option),
+			(4, simple_taproot_next_local_nonce, option),
 		});
 		Ok(OpenChannel {
 			common_fields: CommonOpenChannelFields {
@@ -3366,6 +3427,7 @@ impl LengthReadable for OpenChannel {
 				channel_flags,
 				shutdown_scriptpubkey,
 				channel_type,
+				simple_taproot_next_local_nonce,
 			},
 			push_msat,
 			channel_reserve_satoshis,
@@ -3398,6 +3460,7 @@ impl Writeable for OpenChannelV2 {
 			(0, self.common_fields.shutdown_scriptpubkey.as_ref().map(|s| WithoutLength(s)), option), // Don't encode length twice.
 			(1, self.common_fields.channel_type, option),
 			(2, self.require_confirmed_inputs, option),
+			(4, self.common_fields.simple_taproot_next_local_nonce, option),
 			(103, self.disable_channel_reserve, option),
 		});
 		Ok(())
@@ -3429,11 +3492,13 @@ impl LengthReadable for OpenChannelV2 {
 		let mut shutdown_scriptpubkey: Option<ScriptBuf> = None;
 		let mut channel_type: Option<ChannelTypeFeatures> = None;
 		let mut require_confirmed_inputs: Option<()> = None;
+		let mut simple_taproot_next_local_nonce: Option<Musig2PublicNonce> = None;
 		let mut disable_channel_reserve: Option<()> = None;
 		decode_tlv_stream!(r, {
 			(0, shutdown_scriptpubkey, (option, encoding: (ScriptBuf, WithoutLength))),
 			(1, channel_type, option),
 			(2, require_confirmed_inputs, option),
+			(4, simple_taproot_next_local_nonce, option),
 			(103, disable_channel_reserve, option),
 		});
 		Ok(OpenChannelV2 {
@@ -3456,6 +3521,7 @@ impl LengthReadable for OpenChannelV2 {
 				channel_flags,
 				shutdown_scriptpubkey,
 				channel_type,
+				simple_taproot_next_local_nonce,
 			},
 			funding_feerate_sat_per_1000_weight,
 			locktime,
@@ -3471,13 +3537,16 @@ impl_writeable_msg!(RevokeAndACK, {
 	per_commitment_secret,
 	next_per_commitment_point
 }, {
+	(22, simple_taproot_next_local_nonces, option),
 	(75537, release_htlc_message_paths, optional_vec)
 });
 
 impl_writeable_msg!(Shutdown, {
 	channel_id,
 	scriptpubkey
-}, {});
+}, {
+	(8, simple_taproot_shutdown_nonce, option),
+});
 
 impl_writeable_msg!(UpdateFailHTLC, {
 	channel_id,
@@ -4568,11 +4637,17 @@ impl_writeable_msg!(GossipTimestampFilter, {
 mod tests {
 	use crate::ln::msgs::SocketAddress;
 	use crate::ln::msgs::{
-		self, CommonAcceptChannelFields, CommonOpenChannelFields, FinalOnionHopData,
+		self, CommonAcceptChannelFields, CommonOpenChannelFields, DecodeError, FinalOnionHopData,
 		InboundOnionForwardPayload, InboundOnionReceivePayload, OutboundTrampolinePayload,
 		TrampolineOnionPacket,
 	};
 	use crate::ln::onion_utils::AttributionData;
+	use crate::ln::simple_taproot::{
+		require_next_local_nonces, require_partial_signature, require_partial_signature_with_nonce,
+		require_public_nonce, Musig2PublicNonce, SimpleTaprootNextLocalNonces,
+		SimpleTaprootNonceEntry, SimpleTaprootPartialSignature,
+		SimpleTaprootPartialSignatureWithNonce, MUSIG2_PARTIAL_SIGNATURE_LEN,
+	};
 	use crate::ln::types::ChannelId;
 	use crate::routing::gossip::{NodeAlias, NodeId};
 	use crate::types::features::{
@@ -4636,6 +4711,7 @@ mod tests {
 			my_current_per_commitment_point: public_key,
 			next_funding: None,
 			my_current_funding_locked: None,
+			simple_taproot_next_local_nonces: None,
 		};
 
 		let encoded_value = cr.encode();
@@ -4691,6 +4767,7 @@ mod tests {
 				retransmit_flags: 1,
 			}),
 			my_current_funding_locked: None,
+			simple_taproot_next_local_nonces: None,
 		};
 
 		let encoded_value = cr.encode();
@@ -4750,6 +4827,7 @@ mod tests {
 				),
 				retransmit_flags: 1,
 			}),
+			simple_taproot_next_local_nonces: None,
 		};
 
 		let encoded_value = cr.encode();
@@ -4786,6 +4864,364 @@ mod tests {
 			let sighash = Message::from_digest_slice(&$string.into_bytes()[..]).unwrap();
 			$ctx.sign_ecdsa(&sighash, &$privkey)
 		}};
+	}
+
+	fn sample_musig2_nonce() -> Musig2PublicNonce {
+		Musig2PublicNonce::from_slice(
+			&<Vec<u8>>::from_hex(
+				"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798\
+				 0379be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+			)
+			.unwrap(),
+		)
+		.unwrap()
+	}
+
+	fn sample_partial_signature(seed: u8) -> SimpleTaprootPartialSignature {
+		SimpleTaprootPartialSignature::from_bytes([seed; MUSIG2_PARTIAL_SIGNATURE_LEN])
+	}
+
+	fn sample_partial_signature_with_nonce(seed: u8) -> SimpleTaprootPartialSignatureWithNonce {
+		SimpleTaprootPartialSignatureWithNonce::new(
+			sample_partial_signature(seed),
+			sample_musig2_nonce(),
+		)
+	}
+
+	fn sample_next_local_nonces() -> SimpleTaprootNextLocalNonces {
+		SimpleTaprootNextLocalNonces(vec![SimpleTaprootNonceEntry {
+			funding_txid: Txid::from_str(
+				"c2d4449afa8d26140898dd54d3390b057ba2a5afcf03ba29d7dc0d8b9ffe966e",
+			)
+			.unwrap(),
+			public_nonce: sample_musig2_nonce(),
+		}])
+	}
+
+	fn sample_signature() -> bitcoin::secp256k1::ecdsa::Signature {
+		let secp_ctx = Secp256k1::new();
+		let (privkey, _) = get_keys_from!(
+			"0101010101010101010101010101010101010101010101010101010101010101",
+			secp_ctx
+		);
+		get_sig_on!(privkey, secp_ctx, String::from("01010101010101010101010101010101"))
+	}
+
+	fn sample_pubkey(seed: &str) -> PublicKey {
+		let secp_ctx = Secp256k1::new();
+		let (_, pubkey) = get_keys_from!(seed, secp_ctx);
+		pubkey
+	}
+
+	fn round_trip_message<T>(msg: &T) -> T
+	where
+		T: Clone + core::fmt::Debug + LengthReadable + PartialEq + Writeable,
+	{
+		let encoded = msg.encode();
+		let mut reader = &encoded[..];
+		let decoded = T::read_from_fixed_length_buffer(&mut reader).unwrap();
+		assert_eq!(&decoded, msg);
+		decoded
+	}
+
+	fn append_tlv(bytes: &mut Vec<u8>, typ: u64, value: &[u8]) {
+		BigSize(typ).write(bytes).unwrap();
+		BigSize(value.len() as u64).write(bytes).unwrap();
+		bytes.extend_from_slice(value);
+	}
+
+	#[test]
+	fn simple_taproot_lifecycle_tlvs_round_trip_in_native_messages() {
+		let sig = sample_signature();
+		let nonce = sample_musig2_nonce();
+		let partial_sig = sample_partial_signature(7);
+		let partial_sig_with_nonce = sample_partial_signature_with_nonce(9);
+		let next_local_nonces = sample_next_local_nonces();
+		let funding_txid =
+			Txid::from_str("c2d4449afa8d26140898dd54d3390b057ba2a5afcf03ba29d7dc0d8b9ffe966e")
+				.unwrap();
+
+		let open_channel = msgs::OpenChannel {
+			common_fields: CommonOpenChannelFields {
+				chain_hash: ChainHash::using_genesis_block(Network::Bitcoin),
+				temporary_channel_id: ChannelId::from_bytes([2; 32]),
+				funding_satoshis: 100_000,
+				dust_limit_satoshis: 354,
+				max_htlc_value_in_flight_msat: 10_000_000,
+				htlc_minimum_msat: 1,
+				commitment_feerate_sat_per_1000_weight: 253,
+				to_self_delay: 144,
+				max_accepted_htlcs: 30,
+				funding_pubkey: sample_pubkey(
+					"0101010101010101010101010101010101010101010101010101010101010101",
+				),
+				revocation_basepoint: sample_pubkey(
+					"0202020202020202020202020202020202020202020202020202020202020202",
+				),
+				payment_basepoint: sample_pubkey(
+					"0303030303030303030303030303030303030303030303030303030303030303",
+				),
+				delayed_payment_basepoint: sample_pubkey(
+					"0404040404040404040404040404040404040404040404040404040404040404",
+				),
+				htlc_basepoint: sample_pubkey(
+					"0505050505050505050505050505050505050505050505050505050505050505",
+				),
+				first_per_commitment_point: sample_pubkey(
+					"0606060606060606060606060606060606060606060606060606060606060606",
+				),
+				channel_flags: 0,
+				shutdown_scriptpubkey: None,
+				channel_type: Some(ChannelTypeFeatures::simple_taproot_staging()),
+				simple_taproot_next_local_nonce: Some(nonce),
+			},
+			push_msat: 0,
+			channel_reserve_satoshis: 1_000,
+		};
+		assert_eq!(
+			round_trip_message(&open_channel).common_fields.simple_taproot_next_local_nonce,
+			Some(nonce)
+		);
+
+		let accept_channel = msgs::AcceptChannel {
+			common_fields: CommonAcceptChannelFields {
+				temporary_channel_id: ChannelId::from_bytes([2; 32]),
+				dust_limit_satoshis: 354,
+				max_htlc_value_in_flight_msat: 10_000_000,
+				htlc_minimum_msat: 1,
+				minimum_depth: 1,
+				to_self_delay: 144,
+				max_accepted_htlcs: 30,
+				funding_pubkey: open_channel.common_fields.funding_pubkey,
+				revocation_basepoint: open_channel.common_fields.revocation_basepoint,
+				payment_basepoint: open_channel.common_fields.payment_basepoint,
+				delayed_payment_basepoint: open_channel.common_fields.delayed_payment_basepoint,
+				htlc_basepoint: open_channel.common_fields.htlc_basepoint,
+				first_per_commitment_point: open_channel.common_fields.first_per_commitment_point,
+				shutdown_scriptpubkey: None,
+				channel_type: Some(ChannelTypeFeatures::simple_taproot_staging()),
+				simple_taproot_next_local_nonce: Some(nonce),
+			},
+			channel_reserve_satoshis: 1_000,
+		};
+		assert_eq!(
+			round_trip_message(&accept_channel).common_fields.simple_taproot_next_local_nonce,
+			Some(nonce)
+		);
+
+		let funding_created = msgs::FundingCreated {
+			temporary_channel_id: ChannelId::from_bytes([2; 32]),
+			funding_txid,
+			funding_output_index: 0,
+			signature: sig,
+			simple_taproot_partial_signature_with_nonce: Some(partial_sig_with_nonce),
+		};
+		assert_eq!(
+			round_trip_message(&funding_created).simple_taproot_partial_signature_with_nonce,
+			Some(partial_sig_with_nonce)
+		);
+
+		let funding_signed = msgs::FundingSigned {
+			channel_id: ChannelId::from_bytes([3; 32]),
+			signature: sig,
+			simple_taproot_partial_signature_with_nonce: Some(partial_sig_with_nonce),
+		};
+		assert_eq!(
+			round_trip_message(&funding_signed).simple_taproot_partial_signature_with_nonce,
+			Some(partial_sig_with_nonce)
+		);
+
+		let channel_ready = msgs::ChannelReady {
+			channel_id: ChannelId::from_bytes([3; 32]),
+			next_per_commitment_point: open_channel.common_fields.first_per_commitment_point,
+			short_channel_id_alias: Some(42),
+			simple_taproot_next_local_nonce: Some(nonce),
+		};
+		assert_eq!(round_trip_message(&channel_ready).simple_taproot_next_local_nonce, Some(nonce));
+
+		let shutdown = msgs::Shutdown {
+			channel_id: ChannelId::from_bytes([3; 32]),
+			scriptpubkey: ScriptBuf::new(),
+			simple_taproot_shutdown_nonce: Some(nonce),
+		};
+		assert_eq!(round_trip_message(&shutdown).simple_taproot_shutdown_nonce, Some(nonce));
+
+		let closing_complete = msgs::ClosingComplete {
+			channel_id: ChannelId::from_bytes([3; 32]),
+			closer_scriptpubkey: ScriptBuf::new(),
+			closee_scriptpubkey: ScriptBuf::new(),
+			fee_satoshis: 500,
+			locktime: 0,
+			closer_output_only: None,
+			closee_output_only: None,
+			closer_and_closee_outputs: None,
+			simple_taproot_closer_output_only: Some(partial_sig_with_nonce),
+			simple_taproot_closee_output_only: Some(partial_sig_with_nonce),
+			simple_taproot_closer_and_closee_outputs: Some(partial_sig_with_nonce),
+		};
+		assert_eq!(
+			round_trip_message(&closing_complete).simple_taproot_closer_and_closee_outputs,
+			Some(partial_sig_with_nonce)
+		);
+
+		let closing_sig = msgs::ClosingSig {
+			channel_id: ChannelId::from_bytes([3; 32]),
+			closer_scriptpubkey: ScriptBuf::new(),
+			closee_scriptpubkey: ScriptBuf::new(),
+			fee_satoshis: 500,
+			locktime: 0,
+			closer_output_only: None,
+			closee_output_only: None,
+			closer_and_closee_outputs: None,
+			simple_taproot_closer_output_only: Some(partial_sig),
+			simple_taproot_closee_output_only: Some(partial_sig),
+			simple_taproot_closer_and_closee_outputs: Some(partial_sig),
+			simple_taproot_next_closee_nonce: Some(nonce),
+		};
+		assert_eq!(round_trip_message(&closing_sig).simple_taproot_next_closee_nonce, Some(nonce));
+
+		let commitment_signed = msgs::CommitmentSigned {
+			channel_id: ChannelId::from_bytes([3; 32]),
+			signature: sig,
+			htlc_signatures: Vec::new(),
+			funding_txid: Some(funding_txid),
+			simple_taproot_partial_signature_with_nonce: Some(partial_sig_with_nonce),
+		};
+		assert_eq!(
+			round_trip_message(&commitment_signed).simple_taproot_partial_signature_with_nonce,
+			Some(partial_sig_with_nonce)
+		);
+
+		let revoke_and_ack = msgs::RevokeAndACK {
+			channel_id: ChannelId::from_bytes([3; 32]),
+			per_commitment_secret: [1; 32],
+			next_per_commitment_point: open_channel.common_fields.first_per_commitment_point,
+			release_htlc_message_paths: Vec::new(),
+			simple_taproot_next_local_nonces: Some(next_local_nonces.clone()),
+		};
+		assert_eq!(
+			round_trip_message(&revoke_and_ack).simple_taproot_next_local_nonces,
+			Some(next_local_nonces.clone())
+		);
+
+		let channel_reestablish = msgs::ChannelReestablish {
+			channel_id: ChannelId::from_bytes([3; 32]),
+			next_local_commitment_number: 1,
+			next_remote_commitment_number: 1,
+			your_last_per_commitment_secret: [1; 32],
+			my_current_per_commitment_point: open_channel.common_fields.first_per_commitment_point,
+			next_funding: None,
+			my_current_funding_locked: None,
+			simple_taproot_next_local_nonces: Some(next_local_nonces.clone()),
+		};
+		assert_eq!(
+			round_trip_message(&channel_reestablish).simple_taproot_next_local_nonces,
+			Some(next_local_nonces)
+		);
+	}
+
+	#[test]
+	fn simple_taproot_tlvs_fail_closed_when_malformed_or_unsupported() {
+		let sig = sample_signature();
+		let nonce = sample_musig2_nonce();
+
+		let channel_ready = msgs::ChannelReady {
+			channel_id: ChannelId::from_bytes([3; 32]),
+			next_per_commitment_point: sample_pubkey(
+				"0606060606060606060606060606060606060606060606060606060606060606",
+			),
+			short_channel_id_alias: None,
+			simple_taproot_next_local_nonce: None,
+		};
+		let mut unknown_even = channel_ready.encode();
+		append_tlv(&mut unknown_even, 2, &[]);
+		assert_eq!(
+			msgs::ChannelReady::read_from_fixed_length_buffer(&mut &unknown_even[..]).unwrap_err(),
+			DecodeError::UnknownRequiredFeature
+		);
+
+		let mut duplicate = msgs::ChannelReady {
+			simple_taproot_next_local_nonce: Some(nonce),
+			..channel_ready.clone()
+		}
+		.encode();
+		append_tlv(&mut duplicate, 4, nonce.as_bytes());
+		assert_eq!(
+			msgs::ChannelReady::read_from_fixed_length_buffer(&mut &duplicate[..]).unwrap_err(),
+			DecodeError::InvalidValue
+		);
+
+		let funding_signed = msgs::FundingSigned {
+			channel_id: ChannelId::from_bytes([3; 32]),
+			signature: sig,
+			simple_taproot_partial_signature_with_nonce: None,
+		};
+		let mut malformed_partial_sig_with_nonce = funding_signed.encode();
+		append_tlv(&mut malformed_partial_sig_with_nonce, 2, &[1; 97]);
+		assert!(msgs::FundingSigned::read_from_fixed_length_buffer(
+			&mut &malformed_partial_sig_with_nonce[..]
+		)
+		.is_err());
+
+		let open_channel = msgs::OpenChannel {
+			common_fields: CommonOpenChannelFields {
+				chain_hash: ChainHash::using_genesis_block(Network::Bitcoin),
+				temporary_channel_id: ChannelId::from_bytes([2; 32]),
+				funding_satoshis: 100_000,
+				dust_limit_satoshis: 354,
+				max_htlc_value_in_flight_msat: 10_000_000,
+				htlc_minimum_msat: 1,
+				commitment_feerate_sat_per_1000_weight: 253,
+				to_self_delay: 144,
+				max_accepted_htlcs: 30,
+				funding_pubkey: sample_pubkey(
+					"0101010101010101010101010101010101010101010101010101010101010101",
+				),
+				revocation_basepoint: sample_pubkey(
+					"0202020202020202020202020202020202020202020202020202020202020202",
+				),
+				payment_basepoint: sample_pubkey(
+					"0303030303030303030303030303030303030303030303030303030303030303",
+				),
+				delayed_payment_basepoint: sample_pubkey(
+					"0404040404040404040404040404040404040404040404040404040404040404",
+				),
+				htlc_basepoint: sample_pubkey(
+					"0505050505050505050505050505050505050505050505050505050505050505",
+				),
+				first_per_commitment_point: sample_pubkey(
+					"0606060606060606060606060606060606060606060606060606060606060606",
+				),
+				channel_flags: 0,
+				shutdown_scriptpubkey: None,
+				channel_type: Some(ChannelTypeFeatures::simple_taproot_staging()),
+				simple_taproot_next_local_nonce: None,
+			},
+			push_msat: 0,
+			channel_reserve_satoshis: 1_000,
+		};
+		let mut malformed_nonce = open_channel.encode();
+		append_tlv(&mut malformed_nonce, 4, &[0; 66]);
+		assert_eq!(
+			msgs::OpenChannel::read_from_fixed_length_buffer(&mut &malformed_nonce[..])
+				.unwrap_err(),
+			DecodeError::InvalidValue
+		);
+	}
+
+	#[test]
+	fn simple_taproot_required_tlv_validation_rejects_missing_fields() {
+		assert_eq!(require_public_nonce(None).unwrap_err(), DecodeError::InvalidValue);
+		assert_eq!(
+			require_partial_signature_with_nonce(None).unwrap_err(),
+			DecodeError::InvalidValue
+		);
+		assert_eq!(require_partial_signature(None).unwrap_err(), DecodeError::InvalidValue);
+		assert_eq!(require_next_local_nonces(None).unwrap_err(), DecodeError::InvalidValue);
+		assert_eq!(
+			require_next_local_nonces(Some(&SimpleTaprootNextLocalNonces(Vec::new()))).unwrap_err(),
+			DecodeError::InvalidValue
+		);
 	}
 
 	#[test]
@@ -5155,6 +5591,7 @@ mod tests {
 				} else {
 					None
 				},
+				simple_taproot_next_local_nonce: None,
 			},
 			push_msat: 2536655962884945560,
 			channel_reserve_satoshis: 8665828695742877976,
@@ -5264,6 +5701,7 @@ mod tests {
 				} else {
 					None
 				},
+				simple_taproot_next_local_nonce: None,
 			},
 			funding_feerate_sat_per_1000_weight: 821716,
 			locktime: 305419896,
@@ -5449,6 +5887,7 @@ mod tests {
 					None
 				},
 				channel_type: None,
+				simple_taproot_next_local_nonce: None,
 			},
 			channel_reserve_satoshis: 3608586615801332854,
 		};
@@ -5533,6 +5972,7 @@ mod tests {
 				} else {
 					None
 				},
+				simple_taproot_next_local_nonce: None,
 			},
 			funding_satoshis: 1311768467284833366,
 			second_per_commitment_point: pubkey_7,
@@ -5647,6 +6087,7 @@ mod tests {
 			.unwrap(),
 			funding_output_index: 255,
 			signature: sig_1,
+			simple_taproot_partial_signature_with_nonce: None,
 		};
 		let encoded_value = funding_created.encode();
 		let target_value = <Vec<u8>>::from_hex("02020202020202020202020202020202020202020202020202020202020202026e96fe9f8b0ddcd729ba03cfafa5a27b050b39d354dd980814268dfa9a44d4c200ffd977cb9b53d93a6ff64bb5f1e158b4094b66e798fb12911168a3ccdf80a83096340a6a95da0ae8d9f776528eecdbb747eb6b545495a4319ed5378e35b21e073a").unwrap();
@@ -5662,8 +6103,11 @@ mod tests {
 		);
 		let sig_1 =
 			get_sig_on!(privkey_1, secp_ctx, String::from("01010101010101010101010101010101"));
-		let funding_signed =
-			msgs::FundingSigned { channel_id: ChannelId::from_bytes([2; 32]), signature: sig_1 };
+		let funding_signed = msgs::FundingSigned {
+			channel_id: ChannelId::from_bytes([2; 32]),
+			signature: sig_1,
+			simple_taproot_partial_signature_with_nonce: None,
+		};
 		let encoded_value = funding_signed.encode();
 		let target_value = <Vec<u8>>::from_hex("0202020202020202020202020202020202020202020202020202020202020202d977cb9b53d93a6ff64bb5f1e158b4094b66e798fb12911168a3ccdf80a83096340a6a95da0ae8d9f776528eecdbb747eb6b545495a4319ed5378e35b21e073a").unwrap();
 		assert_eq!(encoded_value, target_value);
@@ -5680,6 +6124,7 @@ mod tests {
 			channel_id: ChannelId::from_bytes([2; 32]),
 			next_per_commitment_point: pubkey_1,
 			short_channel_id_alias: None,
+			simple_taproot_next_local_nonce: None,
 		};
 		let encoded_value = channel_ready.encode();
 		let target_value = <Vec<u8>>::from_hex("0202020202020202020202020202020202020202020202020202020202020202031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f").unwrap();
@@ -6018,6 +6463,7 @@ mod tests {
 			} else {
 				Address::p2wsh(&script, Network::Testnet).script_pubkey()
 			},
+			simple_taproot_shutdown_nonce: None,
 		};
 		let encoded_value = shutdown.encode();
 		let mut target_value =
@@ -6202,6 +6648,7 @@ mod tests {
 				Txid::from_str("c2d4449afa8d26140898dd54d3390b057ba2a5afcf03ba29d7dc0d8b9ffe966e")
 					.unwrap(),
 			),
+			simple_taproot_partial_signature_with_nonce: None,
 		};
 		let encoded_value = commitment_signed.encode();
 		let mut target_value = "0202020202020202020202020202020202020202020202020202020202020202d977cb9b53d93a6ff64bb5f1e158b4094b66e798fb12911168a3ccdf80a83096340a6a95da0ae8d9f776528eecdbb747eb6b545495a4319ed5378e35b21e073a".to_string();
@@ -6237,6 +6684,7 @@ mod tests {
 			],
 			next_per_commitment_point: pubkey_1,
 			release_htlc_message_paths: Vec::new(),
+			simple_taproot_next_local_nonces: None,
 		};
 		let encoded_value = raa.encode();
 		let target_value = <Vec<u8>>::from_hex("02020202020202020202020202020202020202020202020202020202020202020101010101010101010101010101010101010101010101010101010101010101031b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f").unwrap();
