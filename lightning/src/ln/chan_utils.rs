@@ -47,7 +47,10 @@ use super::channel_keys::{
 	RevocationKey,
 };
 #[cfg(feature = "simple_taproot_musig2")]
-use super::simple_taproot::SimpleTaprootKeyAggContext;
+use super::simple_taproot::{
+	simple_taproot_anchor_spend_info, simple_taproot_to_local_spend_info,
+	simple_taproot_to_remote_spend_info, SimpleTaprootKeyAggContext,
+};
 use crate::chain;
 use crate::crypto::utils::{sign, sign_with_aux_rand};
 use crate::io;
@@ -694,6 +697,14 @@ pub fn get_revokeable_redeemscript(revocation_key: &RevocationKey, contest_delay
 pub fn get_countersigner_payment_script(
 	channel_type_features: &ChannelTypeFeatures, payment_key: &PublicKey,
 ) -> ScriptBuf {
+	#[cfg(feature = "simple_taproot_musig2")]
+	if requires_simple_taproot_outputs(channel_type_features) {
+		let secp_ctx = Secp256k1::verification_only();
+		return simple_taproot_to_remote_spend_info(&secp_ctx, payment_key)
+			.expect("valid simple-taproot to_remote output")
+			.script_pubkey;
+	}
+
 	if channel_type_features.supports_anchors_zero_fee_htlc_tx() {
 		get_to_countersigner_keyed_anchor_redeemscript(payment_key).to_p2wsh()
 	} else {
@@ -853,6 +864,12 @@ pub(crate) fn make_funding_redeemscript_from_slices(broadcaster_funding_key: &[u
 		builder.push_slice(countersignatory_funding_key)
 			.push_slice(broadcaster_funding_key)
 	}.push_opcode(opcodes::all::OP_PUSHNUM_2).push_opcode(opcodes::all::OP_CHECKMULTISIG).into_script()
+}
+
+#[cfg(feature = "simple_taproot_musig2")]
+fn requires_simple_taproot_outputs(channel_type_features: &ChannelTypeFeatures) -> bool {
+	channel_type_features.requires_simple_taproot()
+		|| channel_type_features.requires_simple_taproot_staging()
 }
 
 /// Builds an unsigned HTLC-Success or HTLC-Timeout transaction from the given channel and HTLC
@@ -1923,6 +1940,18 @@ impl CommitmentTransaction {
 		let tx_has_htlc_outputs = nondust_htlcs_value_sum_sat != Amount::ZERO;
 
 		if to_countersignatory_value_sat > Amount::ZERO {
+			#[cfg(feature = "simple_taproot_musig2")]
+			let script = if requires_simple_taproot_outputs(channel_type) {
+				let secp_ctx = Secp256k1::verification_only();
+				simple_taproot_to_remote_spend_info(&secp_ctx, countersignatory_payment_point)
+					.expect("valid simple-taproot to_remote output")
+					.script_pubkey
+			} else if channel_type.supports_anchors_zero_fee_htlc_tx() {
+				get_to_countersigner_keyed_anchor_redeemscript(countersignatory_payment_point).to_p2wsh()
+			} else {
+				ScriptBuf::new_p2wpkh(&Hash160::hash(&countersignatory_payment_point.serialize()).into())
+			};
+			#[cfg(not(feature = "simple_taproot_musig2"))]
 			let script = if channel_type.supports_anchors_zero_fee_htlc_tx() {
 				get_to_countersigner_keyed_anchor_redeemscript(countersignatory_payment_point).to_p2wsh()
 			} else {
@@ -1935,17 +1964,90 @@ impl CommitmentTransaction {
 		}
 
 		if to_broadcaster_value_sat > Amount::ZERO {
-			let redeem_script = get_revokeable_redeemscript(
+			#[cfg(feature = "simple_taproot_musig2")]
+			let script_pubkey = if requires_simple_taproot_outputs(channel_type) {
+				let secp_ctx = Secp256k1::verification_only();
+				simple_taproot_to_local_spend_info(
+					&secp_ctx,
+					&keys.broadcaster_delayed_payment_key.to_public_key(),
+					&keys.revocation_key.to_public_key(),
+					contest_delay,
+				)
+				.expect("valid simple-taproot to_local output")
+				.script_pubkey
+			} else {
+				get_revokeable_redeemscript(
+					&keys.revocation_key,
+					contest_delay,
+					&keys.broadcaster_delayed_payment_key,
+				)
+				.to_p2wsh()
+			};
+			#[cfg(not(feature = "simple_taproot_musig2"))]
+			let script_pubkey = get_revokeable_redeemscript(
 				&keys.revocation_key,
 				contest_delay,
 				&keys.broadcaster_delayed_payment_key,
-			);
+			)
+			.to_p2wsh();
 			insert_non_htlc_output(TxOut {
-				script_pubkey: redeem_script.to_p2wsh(),
+				script_pubkey,
 				value: to_broadcaster_value_sat,
 			});
 		}
 
+		#[cfg(feature = "simple_taproot_musig2")]
+		if requires_simple_taproot_outputs(channel_type) {
+			let secp_ctx = Secp256k1::verification_only();
+			if to_broadcaster_value_sat > Amount::ZERO || tx_has_htlc_outputs {
+				insert_non_htlc_output(TxOut {
+					script_pubkey: simple_taproot_anchor_spend_info(
+						&secp_ctx,
+						&keys.broadcaster_delayed_payment_key.to_public_key(),
+					)
+					.expect("valid simple-taproot broadcaster anchor output")
+					.script_pubkey,
+					value: Amount::from_sat(ANCHOR_OUTPUT_VALUE_SATOSHI),
+				});
+			}
+
+			if to_countersignatory_value_sat > Amount::ZERO || tx_has_htlc_outputs {
+				insert_non_htlc_output(TxOut {
+					script_pubkey: simple_taproot_anchor_spend_info(
+						&secp_ctx,
+						countersignatory_payment_point,
+					)
+					.expect("valid simple-taproot countersignatory anchor output")
+					.script_pubkey,
+					value: Amount::from_sat(ANCHOR_OUTPUT_VALUE_SATOSHI),
+				});
+			}
+		} else if channel_type.supports_anchors_zero_fee_htlc_tx() {
+			if to_broadcaster_value_sat > Amount::ZERO || tx_has_htlc_outputs {
+				let anchor_script = get_keyed_anchor_redeemscript(broadcaster_funding_key);
+				insert_non_htlc_output(TxOut {
+					script_pubkey: anchor_script.to_p2wsh(),
+					value: Amount::from_sat(ANCHOR_OUTPUT_VALUE_SATOSHI),
+				});
+			}
+
+			if to_countersignatory_value_sat > Amount::ZERO || tx_has_htlc_outputs {
+				let anchor_script = get_keyed_anchor_redeemscript(countersignatory_funding_key);
+				insert_non_htlc_output(TxOut {
+					script_pubkey: anchor_script.to_p2wsh(),
+					value: Amount::from_sat(ANCHOR_OUTPUT_VALUE_SATOSHI),
+				});
+			}
+		} else if channel_type.supports_anchor_zero_fee_commitments() {
+				let channel_value_satoshis = Amount::from_sat(channel_parameters.channel_value_satoshis());
+				// These subtractions panic on underflow, but this should never happen
+				let trimmed_sum_sat = channel_value_satoshis - nondust_htlcs_value_sum_sat - to_broadcaster_value_sat - to_countersignatory_value_sat;
+				insert_non_htlc_output(TxOut {
+					script_pubkey: shared_anchor_script_pubkey(),
+					value: cmp::min(Amount::from_sat(P2A_MAX_VALUE), trimmed_sum_sat),
+				});
+		}
+		#[cfg(not(feature = "simple_taproot_musig2"))]
 		if channel_type.supports_anchors_zero_fee_htlc_tx() {
 			if to_broadcaster_value_sat > Amount::ZERO || tx_has_htlc_outputs {
 				let anchor_script = get_keyed_anchor_redeemscript(broadcaster_funding_key);
@@ -1962,9 +2064,7 @@ impl CommitmentTransaction {
 					value: Amount::from_sat(ANCHOR_OUTPUT_VALUE_SATOSHI),
 				});
 			}
-		}
-
-		if channel_type.supports_anchor_zero_fee_commitments() {
+		} else if channel_type.supports_anchor_zero_fee_commitments() {
 				let channel_value_satoshis = Amount::from_sat(channel_parameters.channel_value_satoshis());
 				// These subtractions panic on underflow, but this should never happen
 				let trimmed_sum_sat = channel_value_satoshis - nondust_htlcs_value_sum_sat - to_broadcaster_value_sat - to_countersignatory_value_sat;
@@ -2202,15 +2302,37 @@ impl<'a> TrustedCommitmentTransaction<'a> {
 	/// revokeable output.
 	#[rustfmt::skip]
 	pub fn revokeable_output_index(&self) -> Option<usize> {
-		let revokeable_redeemscript = get_revokeable_redeemscript(
+		let to_broadcaster_delay = self.to_broadcaster_delay?;
+		#[cfg(feature = "simple_taproot_musig2")]
+		let revokeable_script_pubkey =
+			if requires_simple_taproot_outputs(&self.inner.channel_type_features) {
+				let secp_ctx = Secp256k1::verification_only();
+				simple_taproot_to_local_spend_info(
+					&secp_ctx,
+					&self.keys.broadcaster_delayed_payment_key.to_public_key(),
+					&self.keys.revocation_key.to_public_key(),
+					to_broadcaster_delay,
+				)
+				.ok()?
+				.script_pubkey
+			} else {
+				get_revokeable_redeemscript(
+					&self.keys.revocation_key,
+					to_broadcaster_delay,
+					&self.keys.broadcaster_delayed_payment_key,
+				)
+				.to_p2wsh()
+			};
+		#[cfg(not(feature = "simple_taproot_musig2"))]
+		let revokeable_script_pubkey = get_revokeable_redeemscript(
 			&self.keys.revocation_key,
-			self.to_broadcaster_delay?,
+			to_broadcaster_delay,
 			&self.keys.broadcaster_delayed_payment_key,
-		);
-		let revokeable_p2wsh = revokeable_redeemscript.to_p2wsh();
+		)
+		.to_p2wsh();
 		let outputs = &self.inner.built.transaction.output;
 		outputs.iter().enumerate()
-			.find(|(_, out)| out.script_pubkey == revokeable_p2wsh)
+			.find(|(_, out)| out.script_pubkey == revokeable_script_pubkey)
 			.map(|(idx, _)| idx)
 	}
 
@@ -2296,6 +2418,8 @@ mod tests {
 		CounterpartyChannelTransactionParameters, HTLCOutputInCommitment,
 		TrustedCommitmentTransaction,
 	};
+	#[cfg(feature = "simple_taproot_musig2")]
+	use crate::ln::channel_keys::{DelayedPaymentBasepoint, HtlcBasepoint, RevocationBasepoint};
 	use crate::sign::{ChannelSigner, SignerProvider};
 	use crate::types::features::ChannelTypeFeatures;
 	use crate::types::payment::PaymentHash;
@@ -2303,6 +2427,8 @@ mod tests {
 	use bitcoin::hashes::Hash;
 	use bitcoin::hex::FromHex;
 	use bitcoin::secp256k1::{self, PublicKey, Secp256k1, SecretKey};
+	#[cfg(feature = "simple_taproot_musig2")]
+	use bitcoin::transaction::TxOut;
 	use bitcoin::PublicKey as BitcoinPublicKey;
 	use bitcoin::{CompressedPublicKey, Network, ScriptBuf, Txid};
 
@@ -2365,6 +2491,60 @@ mod tests {
 		) -> Result<TrustedCommitmentTransaction<'a>, ()> {
 			tx.verify(&self.channel_parameters.as_holder_broadcastable(), &self.secp_ctx)
 		}
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	fn vector_pubkey(hex: &str) -> PublicKey {
+		PublicKey::from_slice(&<Vec<u8>>::from_hex(hex).unwrap()).unwrap()
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	#[rustfmt::skip]
+	fn simple_taproot_vector_builder() -> TestCommitmentTxBuilder {
+		let secp_ctx = Secp256k1::new();
+		let per_commitment_point = vector_pubkey("02a0f5a09017c1dec2d30dd54a25dc4037fc5a2aa3832ee3c7b58f3a88a0836287");
+		let holder_pubkeys = ChannelPublicKeys {
+			funding_pubkey: vector_pubkey("03b7203dec7c13896b6ff1f58b24f84458c441720a12b5a57426397e22f0a8c78b"),
+			revocation_basepoint: RevocationBasepoint::from(vector_pubkey("02c354121ef71922b5cb32fa685c08ac0014b558f96e28f383c45eb28b7da264c3")),
+			payment_point: vector_pubkey("03955b6085296cbd2447a1dde0f7e273e19b83e83de1814993b1517aaf193b7f33"),
+			delayed_payment_basepoint: DelayedPaymentBasepoint::from(vector_pubkey("02ae68d8ff4c59864c03a42bbff6c07f9ae18047e0daa9bc40d07c410f9a0f7899")),
+			htlc_basepoint: HtlcBasepoint::from(vector_pubkey("033ce88bf3c8333e242996964ac91ee7cd945bfe4c49668ea10f3211f3d418fbc8")),
+		};
+		let counterparty_pubkeys = ChannelPublicKeys {
+			funding_pubkey: vector_pubkey("02956e6845a6f346f97c5e028c0f8ab38a76b0124fd7184deab60f682b3e657fdb"),
+			revocation_basepoint: RevocationBasepoint::from(vector_pubkey("02c354121ef71922b5cb32fa685c08ac0014b558f96e28f383c45eb28b7da264c3")),
+			payment_point: vector_pubkey("03595f2ef2a51d2250a21077dbea4a7fc3ce550f10676996bf63719e2a71d1f4c9"),
+			delayed_payment_basepoint: DelayedPaymentBasepoint::from(vector_pubkey("02ae68d8ff4c59864c03a42bbff6c07f9ae18047e0daa9bc40d07c410f9a0f7899")),
+			htlc_basepoint: HtlcBasepoint::from(vector_pubkey("02932dfbf6737001e3c516696ae3dcd323fd91a01ce7898f7f91ab98eebacc323e")),
+		};
+		let channel_parameters = ChannelTransactionParameters {
+			holder_pubkeys,
+			holder_selected_contest_delay: 144,
+			is_outbound_from_holder: false,
+			counterparty_parameters: Some(CounterpartyChannelTransactionParameters {
+				pubkeys: counterparty_pubkeys.clone(),
+				selected_contest_delay: 144,
+			}),
+			funding_outpoint: Some(chain::transaction::OutPoint { txid: Txid::all_zeros(), index: 0 }),
+			splice_parent_funding_txid: None,
+			channel_type_features: ChannelTypeFeatures::simple_taproot_staging(),
+			channel_value_satoshis: 10_000_000,
+		};
+
+		TestCommitmentTxBuilder {
+			commitment_number: 42,
+			per_commitment_point,
+			feerate_per_kw: 15_000,
+			channel_parameters,
+			counterparty_pubkeys,
+			secp_ctx,
+		}
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	fn assert_txout(out: &TxOut, value_sat: u64, script_hex: &str) {
+		assert_eq!(out.value.to_sat(), value_sat);
+		assert_eq!(out.script_pubkey.as_bytes(), &<Vec<u8>>::from_hex(script_hex).unwrap()[..]);
 	}
 
 	#[test]
@@ -2474,6 +2654,32 @@ mod tests {
 				   "0020e43a7c068553003fe68fcae424fb7b28ec5ce48cd8b6744b3945631389bad2fb");
 		assert_eq!(get_htlc_redeemscript(&offered_htlc, &ChannelTypeFeatures::anchors_zero_fee_commitments(), &keys).to_p2wsh().to_hex_string(),
 				   "0020215d61bba56b19e9eadb6107f5a85d7f99c40f65992443f69229c290165bc00d");
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	#[test]
+	#[rustfmt::skip]
+	fn test_simple_taproot_commitment_non_htlc_outputs_match_bolt_vector() {
+		let builder = simple_taproot_vector_builder();
+		let tx = builder.build(6_984_820, 3_000_000, Vec::new());
+		let keys = tx.trust().keys();
+		assert_eq!(
+			keys.broadcaster_delayed_payment_key.to_public_key().serialize(),
+			vector_pubkey("0315ec0138eb42f1ab4603042123988d53c854e89d1d87aa4dbb97a57482029c05").serialize()
+		);
+		assert_eq!(
+			keys.revocation_key.to_public_key().serialize(),
+			vector_pubkey("03d4c77088d346bce67c13bbbf82ca112588f4b1c9595a1f8af3be9b2f95a109a0").serialize()
+		);
+
+		let outputs = &tx.built.transaction.output;
+		assert_eq!(outputs.len(), 4);
+		assert_txout(&outputs[0], 330, "51201249c50576fdf914caa14f9221370b986df520bdbc73f57d5056a86ee03e5ac4");
+		assert_txout(&outputs[1], 330, "5120f67ab012701705f3203d132f909a6810ef18c5da4c11d986cb50818803b8344e");
+		assert_txout(&outputs[2], 3_000_000, "51203609bb705034e5629aa6ec05c5ca906ac89ac08b34c4583c259521ec30174408");
+		assert_txout(&outputs[3], 6_984_820, "51203e1fcbbd06c8a7414704612c72be9834a75d86ed85b29f0ef0c52e1950afaff3");
+		assert_eq!(tx.trust().revokeable_output_index(), Some(3));
+		assert!(builder.verify(&tx).is_ok());
 	}
 
 	#[test]

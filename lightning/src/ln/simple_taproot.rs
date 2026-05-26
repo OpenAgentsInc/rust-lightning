@@ -24,10 +24,14 @@ use bitcoin::hashes::sha256::Hash as Sha256;
 #[cfg(feature = "simple_taproot_musig2")]
 use bitcoin::hashes::{Hash, HashEngine};
 #[cfg(feature = "simple_taproot_musig2")]
-use bitcoin::script::ScriptBuf;
+use bitcoin::opcodes;
+#[cfg(feature = "simple_taproot_musig2")]
+use bitcoin::script::{Builder, ScriptBuf};
 use bitcoin::secp256k1::PublicKey;
 #[cfg(feature = "simple_taproot_musig2")]
 use bitcoin::secp256k1::{schnorr, Secp256k1, SecretKey, Verification, XOnlyPublicKey};
+#[cfg(feature = "simple_taproot_musig2")]
+use bitcoin::taproot::{LeafVersion, TaprootBuilder, TaprootSpendInfo};
 
 use crate::io::{self, Read};
 use crate::ln::msgs::DecodeError;
@@ -63,6 +67,13 @@ pub const MUSIG2_SECRET_NONCE_LEN: usize = 97;
 /// Byte length of `partial_signature || public_nonce`.
 pub const MUSIG2_PARTIAL_SIGNATURE_WITH_NONCE_LEN: usize =
 	MUSIG2_PARTIAL_SIGNATURE_LEN + MUSIG2_PUBLIC_NONCE_LEN;
+/// BOLT simple-taproot NUMS point used for script-only commitment outputs.
+#[cfg(feature = "simple_taproot_musig2")]
+pub const SIMPLE_TAPROOT_NUMS_POINT_BYTES: [u8; 33] = [
+	0x02, 0xdc, 0xa0, 0x94, 0x75, 0x11, 0x09, 0xd0, 0xbd, 0x05, 0x5d, 0x03, 0x56, 0x58, 0x74, 0xe8,
+	0x27, 0x6d, 0xd5, 0x3e, 0x92, 0x6b, 0x44, 0xe3, 0xbd, 0x1b, 0xb6, 0xbf, 0x4b, 0xc1, 0x30, 0xa2,
+	0x79,
+];
 
 /// Errors surfaced by the simple-taproot MuSig2 session helpers.
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
@@ -77,6 +88,46 @@ pub enum SimpleTaprootMusigError {
 	DuplicateNonceUse,
 	/// A signer set was empty where at least one key was required.
 	EmptySignerSet,
+}
+
+/// Spend data for one script leaf in a simple-taproot output.
+#[cfg(feature = "simple_taproot_musig2")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SimpleTaprootLeafSpendInfo {
+	/// The tapscript leaf.
+	pub script: ScriptBuf,
+	/// The control block needed to spend through this leaf.
+	pub control_block: Vec<u8>,
+}
+
+/// Spend data for a simple-taproot `to_local` output.
+#[cfg(feature = "simple_taproot_musig2")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SimpleTaprootToLocalSpendInfo {
+	/// The P2TR commitment output script.
+	pub script_pubkey: ScriptBuf,
+	/// The tapscript root committed to by the output key.
+	pub tapscript_root: [u8; 32],
+	/// The BIP341 tap tweak committed to by the output key.
+	pub tap_tweak: [u8; 32],
+	/// The routine delayed spend path.
+	pub delay: SimpleTaprootLeafSpendInfo,
+	/// The breach revocation spend path.
+	pub revocation: SimpleTaprootLeafSpendInfo,
+}
+
+/// Spend data for a single-leaf simple-taproot output.
+#[cfg(feature = "simple_taproot_musig2")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SimpleTaprootSingleLeafSpendInfo {
+	/// The P2TR commitment output script.
+	pub script_pubkey: ScriptBuf,
+	/// The tapscript root committed to by the output key.
+	pub tapscript_root: [u8; 32],
+	/// The BIP341 tap tweak committed to by the output key.
+	pub tap_tweak: [u8; 32],
+	/// The only script spend path for this output.
+	pub spend: SimpleTaprootLeafSpendInfo,
 }
 
 /// A BIP-327 MuSig2 public nonce encoded as two compressed secp256k1 points.
@@ -618,6 +669,151 @@ impl SimpleTaprootKeyAggContext {
 	}
 }
 
+#[cfg(feature = "simple_taproot_musig2")]
+fn simple_taproot_nums_xonly_key() -> Result<XOnlyPublicKey, SimpleTaprootMusigError> {
+	let nums_point = PublicKey::from_slice(&SIMPLE_TAPROOT_NUMS_POINT_BYTES)
+		.map_err(|_| SimpleTaprootMusigError::InvalidKey)?;
+	Ok(nums_point.x_only_public_key().0)
+}
+
+#[cfg(feature = "simple_taproot_musig2")]
+fn xonly_key(public_key: &PublicKey) -> XOnlyPublicKey {
+	public_key.x_only_public_key().0
+}
+
+#[cfg(feature = "simple_taproot_musig2")]
+fn leaf_spend_info(
+	spend_info: &TaprootSpendInfo, script: ScriptBuf,
+) -> Result<SimpleTaprootLeafSpendInfo, SimpleTaprootMusigError> {
+	let control_block = spend_info
+		.control_block(&(script.clone(), LeafVersion::TapScript))
+		.ok_or(SimpleTaprootMusigError::InvalidKey)?
+		.serialize();
+	Ok(SimpleTaprootLeafSpendInfo { script, control_block })
+}
+
+#[cfg(feature = "simple_taproot_musig2")]
+fn tapscript_root(spend_info: &TaprootSpendInfo) -> Result<[u8; 32], SimpleTaprootMusigError> {
+	Ok(spend_info.merkle_root().ok_or(SimpleTaprootMusigError::InvalidKey)?.to_byte_array())
+}
+
+#[cfg(feature = "simple_taproot_musig2")]
+fn p2tr_script_pubkey(spend_info: &TaprootSpendInfo) -> ScriptBuf {
+	ScriptBuf::new_p2tr_tweaked(spend_info.output_key())
+}
+
+/// Returns the BOLT simple-taproot `to_local` delay tapscript.
+#[cfg(feature = "simple_taproot_musig2")]
+pub fn simple_taproot_to_local_delay_script(
+	local_delayed_pubkey: &PublicKey, contest_delay: u16,
+) -> ScriptBuf {
+	Builder::new()
+		.push_x_only_key(&xonly_key(local_delayed_pubkey))
+		.push_opcode(opcodes::all::OP_CHECKSIGVERIFY)
+		.push_int(contest_delay as i64)
+		.push_opcode(opcodes::all::OP_CSV)
+		.into_script()
+}
+
+/// Returns the BOLT simple-taproot `to_local` revocation tapscript.
+#[cfg(feature = "simple_taproot_musig2")]
+pub fn simple_taproot_to_local_revocation_script(
+	local_delayed_pubkey: &PublicKey, revocation_pubkey: &PublicKey,
+) -> ScriptBuf {
+	Builder::new()
+		.push_x_only_key(&xonly_key(local_delayed_pubkey))
+		.push_opcode(opcodes::all::OP_DROP)
+		.push_x_only_key(&xonly_key(revocation_pubkey))
+		.push_opcode(opcodes::all::OP_CHECKSIG)
+		.into_script()
+}
+
+/// Returns all script-path spend data for a BOLT simple-taproot `to_local` output.
+#[cfg(feature = "simple_taproot_musig2")]
+pub fn simple_taproot_to_local_spend_info<C: Verification>(
+	secp_ctx: &Secp256k1<C>, local_delayed_pubkey: &PublicKey, revocation_pubkey: &PublicKey,
+	contest_delay: u16,
+) -> Result<SimpleTaprootToLocalSpendInfo, SimpleTaprootMusigError> {
+	let delay_script = simple_taproot_to_local_delay_script(local_delayed_pubkey, contest_delay);
+	let revocation_script =
+		simple_taproot_to_local_revocation_script(local_delayed_pubkey, revocation_pubkey);
+	let spend_info = TaprootBuilder::new()
+		.add_leaf(1, revocation_script.clone())
+		.map_err(|_| SimpleTaprootMusigError::InvalidKey)?
+		.add_leaf(1, delay_script.clone())
+		.map_err(|_| SimpleTaprootMusigError::InvalidKey)?
+		.finalize(secp_ctx, simple_taproot_nums_xonly_key()?)
+		.map_err(|_| SimpleTaprootMusigError::InvalidKey)?;
+	let script_pubkey = p2tr_script_pubkey(&spend_info);
+	let tapscript_root = tapscript_root(&spend_info)?;
+	let tap_tweak = spend_info.tap_tweak().to_byte_array();
+	let delay = leaf_spend_info(&spend_info, delay_script)?;
+	let revocation = leaf_spend_info(&spend_info, revocation_script)?;
+	Ok(SimpleTaprootToLocalSpendInfo {
+		script_pubkey,
+		tapscript_root,
+		tap_tweak,
+		delay,
+		revocation,
+	})
+}
+
+/// Returns the BOLT simple-taproot `to_remote` settlement tapscript.
+#[cfg(feature = "simple_taproot_musig2")]
+pub fn simple_taproot_to_remote_script(remote_pubkey: &PublicKey) -> ScriptBuf {
+	Builder::new()
+		.push_x_only_key(&xonly_key(remote_pubkey))
+		.push_opcode(opcodes::all::OP_CHECKSIGVERIFY)
+		.push_opcode(opcodes::all::OP_PUSHNUM_1)
+		.push_opcode(opcodes::all::OP_CSV)
+		.into_script()
+}
+
+/// Returns all script-path spend data for a BOLT simple-taproot `to_remote` output.
+#[cfg(feature = "simple_taproot_musig2")]
+pub fn simple_taproot_to_remote_spend_info<C: Verification>(
+	secp_ctx: &Secp256k1<C>, remote_pubkey: &PublicKey,
+) -> Result<SimpleTaprootSingleLeafSpendInfo, SimpleTaprootMusigError> {
+	let script = simple_taproot_to_remote_script(remote_pubkey);
+	let spend_info = TaprootBuilder::new()
+		.add_leaf(0, script.clone())
+		.map_err(|_| SimpleTaprootMusigError::InvalidKey)?
+		.finalize(secp_ctx, simple_taproot_nums_xonly_key()?)
+		.map_err(|_| SimpleTaprootMusigError::InvalidKey)?;
+	let script_pubkey = p2tr_script_pubkey(&spend_info);
+	let tapscript_root = tapscript_root(&spend_info)?;
+	let tap_tweak = spend_info.tap_tweak().to_byte_array();
+	let spend = leaf_spend_info(&spend_info, script)?;
+	Ok(SimpleTaprootSingleLeafSpendInfo { script_pubkey, tapscript_root, tap_tweak, spend })
+}
+
+/// Returns the BOLT simple-taproot anchor sweep tapscript.
+#[cfg(feature = "simple_taproot_musig2")]
+pub fn simple_taproot_anchor_script() -> ScriptBuf {
+	Builder::new()
+		.push_opcode(opcodes::all::OP_PUSHNUM_16)
+		.push_opcode(opcodes::all::OP_CSV)
+		.into_script()
+}
+
+/// Returns all script-path spend data for a BOLT simple-taproot anchor output.
+#[cfg(feature = "simple_taproot_musig2")]
+pub fn simple_taproot_anchor_spend_info<C: Verification>(
+	secp_ctx: &Secp256k1<C>, anchor_internal_key: &PublicKey,
+) -> Result<SimpleTaprootSingleLeafSpendInfo, SimpleTaprootMusigError> {
+	let script = simple_taproot_anchor_script();
+	let spend_info = TaprootBuilder::new()
+		.add_leaf(0, script.clone())
+		.map_err(|_| SimpleTaprootMusigError::InvalidKey)?
+		.finalize(secp_ctx, xonly_key(anchor_internal_key))
+		.map_err(|_| SimpleTaprootMusigError::InvalidKey)?;
+	let script_pubkey = p2tr_script_pubkey(&spend_info);
+	let tapscript_root = tapscript_root(&spend_info)?;
+	let tap_tweak = spend_info.tap_tweak().to_byte_array();
+	let spend = leaf_spend_info(&spend_info, script)?;
+	Ok(SimpleTaprootSingleLeafSpendInfo { script_pubkey, tapscript_root, tap_tweak, spend })
+}
+
 /// Derives a deterministic simple-taproot counter nonce seed from LDK's shachain seed.
 #[cfg(feature = "simple_taproot_musig2")]
 pub fn derive_simple_taproot_counter_nonce_seed(
@@ -972,6 +1168,98 @@ mod tests {
 				"5120d0ebb4909d563a7ae1213fddede4ae54132fba0ef0b97ee3f8469191fecd348e",
 			)
 			.unwrap()[..]
+		);
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	fn pubkey_from_hex(hex: &str) -> PublicKey {
+		PublicKey::from_slice(&Vec::<u8>::from_hex(hex).unwrap()).unwrap()
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	fn assert_script_hex(script: &ScriptBuf, expected_hex: &str) {
+		assert_eq!(script.as_bytes(), &Vec::<u8>::from_hex(expected_hex).unwrap()[..]);
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	fn hash_from_hex(hex: &str) -> [u8; 32] {
+		Vec::<u8>::from_hex(hex).unwrap().try_into().unwrap()
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	#[test]
+	fn commitment_output_scripts_match_bolt_vectors() {
+		let secp_ctx = Secp256k1::new();
+		let local_delayed_pubkey =
+			pubkey_from_hex("0315ec0138eb42f1ab4603042123988d53c854e89d1d87aa4dbb97a57482029c05");
+		let revocation_pubkey =
+			pubkey_from_hex("03d4c77088d346bce67c13bbbf82ca112588f4b1c9595a1f8af3be9b2f95a109a0");
+		let remote_payment_pubkey =
+			pubkey_from_hex("03595f2ef2a51d2250a21077dbea4a7fc3ce550f10676996bf63719e2a71d1f4c9");
+
+		let to_local = simple_taproot_to_local_spend_info(
+			&secp_ctx,
+			&local_delayed_pubkey,
+			&revocation_pubkey,
+			144,
+		)
+		.unwrap();
+		assert_script_hex(
+			&to_local.revocation.script,
+			"2015ec0138eb42f1ab4603042123988d53c854e89d1d87aa4dbb97a57482029c057520d4c77088d346bce67c13bbbf82ca112588f4b1c9595a1f8af3be9b2f95a109a0ac",
+		);
+		assert_script_hex(
+			&to_local.delay.script,
+			"2015ec0138eb42f1ab4603042123988d53c854e89d1d87aa4dbb97a57482029c05ad029000b2",
+		);
+		assert_eq!(
+			to_local.tapscript_root,
+			hash_from_hex("b8b76c2e893ca785072f0d7393e35d5bd72adf8b7ff2a53538aa664378a38a36")
+		);
+		assert_script_hex(
+			&to_local.script_pubkey,
+			"51203e1fcbbd06c8a7414704612c72be9834a75d86ed85b29f0ef0c52e1950afaff3",
+		);
+		assert_eq!(to_local.delay.control_block.len(), 65);
+		assert_eq!(to_local.revocation.control_block.len(), 65);
+		assert_ne!(to_local.tap_tweak, [0; 32]);
+
+		let to_remote =
+			simple_taproot_to_remote_spend_info(&secp_ctx, &remote_payment_pubkey).unwrap();
+		assert_script_hex(
+			&to_remote.spend.script,
+			"20595f2ef2a51d2250a21077dbea4a7fc3ce550f10676996bf63719e2a71d1f4c9ad51b2",
+		);
+		assert_eq!(
+			to_remote.tapscript_root,
+			hash_from_hex("63ce35b16eb8f8687293d5a88c1d8ada3236843b79ca315fe9dd7c47f30f2bc9")
+		);
+		assert_script_hex(
+			&to_remote.script_pubkey,
+			"51203609bb705034e5629aa6ec05c5ca906ac89ac08b34c4583c259521ec30174408",
+		);
+		assert_eq!(to_remote.spend.control_block.len(), 33);
+		assert_ne!(to_remote.tap_tweak, [0; 32]);
+
+		let local_anchor =
+			simple_taproot_anchor_spend_info(&secp_ctx, &local_delayed_pubkey).unwrap();
+		assert_script_hex(&local_anchor.spend.script, "60b2");
+		assert_eq!(
+			local_anchor.tapscript_root,
+			hash_from_hex("2b88a8f3f52386d61d5b3f2d822df659c35214d7360ed05352ad7ddc1ab03912")
+		);
+		assert_script_hex(
+			&local_anchor.script_pubkey,
+			"5120f67ab012701705f3203d132f909a6810ef18c5da4c11d986cb50818803b8344e",
+		);
+		assert_eq!(local_anchor.spend.control_block.len(), 33);
+		assert_ne!(local_anchor.tap_tweak, [0; 32]);
+
+		let remote_anchor =
+			simple_taproot_anchor_spend_info(&secp_ctx, &remote_payment_pubkey).unwrap();
+		assert_script_hex(
+			&remote_anchor.script_pubkey,
+			"51201249c50576fdf914caa14f9221370b986df520bdbc73f57d5056a86ee03e5ac4",
 		);
 	}
 
