@@ -103,11 +103,13 @@ fn connect_peers<'a, 'b, 'c>(node_a: &Node<'a, 'b, 'c>, node_b: &Node<'a, 'b, 'c
 		features: node_a.init_features(node_id_b),
 		networks: None,
 		remote_network_address: None,
+				custom_tlvs: Vec::new(),
 	};
 	let init_b = Init {
 		features: node_b.init_features(node_id_a),
 		networks: None,
 		remote_network_address: None,
+				custom_tlvs: Vec::new(),
 	};
 
 	node_a.node.peer_connected(node_id_b, &init_b, true).unwrap();

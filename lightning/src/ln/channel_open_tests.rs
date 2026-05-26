@@ -108,6 +108,7 @@ fn test_0conf_limiting() {
 		features: nodes[0].node.init_features(),
 		networks: None,
 		remote_network_address: None,
+		custom_tlvs: Vec::new(),
 	};
 
 	// First, get us up to MAX_UNFUNDED_CHANNEL_PEERS so we can test at the edge
@@ -577,6 +578,7 @@ fn test_channel_resumption_fail_post_funding() {
 		features: nodes[1].node.init_features(),
 		networks: None,
 		remote_network_address: None,
+		custom_tlvs: Vec::new(),
 	};
 	nodes[0].node.peer_connected(node_b_id, &init_msg, true).unwrap();
 	assert_eq!(nodes[0].node.get_and_clear_pending_msg_events(), Vec::new());
@@ -2087,6 +2089,7 @@ pub fn test_rebroadcast_open_channel_when_reconnect_mid_handshake() {
 		features: nodes[0].node.init_features(),
 		networks: None,
 		remote_network_address: None,
+		custom_tlvs: Vec::new(),
 	};
 	nodes[0].node.peer_connected(node_b_id, &init_msg, true).unwrap();
 	nodes[1].node.peer_connected(node_a_id, &init_msg, false).unwrap();

@@ -1705,6 +1705,7 @@ pub fn test_update_add_htlc_bolt2_receiver_check_repeated_id_ignore() {
 		features: nodes[0].node.init_features(),
 		networks: None,
 		remote_network_address: None,
+		custom_tlvs: Vec::new(),
 	};
 	nodes[0].node.peer_connected(node_b_id, &init_msg, true).unwrap();
 	let reestablish_1 = get_chan_reestablish_msgs!(nodes[0], nodes[1]);

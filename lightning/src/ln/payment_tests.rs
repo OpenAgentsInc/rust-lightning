@@ -922,6 +922,7 @@ fn do_retry_with_no_persist(confirm_before_reload: bool) {
 		features: nodes[1].node.init_features(),
 		networks: None,
 		remote_network_address: None,
+		custom_tlvs: Vec::new(),
 	};
 	nodes[0].node.peer_connected(node_b_id, &init_msg, true).unwrap();
 	assert!(nodes[0].node.get_and_clear_pending_msg_events().is_empty());
@@ -1132,6 +1133,7 @@ fn do_test_completed_payment_not_retryable_on_reload(use_dust: bool) {
 		features: nodes[1].node.init_features(),
 		networks: None,
 		remote_network_address: None,
+		custom_tlvs: Vec::new(),
 	};
 	nodes[0].node.peer_connected(node_b_id, &init_msg, true).unwrap();
 	assert!(nodes[0].node.get_and_clear_pending_msg_events().is_empty());

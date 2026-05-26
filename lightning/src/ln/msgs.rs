@@ -126,6 +126,8 @@ pub struct Init {
 	/// public IPv4 address (NAT) and use that for a [`NodeAnnouncement`] update message containing
 	/// the new address.
 	pub remote_network_address: Option<SocketAddress>,
+	/// Custom TLV records included in the init message.
+	pub custom_tlvs: Vec<(u64, Vec<u8>)>,
 }
 
 /// An [`error`] message to be sent to or received from a peer.
@@ -3323,10 +3325,12 @@ impl Writeable for Init {
 		// our relevant feature bits. This keeps us compatible with old nodes.
 		write_features_up_to_13(w, self.features.le_flags())?;
 		self.features.write(w)?;
-		encode_tlv_stream!(w, {
+		let mut custom_tlvs: Vec<&(u64, Vec<u8>)> = self.custom_tlvs.iter().collect();
+		custom_tlvs.sort_unstable_by_key(|(typ, _)| *typ);
+		_encode_tlv_stream!(w, {
 			(1, self.networks.as_ref().map(|n| WithoutLength(n)), option),
 			(3, self.remote_network_address, option),
-		});
+		}, custom_tlvs.iter());
 		Ok(())
 	}
 }
@@ -3337,14 +3341,24 @@ impl LengthReadable for Init {
 		let features: InitFeatures = Readable::read(r)?;
 		let mut remote_network_address: Option<SocketAddress> = None;
 		let mut networks: Option<WithoutLength<Vec<ChainHash>>> = None;
-		decode_tlv_stream!(r, {
+		let mut custom_tlvs = Vec::new();
+		decode_tlv_stream_with_custom_tlv_decode!(r, {
 			(1, networks, option),
 			(3, remote_network_address, option)
+		}, |msg_type: u64, msg_reader: &mut FixedLengthReader<_>| -> Result<bool, DecodeError> {
+			if msg_type < 1 << 16 {
+				return Ok(false);
+			}
+			let mut value = Vec::new();
+			msg_reader.read_to_limit(&mut value, u64::MAX)?;
+			custom_tlvs.push((msg_type, value));
+			Ok(true)
 		});
 		Ok(Init {
 			features: features | global_features,
 			networks: networks.map(|n| n.0),
 			remote_network_address,
+			custom_tlvs,
 		})
 	}
 }
@@ -6774,12 +6788,14 @@ mod tests {
 			features: InitFeatures::from_le_bytes(vec![0xFF, 0xFF, 0xFF]),
 			networks: Some(vec![mainnet_hash]),
 			remote_network_address: None,
+			custom_tlvs: Vec::new(),
 		}.encode(), <Vec<u8>>::from_hex("00023fff0003ffffff01206fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000").unwrap());
 		assert_eq!(
 			msgs::Init {
 				features: InitFeatures::from_le_bytes(vec![0xFF]),
 				networks: None,
 				remote_network_address: None,
+				custom_tlvs: Vec::new(),
 			}
 			.encode(),
 			<Vec<u8>>::from_hex("0001ff0001ff").unwrap()
@@ -6789,6 +6805,7 @@ mod tests {
 				features: InitFeatures::from_le_bytes(vec![]),
 				networks: Some(vec![mainnet_hash]),
 				remote_network_address: None,
+				custom_tlvs: Vec::new(),
 			}
 			.encode(),
 			<Vec<u8>>::from_hex(
@@ -6800,6 +6817,7 @@ mod tests {
 			features: InitFeatures::from_le_bytes(vec![]),
 			networks: Some(vec![ChainHash::from(&[1; 32]), ChainHash::from(&[2; 32])]),
 			remote_network_address: None,
+			custom_tlvs: Vec::new(),
 		}.encode(), <Vec<u8>>::from_hex("00000000014001010101010101010101010101010101010101010101010101010101010101010202020202020202020202020202020202020202020202020202020202020202").unwrap());
 		let init_msg = msgs::Init {
 			features: InitFeatures::from_le_bytes(vec![]),
@@ -6808,6 +6826,7 @@ mod tests {
 				addr: [127, 0, 0, 1],
 				port: 1000,
 			}),
+			custom_tlvs: Vec::new(),
 		};
 		let encoded_value = init_msg.encode();
 		let target_value = <Vec<u8>>::from_hex("0000000001206fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d61900000000000307017f00000103e8").unwrap();
@@ -6815,6 +6834,18 @@ mod tests {
 		assert_eq!(
 			msgs::Init::read_from_fixed_length_buffer(&mut &target_value[..]).unwrap(),
 			init_msg
+		);
+		let custom_init_msg = msgs::Init {
+			features: InitFeatures::from_le_bytes(vec![]),
+			networks: None,
+			remote_network_address: None,
+			custom_tlvs: vec![(65_545, vec![0, 1, 10])],
+		};
+		let custom_encoded = custom_init_msg.encode();
+		assert_eq!(custom_encoded, <Vec<u8>>::from_hex("00000000fe000100090300010a").unwrap());
+		assert_eq!(
+			msgs::Init::read_from_fixed_length_buffer(&mut &custom_encoded[..]).unwrap(),
+			custom_init_msg
 		);
 	}
 

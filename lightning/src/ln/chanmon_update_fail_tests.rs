@@ -414,6 +414,7 @@ fn do_test_monitor_temporary_update_fail(disconnect_count: usize) {
 				features: nodes[1].node.init_features(),
 				networks: None,
 				remote_network_address: None,
+				custom_tlvs: Vec::new(),
 			};
 
 			nodes[0].node.peer_connected(node_b_id, &init_msg, true).unwrap();
@@ -443,6 +444,7 @@ fn do_test_monitor_temporary_update_fail(disconnect_count: usize) {
 			features: nodes[1].node.init_features(),
 			networks: None,
 			remote_network_address: None,
+			custom_tlvs: Vec::new(),
 		};
 		nodes[0].node.peer_connected(node_b_id, &init_msg, true).unwrap();
 		let reestablish_1 = get_chan_reestablish_msgs!(nodes[0], nodes[1]);
@@ -1311,6 +1313,7 @@ fn test_monitor_update_fail_reestablish() {
 		features: nodes[1].node.init_features(),
 		networks: None,
 		remote_network_address: None,
+		custom_tlvs: Vec::new(),
 	};
 	nodes[0].node.peer_connected(node_b_id, &init_msg, true).unwrap();
 	nodes[1].node.peer_connected(node_a_id, &init_msg, false).unwrap();
@@ -1526,6 +1529,7 @@ fn claim_while_disconnected_monitor_update_fail() {
 		features: nodes[1].node.init_features(),
 		networks: None,
 		remote_network_address: None,
+		custom_tlvs: Vec::new(),
 	};
 	nodes[0].node.peer_connected(node_b_id, &init_msg, true).unwrap();
 	nodes[1].node.peer_connected(node_a_id, &init_msg, false).unwrap();
@@ -1681,6 +1685,7 @@ fn monitor_failed_no_reestablish_response() {
 		features: nodes[1].node.init_features(),
 		networks: None,
 		remote_network_address: None,
+		custom_tlvs: Vec::new(),
 	};
 	nodes[0].node.peer_connected(node_b_id, &init_msg, true).unwrap();
 	nodes[1].node.peer_connected(node_a_id, &init_msg, false).unwrap();
@@ -2410,6 +2415,7 @@ fn test_pending_update_fee_ack_on_reconnect() {
 		features: nodes[1].node.init_features(),
 		networks: None,
 		remote_network_address: None,
+		custom_tlvs: Vec::new(),
 	};
 	nodes[0].node.peer_connected(node_b_id, &init_msg, true).unwrap();
 	let as_connect_msg = get_chan_reestablish_msgs!(nodes[0], nodes[1]).pop().unwrap();
@@ -2573,6 +2579,7 @@ fn do_update_fee_resend_test(deliver_update: bool, parallel_updates: bool) {
 		features: nodes[1].node.init_features(),
 		networks: None,
 		remote_network_address: None,
+		custom_tlvs: Vec::new(),
 	};
 	nodes[0].node.peer_connected(node_b_id, &init_msg, true).unwrap();
 	let as_connect_msg = get_chan_reestablish_msgs!(nodes[0], nodes[1]).pop().unwrap();
@@ -2741,6 +2748,7 @@ fn do_channel_holding_cell_serialize(disconnect: bool, reload_a: bool) {
 			features: nodes[1].node.init_features(),
 			networks: None,
 			remote_network_address: None,
+			custom_tlvs: Vec::new(),
 		};
 		nodes[0].node.peer_connected(node_b_id, &init_msg, true).unwrap();
 		let reestablish_1 = get_chan_reestablish_msgs!(nodes[0], nodes[1]);

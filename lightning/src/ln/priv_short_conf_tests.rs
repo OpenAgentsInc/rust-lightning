@@ -134,6 +134,7 @@ fn test_priv_forwarding_rejection() {
 		features: nodes[1].node.init_features(),
 		networks: None,
 		remote_network_address: None,
+		custom_tlvs: Vec::new(),
 	};
 	nodes[0].node.peer_connected(node_b_id, &bs_init_msg, true).unwrap();
 
@@ -141,6 +142,7 @@ fn test_priv_forwarding_rejection() {
 		features: nodes[0].node.init_features(),
 		networks: None,
 		remote_network_address: None,
+		custom_tlvs: Vec::new(),
 	};
 	nodes[1].node.peer_connected(node_a_id, &as_init_msg, false).unwrap();
 	let as_reestablish = get_chan_reestablish_msgs!(nodes[0], nodes[1]).pop().unwrap();
@@ -154,6 +156,7 @@ fn test_priv_forwarding_rejection() {
 		features: nodes[2].node.init_features(),
 		networks: None,
 		remote_network_address: None,
+		custom_tlvs: Vec::new(),
 	};
 	nodes[1].node.peer_connected(node_c_id, &cs_init_msg, true).unwrap();
 	nodes[2].node.peer_connected(node_b_id, &bs_init_msg, false).unwrap();

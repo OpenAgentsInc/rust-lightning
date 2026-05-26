@@ -119,8 +119,7 @@ fn test_experimental_simple_taproot_staging_channel_initial() {
 #[cfg(feature = "simple_taproot_musig2")]
 #[test]
 fn test_experimental_taproot_asset_channel_initial() {
-	let mut expected_type = ChannelTypeFeatures::simple_taproot_staging();
-	expected_type.set_taproot_asset_channel_required();
+	let expected_type = ChannelTypeFeatures::taproot_asset_single_asset();
 
 	do_test_get_initial_channel_type(
 		UserConfig::default(),

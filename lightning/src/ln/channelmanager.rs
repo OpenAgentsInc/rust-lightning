@@ -21669,10 +21669,10 @@ mod tests {
 
 		// Now we reconnect to a peer
 		nodes[0].node.peer_connected(nodes[2].node.get_our_node_id(), &msgs::Init {
-			features: nodes[2].node.init_features(), networks: None, remote_network_address: None
+			features: nodes[2].node.init_features(), networks: None, remote_network_address: None, custom_tlvs: Vec::new(),
 		}, true).unwrap();
 		nodes[2].node.peer_connected(nodes[0].node.get_our_node_id(), &msgs::Init {
-			features: nodes[0].node.init_features(), networks: None, remote_network_address: None
+			features: nodes[0].node.init_features(), networks: None, remote_network_address: None, custom_tlvs: Vec::new(),
 		}, false).unwrap();
 
 		// Confirm that get_and_clear_pending_msg_events correctly captures pending broadcast messages
@@ -21937,13 +21937,13 @@ mod tests {
 				&SecretKey::from_slice(&nodes[1].keys_manager.get_secure_random_bytes()).unwrap());
 			peer_pks.push(random_pk);
 			nodes[1].node.peer_connected(random_pk, &msgs::Init {
-				features: nodes[0].node.init_features(), networks: None, remote_network_address: None
+				features: nodes[0].node.init_features(), networks: None, remote_network_address: None, custom_tlvs: Vec::new(),
 			}, true).unwrap();
 		}
 		let last_random_pk = PublicKey::from_secret_key(&nodes[0].node.secp_ctx,
 			&SecretKey::from_slice(&nodes[1].keys_manager.get_secure_random_bytes()).unwrap());
 		nodes[1].node.peer_connected(last_random_pk, &msgs::Init {
-			features: nodes[0].node.init_features(), networks: None, remote_network_address: None
+			features: nodes[0].node.init_features(), networks: None, remote_network_address: None, custom_tlvs: Vec::new(),
 		}, true).unwrap_err();
 
 		// Also importantly, because nodes[0] isn't "protected", we will refuse a reconnection from
@@ -21955,15 +21955,15 @@ mod tests {
 			if let Event::ChannelClosed { .. } = ev { } else { panic!(); }
 		}
 		nodes[1].node.peer_connected(last_random_pk, &msgs::Init {
-			features: nodes[0].node.init_features(), networks: None, remote_network_address: None
+			features: nodes[0].node.init_features(), networks: None, remote_network_address: None, custom_tlvs: Vec::new(),
 		}, true).unwrap();
 		nodes[1].node.peer_connected(nodes[0].node.get_our_node_id(), &msgs::Init {
-			features: nodes[0].node.init_features(), networks: None, remote_network_address: None
+			features: nodes[0].node.init_features(), networks: None, remote_network_address: None, custom_tlvs: Vec::new(),
 		}, true).unwrap_err();
 
 		// but of course if the connection is outbound its allowed...
 		nodes[1].node.peer_connected(nodes[0].node.get_our_node_id(), &msgs::Init {
-			features: nodes[0].node.init_features(), networks: None, remote_network_address: None
+			features: nodes[0].node.init_features(), networks: None, remote_network_address: None, custom_tlvs: Vec::new(),
 		}, false).unwrap();
 		nodes[1].node.peer_disconnected(nodes[0].node.get_our_node_id());
 
@@ -21999,7 +21999,7 @@ mod tests {
 		// "protected" and can connect again.
 		mine_transaction(&nodes[1], funding_tx.as_ref().unwrap());
 		nodes[1].node.peer_connected(nodes[0].node.get_our_node_id(), &msgs::Init {
-			features: nodes[0].node.init_features(), networks: None, remote_network_address: None
+			features: nodes[0].node.init_features(), networks: None, remote_network_address: None, custom_tlvs: Vec::new(),
 		}, true).unwrap();
 		get_event_msg!(nodes[1], MessageSendEvent::SendChannelReestablish, nodes[0].node.get_our_node_id());
 
@@ -22215,10 +22215,10 @@ mod tests {
 		// such that Bob sends a `ChannelReestablish` to Alice since the channel is still open from
 		// their side.
 		nodes[0].node.peer_connected(nodes[1].node.get_our_node_id(), &msgs::Init {
-			features: nodes[1].node.init_features(), networks: None, remote_network_address: None
+			features: nodes[1].node.init_features(), networks: None, remote_network_address: None, custom_tlvs: Vec::new(),
 		}, true).unwrap();
 		nodes[1].node.peer_connected(nodes[0].node.get_our_node_id(), &msgs::Init {
-			features: nodes[0].node.init_features(), networks: None, remote_network_address: None
+			features: nodes[0].node.init_features(), networks: None, remote_network_address: None, custom_tlvs: Vec::new(),
 		}, false).unwrap();
 		assert!(nodes[0].node.get_and_clear_pending_msg_events().is_empty());
 		let channel_reestablish = get_event_msg!(
@@ -22359,10 +22359,10 @@ pub mod bench {
 		let node_b_holder = ANodeHolder { node: &node_b };
 
 		node_a.peer_connected(node_b.get_our_node_id(), &Init {
-			features: node_b.init_features(), networks: None, remote_network_address: None
+			features: node_b.init_features(), networks: None, remote_network_address: None, custom_tlvs: Vec::new(),
 		}, true).unwrap();
 		node_b.peer_connected(node_a.get_our_node_id(), &Init {
-			features: node_a.init_features(), networks: None, remote_network_address: None
+			features: node_a.init_features(), networks: None, remote_network_address: None, custom_tlvs: Vec::new(),
 		}, false).unwrap();
 		node_a.create_channel(node_b.get_our_node_id(), 8_000_000, 100_000_000, 42, None, None).unwrap();
 		node_b.handle_open_channel(node_a.get_our_node_id(), &get_event_msg!(node_a_holder, MessageSendEvent::SendOpenChannel, node_b.get_our_node_id()));

@@ -453,11 +453,13 @@ fn do_test_unconf_chan(
 			features: nodes[1].node.init_features(),
 			networks: None,
 			remote_network_address: None,
+			custom_tlvs: Vec::new(),
 		};
 		let node_0_init = Init {
 			features: nodes[0].node.init_features(),
 			networks: None,
 			remote_network_address: None,
+			custom_tlvs: Vec::new(),
 		};
 		nodes[0].node.peer_connected(node_id_1, &node_1_init, true).unwrap();
 		nodes[1].node.peer_connected(node_id_0, &node_0_init, true).unwrap();

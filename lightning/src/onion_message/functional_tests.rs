@@ -354,7 +354,12 @@ fn create_nodes_using_cfgs(cfgs: Vec<MessengerCfg>) -> Vec<MessengerNode> {
 fn connect_peers(node_a: &MessengerNode, node_b: &MessengerNode) {
 	let mut features = InitFeatures::empty();
 	features.set_onion_messages_optional();
-	let init_msg = msgs::Init { features, networks: None, remote_network_address: None };
+	let init_msg = msgs::Init {
+		features,
+		networks: None,
+		remote_network_address: None,
+		custom_tlvs: Vec::new(),
+	};
 	node_a.messenger.peer_connected(node_b.node_id, &init_msg.clone(), true).unwrap();
 	node_b.messenger.peer_connected(node_a.node_id, &init_msg.clone(), false).unwrap();
 }

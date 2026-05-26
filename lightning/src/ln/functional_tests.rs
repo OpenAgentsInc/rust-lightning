@@ -3189,6 +3189,7 @@ pub fn test_drop_messages_peer_disconnect_dual_htlc() {
 		features: nodes[1].node.init_features(),
 		networks: None,
 		remote_network_address: None,
+		custom_tlvs: Vec::new(),
 	};
 
 	nodes[0].node.peer_connected(node_b_id, &init_msg, true).unwrap();
@@ -6176,6 +6177,7 @@ pub fn test_announce_disable_channels() {
 		features: nodes[1].node.init_features(),
 		networks: None,
 		remote_network_address: None,
+		custom_tlvs: Vec::new(),
 	};
 	nodes[0].node.peer_connected(node_b_id, &init_msg, true).unwrap();
 	let reestablish_1 = get_chan_reestablish_msgs!(nodes[0], nodes[1]);
@@ -9638,12 +9640,14 @@ pub fn test_disconnects_peer_awaiting_response_ticks() {
 		features: nodes[1].node.init_features(),
 		networks: None,
 		remote_network_address: None,
+		custom_tlvs: Vec::new(),
 	};
 	nodes[0].node.peer_connected(node_b_id, &bob_init, true).unwrap();
 	let alice_init = msgs::Init {
 		features: nodes[0].node.init_features(),
 		networks: None,
 		remote_network_address: None,
+		custom_tlvs: Vec::new(),
 	};
 	nodes[1].node.peer_connected(node_a_id, &alice_init, true).unwrap();
 

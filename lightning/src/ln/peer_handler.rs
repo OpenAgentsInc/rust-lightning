@@ -123,6 +123,16 @@ pub trait CustomMessageHandler: wire::CustomMessageReader {
 	///
 	/// [`Init`]: crate::ln::msgs::Init
 	fn provided_init_features(&self, their_node_id: PublicKey) -> InitFeatures;
+
+	/// Gets custom TLV records which should be sent to the given peer in our [`Init`] message.
+	///
+	/// The records must be sorted by type if more than one is returned. Unknown non-custom
+	/// even TLVs remain protocol errors during decoding.
+	///
+	/// [`Init`]: crate::ln::msgs::Init
+	fn provided_init_tlvs(&self, _their_node_id: PublicKey) -> Vec<(u64, Vec<u8>)> {
+		Vec::new()
+	}
 }
 
 impl<T: CustomMessageHandler + ?Sized, C: Deref<Target = T>> CustomMessageHandler for C {
@@ -147,6 +157,9 @@ impl<T: CustomMessageHandler + ?Sized, C: Deref<Target = T>> CustomMessageHandle
 	}
 	fn provided_init_features(&self, their_node_id: PublicKey) -> InitFeatures {
 		self.deref().provided_init_features(their_node_id)
+	}
+	fn provided_init_tlvs(&self, their_node_id: PublicKey) -> Vec<(u64, Vec<u8>)> {
+		self.deref().provided_init_tlvs(their_node_id)
 	}
 }
 
@@ -1389,6 +1402,10 @@ impl<
 			| self.message_handler.send_only_message_handler.provided_init_features(their_node_id)
 	}
 
+	fn init_custom_tlvs(&self, their_node_id: PublicKey) -> Vec<(u64, Vec<u8>)> {
+		self.message_handler.custom_message_handler.provided_init_tlvs(their_node_id)
+	}
+
 	/// Indicates a new outbound connection has been established to a node with the given `node_id`
 	/// and an optional remote network address.
 	///
@@ -1862,6 +1879,7 @@ impl<
 							peer.set_their_node_id(their_node_id);
 							insert_node_id!();
 							let features = self.init_features(their_node_id);
+							let custom_tlvs = self.init_custom_tlvs(their_node_id);
 							let networks = self.message_handler.chan_handler.get_chain_hashes();
 							let resp = msgs::Init {
 								features,
@@ -1869,6 +1887,7 @@ impl<
 								remote_network_address: filter_addresses(
 									peer.their_socket_address.clone(),
 								),
+								custom_tlvs,
 							};
 							let msg = Message::Init(resp);
 							self.enqueue_message(peer, msg);
@@ -1883,6 +1902,7 @@ impl<
 							peer.set_their_node_id(their_node_id);
 							insert_node_id!();
 							let features = self.init_features(their_node_id);
+							let custom_tlvs = self.init_custom_tlvs(their_node_id);
 							let networks = self.message_handler.chan_handler.get_chain_hashes();
 							let resp = msgs::Init {
 								features,
@@ -1890,6 +1910,7 @@ impl<
 								remote_network_address: filter_addresses(
 									peer.their_socket_address.clone(),
 								),
+								custom_tlvs,
 							};
 							let msg = Message::Init(resp);
 							self.enqueue_message(peer, msg);

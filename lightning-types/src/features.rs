@@ -83,8 +83,8 @@
 //!   (see [BOLT PR #1160](https://github.com/lightning/bolts/pull/1160) for more information).
 //! - `HtlcHold` - requires/supports holding HTLCs and forwarding on receipt of an onion message
 //!   (see [BOLT-2](https://github.com/lightning/bolts/pull/989/files) for more information).
-//! - `TaprootAssetChannel` - OpenAgentsInc experimental support for single-asset Taproot
-//!   Asset channels while BLIP-TAP remains draft.
+//! - `TaprootAssetChannel` - OpenAgentsInc experimental support for Lightning Labs
+//!   `taproot-overlay-chans` while BLIP-TAP remains draft.
 //!
 //! LDK knows about the following features, but does not support them:
 //! - `AnchorsNonzeroFeeHtlcTx` - the initial version of anchor outputs, which was later found to be
@@ -176,7 +176,7 @@ mod sealed {
 			// Byte 11 - 17
 			,,,,,,,
 			// Byte 18
-			TaprootAssetChannel,
+			,
 			// Byte 19
 			HtlcHold,
 			// Byte 20 - 21
@@ -211,7 +211,7 @@ mod sealed {
 			// Byte 11 - 17
 			,,,,,,,
 			// Byte 18
-			TaprootAssetChannel,
+			,
 			// Byte 19
 			HtlcHold,
 			// Byte 20 - 21
@@ -288,7 +288,7 @@ mod sealed {
 		// Byte 11 - 17
 		,,,,,,,
 		// Byte 18
-		TaprootAssetChannel,
+		,
 		// Byte 19 - 21
 		,,,
 		// Byte 22
@@ -763,17 +763,6 @@ mod sealed {
 		requires_simple_taproot_staging
 	);
 	define_feature!(
-		151,
-		TaprootAssetChannel,
-		[InitContext, NodeContext, ChannelTypeContext],
-		"Feature flags for OpenAgentsInc experimental single-asset Taproot Asset channels.",
-		set_taproot_asset_channel_optional,
-		set_taproot_asset_channel_required,
-		clear_taproot_asset_channel,
-		supports_taproot_asset_channel,
-		requires_taproot_asset_channel
-	);
-	define_feature!(
 		153, // The BOLTs PR uses feature bit 52/53, so add +100 for the experimental bit
 		HtlcHold,
 		[InitContext, NodeContext],
@@ -1065,6 +1054,34 @@ pub type BlindedHopFeatures = Features<sealed::BlindedHopContext>;
 /// thus must only appear inside a TLV where its length is known in advance.
 pub type ChannelTypeFeatures = Features<sealed::ChannelTypeContext>;
 
+/// Lightning Labs' optional init feature bit for `taproot-overlay-chans`.
+pub const TAPROOT_ASSET_CHANNEL_OPTIONAL_BIT: usize = 2025;
+/// Lightning Labs' required channel_type feature bit for `taproot-overlay-chans`.
+pub const TAPROOT_ASSET_CHANNEL_REQUIRED_BIT: usize = 2026;
+
+const LEGACY_TAPROOT_ASSET_CHANNEL_REQUIRED_BIT: usize = 150;
+const LEGACY_TAPROOT_ASSET_CHANNEL_OPTIONAL_BIT: usize = 151;
+
+fn feature_bit_is_set<T: sealed::Context>(features: &Features<T>, bit: usize) -> bool {
+	let byte_offset = bit / 8;
+	let mask = 1 << (bit - 8 * byte_offset);
+	features.flags.len() > byte_offset && (features.flags[byte_offset] & mask) != 0
+}
+
+fn clear_feature_bits<T: sealed::Context>(features: &mut Features<T>, bits: &[usize]) {
+	for bit in bits {
+		let byte_offset = bit / 8;
+		if features.flags.len() > byte_offset {
+			let mask = 1 << (bit - 8 * byte_offset);
+			features.flags[byte_offset] &= !mask;
+		}
+	}
+
+	let last_non_zero_byte = features.flags.iter().rposition(|&byte| byte != 0);
+	let size = if let Some(offset) = last_non_zero_byte { offset + 1 } else { 0 };
+	features.flags.resize(size, 0u8);
+}
+
 impl InitFeatures {
 	#[doc(hidden)]
 	/// Converts `InitFeatures` to `Features<C>`. Only known `InitFeatures` relevant to context `C`
@@ -1073,6 +1090,86 @@ impl InitFeatures {
 	/// This is not exported to bindings users as it shouldn't be used outside of LDK
 	pub fn to_context<C: sealed::Context>(&self) -> Features<C> {
 		self.to_context_internal()
+	}
+
+	/// Sets Lightning Labs' optional `taproot-overlay-chans` init feature bit.
+	pub fn set_taproot_asset_channel_optional(&mut self) {
+		self.set_optional_custom_bit(TAPROOT_ASSET_CHANNEL_OPTIONAL_BIT)
+			.expect("taproot-overlay-chans optional bit is in the custom feature range");
+	}
+
+	/// Sets Lightning Labs' required `taproot-overlay-chans` init feature bit.
+	pub fn set_taproot_asset_channel_required(&mut self) {
+		self.set_required_custom_bit(TAPROOT_ASSET_CHANNEL_REQUIRED_BIT)
+			.expect("taproot-overlay-chans required bit is in the custom feature range");
+	}
+
+	/// Clears all Taproot Asset channel feature bits known to this fork.
+	pub fn clear_taproot_asset_channel(&mut self) {
+		clear_feature_bits(
+			self,
+			&[
+				TAPROOT_ASSET_CHANNEL_OPTIONAL_BIT,
+				TAPROOT_ASSET_CHANNEL_REQUIRED_BIT,
+				LEGACY_TAPROOT_ASSET_CHANNEL_OPTIONAL_BIT,
+				LEGACY_TAPROOT_ASSET_CHANNEL_REQUIRED_BIT,
+			],
+		);
+	}
+
+	/// Checks whether this feature set supports Taproot Asset overlay channels.
+	pub fn supports_taproot_asset_channel(&self) -> bool {
+		feature_bit_is_set(self, TAPROOT_ASSET_CHANNEL_OPTIONAL_BIT)
+			|| feature_bit_is_set(self, TAPROOT_ASSET_CHANNEL_REQUIRED_BIT)
+			|| feature_bit_is_set(self, LEGACY_TAPROOT_ASSET_CHANNEL_OPTIONAL_BIT)
+			|| feature_bit_is_set(self, LEGACY_TAPROOT_ASSET_CHANNEL_REQUIRED_BIT)
+	}
+
+	/// Checks whether this feature set requires Taproot Asset overlay channels.
+	pub fn requires_taproot_asset_channel(&self) -> bool {
+		feature_bit_is_set(self, TAPROOT_ASSET_CHANNEL_REQUIRED_BIT)
+			|| feature_bit_is_set(self, LEGACY_TAPROOT_ASSET_CHANNEL_REQUIRED_BIT)
+	}
+}
+
+impl NodeFeatures {
+	/// Sets Lightning Labs' optional `taproot-overlay-chans` node feature bit.
+	pub fn set_taproot_asset_channel_optional(&mut self) {
+		self.set_optional_custom_bit(TAPROOT_ASSET_CHANNEL_OPTIONAL_BIT)
+			.expect("taproot-overlay-chans optional bit is in the custom feature range");
+	}
+
+	/// Sets Lightning Labs' required `taproot-overlay-chans` node feature bit.
+	pub fn set_taproot_asset_channel_required(&mut self) {
+		self.set_required_custom_bit(TAPROOT_ASSET_CHANNEL_REQUIRED_BIT)
+			.expect("taproot-overlay-chans required bit is in the custom feature range");
+	}
+
+	/// Clears all Taproot Asset channel feature bits known to this fork.
+	pub fn clear_taproot_asset_channel(&mut self) {
+		clear_feature_bits(
+			self,
+			&[
+				TAPROOT_ASSET_CHANNEL_OPTIONAL_BIT,
+				TAPROOT_ASSET_CHANNEL_REQUIRED_BIT,
+				LEGACY_TAPROOT_ASSET_CHANNEL_OPTIONAL_BIT,
+				LEGACY_TAPROOT_ASSET_CHANNEL_REQUIRED_BIT,
+			],
+		);
+	}
+
+	/// Checks whether this feature set supports Taproot Asset overlay channels.
+	pub fn supports_taproot_asset_channel(&self) -> bool {
+		feature_bit_is_set(self, TAPROOT_ASSET_CHANNEL_OPTIONAL_BIT)
+			|| feature_bit_is_set(self, TAPROOT_ASSET_CHANNEL_REQUIRED_BIT)
+			|| feature_bit_is_set(self, LEGACY_TAPROOT_ASSET_CHANNEL_OPTIONAL_BIT)
+			|| feature_bit_is_set(self, LEGACY_TAPROOT_ASSET_CHANNEL_REQUIRED_BIT)
+	}
+
+	/// Checks whether this feature set requires Taproot Asset overlay channels.
+	pub fn requires_taproot_asset_channel(&self) -> bool {
+		feature_bit_is_set(self, TAPROOT_ASSET_CHANNEL_REQUIRED_BIT)
+			|| feature_bit_is_set(self, LEGACY_TAPROOT_ASSET_CHANNEL_REQUIRED_BIT)
 	}
 }
 
@@ -1128,6 +1225,9 @@ impl ChannelTypeFeatures {
 			*byte |= (*byte & ANY_OPTIONAL_FEATURES_MASK) >> 1;
 			*byte &= ANY_REQUIRED_FEATURES_MASK;
 		}
+		if init.supports_taproot_asset_channel() {
+			Features::<sealed::ChannelTypeContext>::set_taproot_asset_channel_required(&mut ret);
+		}
 		ret
 	}
 
@@ -1172,12 +1272,51 @@ impl ChannelTypeFeatures {
 	}
 
 	/// Constructs a ChannelTypeFeatures for OpenAgentsInc experimental single-asset
-	/// Taproot Asset channels. The current demo intentionally uses the BOLT simple-taproot
-	/// staging bit as the base channel type while the BOLT remains unsettled.
+	/// Taproot Asset channels using Lightning Labs' `taproot-overlay-chans`
+	/// required channel_type bit.
 	pub fn taproot_asset_single_asset() -> Self {
-		let mut ret = Self::simple_taproot_staging();
-		<sealed::ChannelTypeContext as sealed::TaprootAssetChannel>::set_required_bit(&mut ret);
+		let mut ret = Self::empty();
+		Features::<sealed::ChannelTypeContext>::set_taproot_asset_channel_required(&mut ret);
 		ret
+	}
+
+	/// Sets Lightning Labs' optional `taproot-overlay-chans` channel_type bit.
+	pub fn set_taproot_asset_channel_optional(&mut self) {
+		self.set_optional_custom_bit(TAPROOT_ASSET_CHANNEL_OPTIONAL_BIT)
+			.expect("taproot-overlay-chans optional bit is in the custom feature range");
+	}
+
+	/// Sets Lightning Labs' required `taproot-overlay-chans` channel_type bit.
+	pub fn set_taproot_asset_channel_required(&mut self) {
+		self.set_required_custom_bit(TAPROOT_ASSET_CHANNEL_REQUIRED_BIT)
+			.expect("taproot-overlay-chans required bit is in the custom feature range");
+	}
+
+	/// Clears all Taproot Asset channel feature bits known to this fork.
+	pub fn clear_taproot_asset_channel(&mut self) {
+		clear_feature_bits(
+			self,
+			&[
+				TAPROOT_ASSET_CHANNEL_OPTIONAL_BIT,
+				TAPROOT_ASSET_CHANNEL_REQUIRED_BIT,
+				LEGACY_TAPROOT_ASSET_CHANNEL_OPTIONAL_BIT,
+				LEGACY_TAPROOT_ASSET_CHANNEL_REQUIRED_BIT,
+			],
+		);
+	}
+
+	/// Checks whether this channel_type supports Taproot Asset overlay channels.
+	pub fn supports_taproot_asset_channel(&self) -> bool {
+		feature_bit_is_set(self, TAPROOT_ASSET_CHANNEL_OPTIONAL_BIT)
+			|| feature_bit_is_set(self, TAPROOT_ASSET_CHANNEL_REQUIRED_BIT)
+			|| feature_bit_is_set(self, LEGACY_TAPROOT_ASSET_CHANNEL_OPTIONAL_BIT)
+			|| feature_bit_is_set(self, LEGACY_TAPROOT_ASSET_CHANNEL_REQUIRED_BIT)
+	}
+
+	/// Checks whether this channel_type requires Taproot Asset overlay channels.
+	pub fn requires_taproot_asset_channel(&self) -> bool {
+		feature_bit_is_set(self, TAPROOT_ASSET_CHANNEL_REQUIRED_BIT)
+			|| feature_bit_is_set(self, LEGACY_TAPROOT_ASSET_CHANNEL_REQUIRED_BIT)
 	}
 }
 
@@ -1640,7 +1779,8 @@ mod tests {
 		init_features.set_simple_taproot_staging_optional();
 		init_features.set_taproot_asset_channel_optional();
 		let converted_features = ChannelTypeFeatures::from_init(&init_features);
-		assert_eq!(converted_features, ChannelTypeFeatures::taproot_asset_single_asset());
+		assert!(!ChannelTypeFeatures::taproot_asset_single_asset()
+			.requires_unknown_bits_from(&converted_features));
 		assert!(!converted_features.supports_any_optional_bits());
 		assert!(converted_features.requires_static_remote_key());
 		assert!(converted_features.requires_simple_taproot_staging());

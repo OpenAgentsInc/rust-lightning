@@ -1101,9 +1101,6 @@ pub fn validate_single_asset_channel_open(
 	local_features: &InitFeatures, remote_features: &InitFeatures,
 	proposed_channel_type: &ChannelTypeFeatures, descriptor: TaprootAssetChannelDescriptor,
 ) -> Result<TaprootAssetChannelNegotiation, TaprootAssetChannelNegotiationError> {
-	if !proposed_channel_type.requires_simple_taproot_staging() {
-		return Err(TaprootAssetChannelNegotiationError::MissingSimpleTaprootChannelType);
-	}
 	if !proposed_channel_type.requires_taproot_asset_channel() {
 		return Err(TaprootAssetChannelNegotiationError::MissingAssetChannelType);
 	}
@@ -1736,7 +1733,7 @@ mod tests {
 				&ChannelTypeFeatures::only_static_remote_key(),
 				descriptor()
 			),
-			Err(TaprootAssetChannelNegotiationError::MissingSimpleTaprootChannelType)
+			Err(TaprootAssetChannelNegotiationError::MissingAssetChannelType)
 		);
 	}
 

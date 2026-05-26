@@ -17032,14 +17032,16 @@ pub(super) fn get_initial_channel_type(
 		&& cfg!(feature = "simple_taproot_musig2")
 		&& their_features.supports_simple_taproot_staging()
 		&& their_features.supports_taproot_asset_channel();
-	if negotiate_simple_taproot || negotiate_taproot_asset {
+	if negotiate_taproot_asset {
+		ret.clear_static_remote_key();
+		ret.clear_anchors_zero_fee_htlc_tx();
+		ret.clear_anchor_zero_fee_commitments();
+		ret.set_taproot_asset_channel_required();
+	} else if negotiate_simple_taproot {
 		ret.set_static_remote_key_required();
 		ret.clear_anchors_zero_fee_htlc_tx();
 		ret.clear_anchor_zero_fee_commitments();
 		ret.set_simple_taproot_staging_required();
-	}
-	if negotiate_taproot_asset {
-		ret.set_taproot_asset_channel_required();
 	}
 
 	ret
