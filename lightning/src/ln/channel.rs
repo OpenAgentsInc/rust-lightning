@@ -41,6 +41,11 @@ use crate::chain::transaction::{OutPoint, TransactionData};
 use crate::chain::BlockLocator;
 use crate::events::{ClosureReason, FundingInfo, NegotiationFailureReason};
 use crate::ln::chan_utils;
+#[cfg(feature = "simple_taproot_musig2")]
+use crate::ln::chan_utils::{
+	derive_simple_taproot_to_remote_payment_key, SimpleTaprootAssetCommitmentOutputKeys,
+	TxCreationKeys,
+};
 use crate::ln::chan_utils::{
 	get_commitment_transaction_number_obscure_factor, max_htlcs, second_stage_tx_fees_sat,
 	selected_commitment_sat_per_1000_weight, ChannelPublicKeys, ChannelTransactionParameters,
@@ -48,8 +53,6 @@ use crate::ln::chan_utils::{
 	CounterpartyCommitmentSecrets, HTLCOutputInCommitment, HolderCommitmentTransaction,
 	EMPTY_SCRIPT_SIG_WEIGHT, FUNDING_TRANSACTION_WITNESS_WEIGHT,
 };
-#[cfg(feature = "simple_taproot_musig2")]
-use crate::ln::chan_utils::{SimpleTaprootAssetCommitmentOutputKeys, TxCreationKeys};
 use crate::ln::channel_state::{
 	ChannelShutdownState, CounterpartyForwardingInfo, InboundHTLCDetails, InboundHTLCStateDetails,
 	OutboundHTLCDetails, OutboundHTLCStateDetails,
@@ -1885,9 +1888,15 @@ where
 		.map_err(|_| {
 			ChannelError::close("Failed to derive holder Taproot Asset output key".to_owned())
 		})?;
+		let holder_commitment_to_counterparty_payment_key =
+			derive_simple_taproot_to_remote_payment_key(
+				&context.secp_ctx,
+				&holder_commitment_point.next_point(),
+				&counterparty_pubkeys.payment_point,
+			);
 		let holder_commitment_to_counterparty = simple_taproot_to_remote_spend_info(
 			&context.secp_ctx,
-			&counterparty_pubkeys.payment_point,
+			&holder_commitment_to_counterparty_payment_key,
 		)
 		.map_err(|_| {
 			ChannelError::close("Failed to derive counterparty Taproot Asset output key".to_owned())
@@ -1899,11 +1908,17 @@ where
 			holder_pubkeys,
 			&context.secp_ctx,
 		);
-		let counterparty_commitment_to_holder =
-			simple_taproot_to_remote_spend_info(&context.secp_ctx, &holder_pubkeys.payment_point)
-				.map_err(|_| {
-				ChannelError::close("Failed to derive holder Taproot Asset output key".to_owned())
-			})?;
+		let counterparty_commitment_to_holder = simple_taproot_to_remote_spend_info(
+			&context.secp_ctx,
+			&derive_simple_taproot_to_remote_payment_key(
+				&context.secp_ctx,
+				&counterparty_commitment_point,
+				&holder_pubkeys.payment_point,
+			),
+		)
+		.map_err(|_| {
+			ChannelError::close("Failed to derive holder Taproot Asset output key".to_owned())
+		})?;
 		let counterparty_commitment_to_counterparty = simple_taproot_to_local_spend_info(
 			&context.secp_ctx,
 			&counterparty_commitment_keys.broadcaster_delayed_payment_key.to_public_key(),

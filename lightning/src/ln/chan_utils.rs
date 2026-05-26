@@ -43,8 +43,8 @@ use bitcoin::secp256k1::{PublicKey, Scalar, SecretKey};
 use bitcoin::{secp256k1, Sequence, Witness};
 
 use super::channel_keys::{
-	DelayedPaymentBasepoint, DelayedPaymentKey, HtlcBasepoint, HtlcKey, RevocationBasepoint,
-	RevocationKey,
+	add_public_key_tweak, DelayedPaymentBasepoint, DelayedPaymentKey, HtlcBasepoint, HtlcKey,
+	RevocationBasepoint, RevocationKey,
 };
 #[cfg(feature = "simple_taproot_musig2")]
 use super::simple_taproot::{
@@ -734,6 +734,18 @@ pub fn get_countersigner_payment_script(
 	} else {
 		ScriptBuf::new_p2wpkh(&WPubkeyHash::hash(&payment_key.serialize()))
 	}
+}
+
+#[cfg(feature = "simple_taproot_musig2")]
+pub(crate) fn derive_simple_taproot_to_remote_payment_key(
+	secp_ctx: &Secp256k1<secp256k1::All>, per_commitment_point: &PublicKey,
+	payment_basepoint: &PublicKey,
+) -> PublicKey {
+	let mut sha = Sha256::engine();
+	sha.input(&per_commitment_point.serialize());
+	sha.input(&payment_basepoint.serialize());
+	let tweak = Sha256::from_engine(sha);
+	add_public_key_tweak(secp_ctx, payment_basepoint, &tweak)
 }
 
 /// Information about an HTLC as it appears in a commitment transaction
@@ -2056,10 +2068,15 @@ impl CommitmentTransaction {
 		if to_countersignatory_value_sat > Amount::ZERO {
 			#[cfg(feature = "simple_taproot_musig2")]
 			let script = if requires_simple_taproot_outputs(channel_type) {
-				let secp_ctx = Secp256k1::verification_only();
+				let secp_ctx = Secp256k1::new();
+				let countersignatory_payment_key = derive_simple_taproot_to_remote_payment_key(
+					&secp_ctx,
+					&keys.per_commitment_point,
+					countersignatory_payment_point,
+				);
 				simple_taproot_to_remote_spend_info_with_aux_leaf(
 					&secp_ctx,
-					countersignatory_payment_point,
+					&countersignatory_payment_key,
 					channel_parameters.simple_taproot_to_countersignatory_aux_leaf_script(),
 				)
 				.expect("valid simple-taproot to_remote output")
@@ -2551,6 +2568,8 @@ pub fn get_commitment_transaction_number_obscure_factor(
 mod tests {
 	use super::{ChannelPublicKeys, CounterpartyCommitmentSecrets};
 	use crate::chain;
+	#[cfg(feature = "simple_taproot_musig2")]
+	use crate::ln::chan_utils::derive_simple_taproot_to_remote_payment_key;
 	use crate::ln::chan_utils::{
 		build_htlc_transaction, commit_tx_fee_sat, get_htlc_redeemscript,
 		get_keyed_anchor_redeemscript, get_to_countersigner_keyed_anchor_redeemscript,
@@ -2834,7 +2853,7 @@ mod tests {
 	#[cfg(feature = "simple_taproot_musig2")]
 	#[test]
 	#[rustfmt::skip]
-	fn test_simple_taproot_commitment_non_htlc_outputs_match_bolt_vector() {
+	fn test_simple_taproot_commitment_non_htlc_outputs_use_lnd_tweaked_to_remote_key() {
 		let builder = simple_taproot_vector_builder();
 		let tx = builder.build(6_984_820, 3_000_000, Vec::new());
 		let keys = tx.trust().keys();
@@ -2851,7 +2870,7 @@ mod tests {
 		assert_eq!(outputs.len(), 4);
 		assert_txout(&outputs[0], 330, "51201249c50576fdf914caa14f9221370b986df520bdbc73f57d5056a86ee03e5ac4");
 		assert_txout(&outputs[1], 330, "5120f67ab012701705f3203d132f909a6810ef18c5da4c11d986cb50818803b8344e");
-		assert_txout(&outputs[2], 3_000_000, "51203609bb705034e5629aa6ec05c5ca906ac89ac08b34c4583c259521ec30174408");
+		assert_txout(&outputs[2], 3_000_000, "5120eda023c764b3118b37028b4c37ac55e26b5359ee441b49e496af064b12e463f6");
 		assert_txout(&outputs[3], 6_984_820, "51203e1fcbbd06c8a7414704612c72be9834a75d86ed85b29f0ef0c52e1950afaff3");
 		assert_eq!(tx.trust().revokeable_output_index(), Some(3));
 		assert!(builder.verify(&tx).is_ok());
@@ -2870,9 +2889,14 @@ mod tests {
 
 		let tx = builder.build(6_984_820, 3_000_000, Vec::new());
 		let keys = tx.trust().keys();
+		let countersignatory_payment_key = derive_simple_taproot_to_remote_payment_key(
+			&builder.secp_ctx,
+			&keys.per_commitment_point,
+			&builder.counterparty_pubkeys.payment_point,
+		);
 		let expected_to_countersignatory = simple_taproot_to_remote_spend_info_with_aux_leaf(
 			&builder.secp_ctx,
-			&builder.counterparty_pubkeys.payment_point,
+			&countersignatory_payment_key,
 			Some(aux_leaf.as_script()),
 		)
 		.unwrap()
