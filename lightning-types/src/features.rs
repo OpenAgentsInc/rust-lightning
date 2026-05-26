@@ -83,6 +83,8 @@
 //!   (see [BOLT PR #1160](https://github.com/lightning/bolts/pull/1160) for more information).
 //! - `HtlcHold` - requires/supports holding HTLCs and forwarding on receipt of an onion message
 //!   (see [BOLT-2](https://github.com/lightning/bolts/pull/989/files) for more information).
+//! - `TaprootAssetChannel` - OpenAgentsInc experimental support for single-asset Taproot
+//!   Asset channels while BLIP-TAP remains draft.
 //!
 //! LDK knows about the following features, but does not support them:
 //! - `AnchorsNonzeroFeeHtlcTx` - the initial version of anchor outputs, which was later found to be
@@ -167,8 +169,10 @@ mod sealed {
 			ZeroConf,
 			// Byte 7
 			Trampoline | SimpleClose | Splice,
-			// Byte 8 - 18
-			,,,,,,,,,,,
+			// Byte 8 - 17
+			,,,,,,,,,,
+			// Byte 18
+			TaprootAssetChannel,
 			// Byte 19
 			HtlcHold,
 		]
@@ -192,8 +196,10 @@ mod sealed {
 			ZeroConf | Keysend,
 			// Byte 7
 			Trampoline | SimpleClose | Splice,
-			// Byte 8 - 18
-			,,,,,,,,,,,
+			// Byte 8 - 17
+			,,,,,,,,,,
+			// Byte 18
+			TaprootAssetChannel,
 			// Byte 19
 			HtlcHold,
 			// Byte 20 - 31
@@ -259,6 +265,10 @@ mod sealed {
 		AnchorZeroFeeCommitments | SCIDPrivacy,
 		// Byte 6
 		ZeroConf,
+		// Byte 7 - 17
+		,,,,,,,,,,,
+		// Byte 18
+		TaprootAssetChannel,
 	]);
 
 	/// Defines a feature with the given bits for the specified [`Context`]s. The generated trait is
@@ -707,6 +717,17 @@ mod sealed {
 	// added which we expect to appear commonly across contexts.
 	pub(super) const MIN_FEATURES_ALLOCATION_BYTES: usize = 63_usize.div_ceil(8);
 	define_feature!(
+		151,
+		TaprootAssetChannel,
+		[InitContext, NodeContext, ChannelTypeContext],
+		"Feature flags for OpenAgentsInc experimental single-asset Taproot Asset channels.",
+		set_taproot_asset_channel_optional,
+		set_taproot_asset_channel_required,
+		clear_taproot_asset_channel,
+		supports_taproot_asset_channel,
+		requires_taproot_asset_channel
+	);
+	define_feature!(
 		153, // The BOLTs PR uses feature bit 52/53, so add +100 for the experimental bit
 		HtlcHold,
 		[InitContext, NodeContext],
@@ -1085,6 +1106,14 @@ impl ChannelTypeFeatures {
 		<sealed::ChannelTypeContext as sealed::AnchorZeroFeeCommitments>::set_required_bit(
 			&mut ret,
 		);
+		ret
+	}
+
+	/// Constructs a ChannelTypeFeatures for OpenAgentsInc experimental single-asset
+	/// Taproot Asset channels.
+	pub fn taproot_asset_single_asset() -> Self {
+		let mut ret = Self::only_static_remote_key();
+		<sealed::ChannelTypeContext as sealed::TaprootAssetChannel>::set_required_bit(&mut ret);
 		ret
 	}
 }
@@ -1520,6 +1549,18 @@ mod tests {
 		assert_eq!(converted_features, ChannelTypeFeatures::only_static_remote_key());
 		assert!(!converted_features.supports_any_optional_bits());
 		assert!(converted_features.requires_static_remote_key());
+	}
+
+	#[test]
+	fn test_taproot_asset_channel_type_mapping() {
+		let mut init_features = InitFeatures::empty();
+		init_features.set_static_remote_key_optional();
+		init_features.set_taproot_asset_channel_optional();
+		let converted_features = ChannelTypeFeatures::from_init(&init_features);
+		assert_eq!(converted_features, ChannelTypeFeatures::taproot_asset_single_asset());
+		assert!(!converted_features.supports_any_optional_bits());
+		assert!(converted_features.requires_static_remote_key());
+		assert!(converted_features.requires_taproot_asset_channel());
 	}
 
 	#[test]

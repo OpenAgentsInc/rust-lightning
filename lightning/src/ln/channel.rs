@@ -15839,6 +15839,12 @@ pub(super) fn get_initial_channel_type(
 		ret.set_anchors_zero_fee_htlc_tx_required();
 	}
 
+	if config.channel_handshake_config.negotiate_taproot_asset_channels
+		&& their_features.supports_taproot_asset_channel()
+	{
+		ret.set_taproot_asset_channel_required();
+	}
+
 	ret
 }
 

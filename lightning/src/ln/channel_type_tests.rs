@@ -96,6 +96,25 @@ fn test_option_zero_fee_commitments_from_zero_htlc_anchors_initial() {
 	)
 }
 
+#[test]
+fn test_experimental_taproot_asset_channel_initial() {
+	let mut expected_type = ChannelTypeFeatures::only_static_remote_key();
+	expected_type.set_taproot_asset_channel_required();
+
+	do_test_get_initial_channel_type(
+		UserConfig::default(),
+		InitFeatures::empty(),
+		ChannelTypeFeatures::only_static_remote_key(),
+		|cfg: &mut UserConfig| {
+			cfg.channel_handshake_config.negotiate_taproot_asset_channels = true;
+		},
+		|their_features: &mut InitFeatures| {
+			their_features.set_taproot_asset_channel_optional();
+		},
+		expected_type,
+	)
+}
+
 fn do_test_get_initial_channel_type<F1, F2>(
 	start_cfg: UserConfig, start_features: InitFeatures, start_type: ChannelTypeFeatures,
 	mut local_cfg_mod: F1, mut remote_features_mod: F2, channel_type: ChannelTypeFeatures,

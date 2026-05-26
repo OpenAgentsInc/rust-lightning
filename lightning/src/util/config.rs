@@ -241,6 +241,16 @@ pub struct ChannelHandshakeConfig {
 	/// [`Event::OpenChannelRequest`]: crate::events::Event::OpenChannelRequest
 	pub negotiate_anchor_zero_fee_commitments: bool,
 
+	/// If set, we advertise and attempt to negotiate the OpenAgentsInc experimental
+	/// Taproot Asset channel type for future channels.
+	///
+	/// This is only a feature and channel-type gate. The asset ID, Taproot Assets
+	/// proof root, protocol version, and allocation checks must be bound by the
+	/// asset-channel funding/controller layer before a channel is safe to use.
+	///
+	/// Default value: `false`
+	pub negotiate_taproot_asset_channels: bool,
+
 	/// The maximum number of HTLCs in-flight from our counterparty towards us at the same time.
 	///
 	/// Increasing the value can help improve liquidity and stability in
@@ -272,6 +282,7 @@ impl Default for ChannelHandshakeConfig {
 			their_channel_reserve_proportional_millionths: 10_000,
 			negotiate_anchors_zero_fee_htlc_tx: true,
 			negotiate_anchor_zero_fee_commitments: false,
+			negotiate_taproot_asset_channels: false,
 			our_max_accepted_htlcs: 50,
 		}
 	}
@@ -304,6 +315,7 @@ impl Readable for ChannelHandshakeConfig {
 			their_channel_reserve_proportional_millionths: Readable::read(reader)?,
 			negotiate_anchors_zero_fee_htlc_tx: Readable::read(reader)?,
 			negotiate_anchor_zero_fee_commitments: Readable::read(reader)?,
+			negotiate_taproot_asset_channels: Readable::read(reader)?,
 			our_max_accepted_htlcs: Readable::read(reader)?,
 		})
 	}
