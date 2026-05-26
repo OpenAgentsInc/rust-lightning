@@ -57,6 +57,10 @@ use crate::ln::channel_keys::{
 use crate::ln::channelmanager::{HTLCSource, PaymentClaimDetails, SentHTLCId};
 use crate::ln::funding::FundingContribution;
 use crate::ln::msgs::DecodeError;
+use crate::ln::taproot_asset::{
+	require_asset_monitor_aux_blob, TaprootAssetMonitorAuxBlob, TaprootAssetMonitorAuxBlobError,
+	TaprootAssetMonitorAuxBlobExpectation,
+};
 use crate::ln::types::ChannelId;
 use crate::sign::{
 	ecdsa::EcdsaChannelSigner, ChannelDerivationParameters, DelayedPaymentOutputDescriptor,
@@ -141,6 +145,40 @@ impl ChannelMonitorUpdate {
 	#[cfg(not(c_bindings))]
 	pub fn renegotiated_funding_data(&self) -> impl Iterator<Item = (OutPoint, ScriptBuf)> + '_ {
 		self.internal_renegotiated_funding_data()
+	}
+
+	/// Builds a monitor update carrying only a Taproot Asset aux blob.
+	pub fn taproot_asset_aux_update(
+		update_id: u64, channel_id: ChannelId, blob: TaprootAssetMonitorAuxBlob,
+	) -> Result<Self, TaprootAssetMonitorAuxBlobError> {
+		blob.validate_integrity()?;
+		if blob.channel_id != channel_id {
+			return Err(TaprootAssetMonitorAuxBlobError::ChannelIdMismatch);
+		}
+		Ok(Self {
+			updates: vec![ChannelMonitorUpdateStep::TaprootAssetAuxBlob { blob }],
+			update_id,
+			channel_id: Some(channel_id),
+		})
+	}
+
+	/// Returns the Taproot Asset aux blobs carried by this monitor update.
+	pub fn taproot_asset_aux_blobs(
+		&self,
+	) -> impl Iterator<Item = &TaprootAssetMonitorAuxBlob> + '_ {
+		self.updates.iter().filter_map(|update| match update {
+			ChannelMonitorUpdateStep::TaprootAssetAuxBlob { blob } => Some(blob),
+			_ => None,
+		})
+	}
+
+	/// Requires and validates a Taproot Asset aux blob for this monitor update.
+	pub fn require_taproot_asset_aux_blob(
+		&self, expected: &TaprootAssetMonitorAuxBlobExpectation,
+	) -> Result<&TaprootAssetMonitorAuxBlob, TaprootAssetMonitorAuxBlobError> {
+		let matching_blob =
+			self.taproot_asset_aux_blobs().find(|blob| blob.channel_id == expected.channel_id);
+		require_asset_monitor_aux_blob(matching_blob, expected)
 	}
 }
 
@@ -708,6 +746,9 @@ pub(crate) enum ChannelMonitorUpdateStep {
 	ReleasePaymentComplete {
 		htlc: SentHTLCId,
 	},
+	TaprootAssetAuxBlob {
+		blob: TaprootAssetMonitorAuxBlob,
+	},
 }
 
 impl ChannelMonitorUpdateStep {
@@ -725,6 +766,7 @@ impl ChannelMonitorUpdateStep {
 			ChannelMonitorUpdateStep::RenegotiatedFunding { .. } => "RenegotiatedFunding",
 			ChannelMonitorUpdateStep::RenegotiatedFundingLocked { .. } => "RenegotiatedFundingLocked",
 			ChannelMonitorUpdateStep::ReleasePaymentComplete { .. } => "ReleasePaymentComplete",
+			ChannelMonitorUpdateStep::TaprootAssetAuxBlob { .. } => "TaprootAssetAuxBlob",
 		}
 	}
 }
@@ -779,6 +821,9 @@ impl_writeable_tlv_based_enum_upgradable!(ChannelMonitorUpdateStep,
 	},
 	(12, RenegotiatedFundingLocked) => {
 		(1, funding_txid, required),
+	},
+	(14, TaprootAssetAuxBlob) => {
+		(1, blob, required),
 	},
 );
 
@@ -4338,6 +4383,17 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 					log_trace!(logger, "HTLC {htlc:?} permanently and fully resolved");
 					self.htlcs_resolved_to_user.insert(*htlc);
 				},
+				ChannelMonitorUpdateStep::TaprootAssetAuxBlob { blob } => {
+					log_trace!(
+						logger,
+						"Updating ChannelMonitor with Taproot Asset aux blob for commitment {}",
+						blob.commitment_number
+					);
+					if let Err(_) = blob.validate_integrity() {
+						log_error!(logger, "Taproot Asset aux blob failed integrity validation");
+						ret = Err(());
+					}
+				},
 			}
 		}
 
@@ -4409,7 +4465,8 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 					|ChannelMonitorUpdateStep::ShutdownScript { .. }
 					|ChannelMonitorUpdateStep::CommitmentSecret { .. }
 					|ChannelMonitorUpdateStep::RenegotiatedFunding { .. }
-					|ChannelMonitorUpdateStep::RenegotiatedFundingLocked { .. } =>
+					|ChannelMonitorUpdateStep::RenegotiatedFundingLocked { .. }
+					|ChannelMonitorUpdateStep::TaprootAssetAuxBlob { .. } =>
 						is_pre_close_update = true,
 				// After a channel is closed, we don't communicate with our peer about it, so the
 				// only things we will update is getting a new preimage (from a different channel),
@@ -7072,12 +7129,16 @@ mod tests {
 	use crate::ln::channelmanager::{HTLCSource, PaymentId};
 	use crate::ln::functional_test_utils::*;
 	use crate::ln::outbound_payment::RecipientOnionFields;
+	use crate::ln::taproot_asset::{
+		TaprootAssetMonitorAuxBlob, TaprootAssetMonitorAuxBlobError,
+		TaprootAssetMonitorAuxBlobExpectation,
+	};
 	use crate::ln::types::ChannelId;
 	use crate::sync::Arc;
 	use crate::types::features::ChannelTypeFeatures;
 	use crate::types::payment::{PaymentHash, PaymentPreimage};
 	use crate::util::logger::Logger;
-	use crate::util::ser::{ReadableArgs, Writeable};
+	use crate::util::ser::{Readable, ReadableArgs, Writeable};
 	use crate::util::test_utils::{TestBroadcaster, TestFeeEstimator, TestLogger};
 	use crate::{check_spends, get_local_commitment_txn, get_monitor, get_route_and_payment_hash};
 
@@ -7085,6 +7146,78 @@ mod tests {
 	use crate::prelude::*;
 
 	use std::str::FromStr;
+
+	fn taproot_asset_aux_blob() -> TaprootAssetMonitorAuxBlob {
+		TaprootAssetMonitorAuxBlob::new(
+			ChannelId::from_bytes([42; 32]),
+			[2; 32],
+			7,
+			700,
+			300,
+			[3; 32],
+			[4; 32],
+			1_000,
+			[5; 32],
+			[6; 32],
+		)
+		.unwrap()
+	}
+
+	fn taproot_asset_aux_expectation() -> TaprootAssetMonitorAuxBlobExpectation {
+		TaprootAssetMonitorAuxBlobExpectation {
+			channel_id: ChannelId::from_bytes([42; 32]),
+			asset_id: [2; 32],
+			commitment_number: 7,
+			local_balance: 700,
+			remote_balance: 300,
+			state_digest: [3; 32],
+			proof_root_hash: [4; 32],
+			proof_root_sum: 1_000,
+		}
+	}
+
+	#[test]
+	fn taproot_asset_aux_update_serializes_and_validates() {
+		let channel_id = ChannelId::from_bytes([42; 32]);
+		let blob = taproot_asset_aux_blob();
+		let expected = taproot_asset_aux_expectation();
+		let update = super::ChannelMonitorUpdate::taproot_asset_aux_update(7, channel_id, blob)
+			.expect("asset aux update");
+
+		assert_eq!(update.require_taproot_asset_aux_blob(&expected).unwrap(), &blob);
+
+		let encoded = update.encode();
+		let decoded = super::ChannelMonitorUpdate::read(&mut encoded.as_slice()).unwrap();
+		assert_eq!(decoded.require_taproot_asset_aux_blob(&expected).unwrap(), &blob);
+	}
+
+	#[test]
+	fn taproot_asset_aux_update_rejects_missing_or_stale_blob() {
+		let channel_id = ChannelId::from_bytes([42; 32]);
+		let expected = taproot_asset_aux_expectation();
+		let missing = super::ChannelMonitorUpdate {
+			updates: vec![],
+			update_id: 7,
+			channel_id: Some(channel_id),
+		};
+		assert_eq!(
+			missing.require_taproot_asset_aux_blob(&expected),
+			Err(TaprootAssetMonitorAuxBlobError::MissingAssetBlob)
+		);
+
+		let update = super::ChannelMonitorUpdate::taproot_asset_aux_update(
+			7,
+			channel_id,
+			taproot_asset_aux_blob(),
+		)
+		.expect("asset aux update");
+		let mut stale = expected;
+		stale.commitment_number = 8;
+		assert_eq!(
+			update.require_taproot_asset_aux_blob(&stale),
+			Err(TaprootAssetMonitorAuxBlobError::CommitmentNumberMismatch)
+		);
+	}
 
 	#[rustfmt::skip]
 	fn do_test_funding_spend_refuses_updates(use_local_txn: bool) {

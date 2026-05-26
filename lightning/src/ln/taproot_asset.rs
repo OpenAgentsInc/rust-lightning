@@ -17,6 +17,7 @@
 use crate::chain::transaction::OutPoint;
 use crate::ln::types::ChannelId;
 
+use bitcoin::hashes::{sha256::Hash as Sha256, Hash as _, HashEngine as _};
 use bitcoin::secp256k1::PublicKey;
 use lightning_types::features::{ChannelTypeFeatures, InitFeatures};
 
@@ -26,6 +27,9 @@ pub const SUPPORTED_TAPROOT_ASSET_CHANNEL_PROTOCOL_VERSION: u16 = 1;
 
 /// The byte length of a Taproot Asset ID.
 pub const TAPROOT_ASSET_ID_LEN: usize = 32;
+
+/// The schema version for Taproot Asset monitor aux blobs.
+pub const TAPROOT_ASSET_MONITOR_AUX_BLOB_SCHEMA_VERSION: u16 = 1;
 
 /// Describes the single asset that an experimental Taproot Asset channel is
 /// allowed to carry.
@@ -170,6 +174,129 @@ pub struct TaprootAssetFundingApproval {
 	pub total_amount: u64,
 }
 
+/// Asset-channel state that must be persisted with the matching
+/// [`ChannelMonitorUpdate`](crate::chain::channelmonitor::ChannelMonitorUpdate).
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct TaprootAssetMonitorAuxBlob {
+	/// Schema version for this aux blob.
+	pub schema_version: u16,
+	/// Channel ID whose monitor update carries this asset state.
+	pub channel_id: ChannelId,
+	/// Asset ID for the single-asset channel.
+	pub asset_id: [u8; TAPROOT_ASSET_ID_LEN],
+	/// Lightning commitment number this asset state belongs to.
+	pub commitment_number: u64,
+	/// Local asset balance after this commitment.
+	pub local_balance: u64,
+	/// Remote asset balance after this commitment.
+	pub remote_balance: u64,
+	/// Digest of the asset state at this commitment.
+	pub state_digest: [u8; TAPROOT_ASSET_ID_LEN],
+	/// Taproot Asset proof/root reference hash for this state.
+	pub proof_root_hash: [u8; TAPROOT_ASSET_ID_LEN],
+	/// Taproot Asset proof/root sum for this state.
+	pub proof_root_sum: u64,
+	/// Digest of nonce material required by the asset signature path.
+	pub nonce_digest: [u8; TAPROOT_ASSET_ID_LEN],
+	/// Digest of asset signature material for this commitment.
+	pub signature_digest: [u8; TAPROOT_ASSET_ID_LEN],
+	/// Integrity digest over all fields above.
+	pub blob_digest: [u8; TAPROOT_ASSET_ID_LEN],
+}
+
+impl TaprootAssetMonitorAuxBlob {
+	/// Builds a validated Taproot Asset monitor aux blob.
+	pub fn new(
+		channel_id: ChannelId, asset_id: [u8; TAPROOT_ASSET_ID_LEN], commitment_number: u64,
+		local_balance: u64, remote_balance: u64, state_digest: [u8; TAPROOT_ASSET_ID_LEN],
+		proof_root_hash: [u8; TAPROOT_ASSET_ID_LEN], proof_root_sum: u64,
+		nonce_digest: [u8; TAPROOT_ASSET_ID_LEN], signature_digest: [u8; TAPROOT_ASSET_ID_LEN],
+	) -> Result<Self, TaprootAssetMonitorAuxBlobError> {
+		let mut blob = Self {
+			schema_version: TAPROOT_ASSET_MONITOR_AUX_BLOB_SCHEMA_VERSION,
+			channel_id,
+			asset_id,
+			commitment_number,
+			local_balance,
+			remote_balance,
+			state_digest,
+			proof_root_hash,
+			proof_root_sum,
+			nonce_digest,
+			signature_digest,
+			blob_digest: [0; TAPROOT_ASSET_ID_LEN],
+		};
+		blob.blob_digest = blob.digest();
+		blob.validate_integrity()?;
+		Ok(blob)
+	}
+
+	/// Recomputes the aux blob integrity digest.
+	pub fn digest(&self) -> [u8; TAPROOT_ASSET_ID_LEN] {
+		let mut engine = Sha256::engine();
+		engine.input(b"openagents:taproot-asset-monitor-aux:v1");
+		engine.input(&self.schema_version.to_be_bytes());
+		engine.input(&self.channel_id.0);
+		engine.input(&self.asset_id);
+		engine.input(&self.commitment_number.to_be_bytes());
+		engine.input(&self.local_balance.to_be_bytes());
+		engine.input(&self.remote_balance.to_be_bytes());
+		engine.input(&self.state_digest);
+		engine.input(&self.proof_root_hash);
+		engine.input(&self.proof_root_sum.to_be_bytes());
+		engine.input(&self.nonce_digest);
+		engine.input(&self.signature_digest);
+		Sha256::from_engine(engine).to_byte_array()
+	}
+
+	/// Checks the blob's internal integrity independent of any expected
+	/// commitment.
+	pub fn validate_integrity(&self) -> Result<(), TaprootAssetMonitorAuxBlobError> {
+		if self.schema_version != TAPROOT_ASSET_MONITOR_AUX_BLOB_SCHEMA_VERSION {
+			return Err(TaprootAssetMonitorAuxBlobError::UnsupportedVersion);
+		}
+		if self.channel_id.is_zero() {
+			return Err(TaprootAssetMonitorAuxBlobError::MalformedBlob);
+		}
+		if self.asset_id == [0; TAPROOT_ASSET_ID_LEN]
+			|| self.state_digest == [0; TAPROOT_ASSET_ID_LEN]
+		{
+			return Err(TaprootAssetMonitorAuxBlobError::MalformedBlob);
+		}
+		if self.local_balance.checked_add(self.remote_balance).is_none() {
+			return Err(TaprootAssetMonitorAuxBlobError::AmountMismatch);
+		}
+		if self.proof_root_sum != self.local_balance + self.remote_balance {
+			return Err(TaprootAssetMonitorAuxBlobError::AmountMismatch);
+		}
+		if self.blob_digest != self.digest() {
+			return Err(TaprootAssetMonitorAuxBlobError::BlobDigestMismatch);
+		}
+		Ok(())
+	}
+}
+
+/// Expected asset-channel monitor aux state for a Lightning monitor update.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct TaprootAssetMonitorAuxBlobExpectation {
+	/// Expected channel ID.
+	pub channel_id: ChannelId,
+	/// Expected asset ID.
+	pub asset_id: [u8; TAPROOT_ASSET_ID_LEN],
+	/// Expected Lightning commitment number.
+	pub commitment_number: u64,
+	/// Expected local asset balance.
+	pub local_balance: u64,
+	/// Expected remote asset balance.
+	pub remote_balance: u64,
+	/// Expected asset state digest.
+	pub state_digest: [u8; TAPROOT_ASSET_ID_LEN],
+	/// Expected Taproot Asset root hash.
+	pub proof_root_hash: [u8; TAPROOT_ASSET_ID_LEN],
+	/// Expected Taproot Asset root sum.
+	pub proof_root_sum: u64,
+}
+
 /// Errors returned while checking an experimental Taproot Asset channel
 /// negotiation.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -220,6 +347,31 @@ pub enum TaprootAssetFundingError {
 	/// Local and remote allocation or root sums did not match the expected
 	/// total.
 	AmountMismatch,
+}
+
+/// Errors returned by Taproot Asset monitor aux blob validation.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum TaprootAssetMonitorAuxBlobError {
+	/// An asset-channel monitor update was required but no aux blob was present.
+	MissingAssetBlob,
+	/// The aux blob used an unsupported schema version.
+	UnsupportedVersion,
+	/// The aux blob was zeroed or internally malformed.
+	MalformedBlob,
+	/// The aux blob channel ID did not match the monitor update.
+	ChannelIdMismatch,
+	/// The aux blob asset ID did not match the expected asset.
+	AssetIdMismatch,
+	/// The aux blob commitment number did not match the Lightning commitment.
+	CommitmentNumberMismatch,
+	/// The aux blob balance sum did not match the expected total or root sum.
+	AmountMismatch,
+	/// The aux blob state digest did not match the expected asset state.
+	StateDigestMismatch,
+	/// The aux blob proof root did not match the expected Taproot Asset root.
+	ProofRootMismatch,
+	/// The aux blob integrity digest did not match the serialized fields.
+	BlobDigestMismatch,
 }
 
 /// Builds the required channel type for a single-asset Taproot Asset channel.
@@ -335,6 +487,63 @@ pub fn validate_asset_channel_funding(
 	})
 }
 
+/// Requires and validates a Taproot Asset monitor aux blob for a monitor
+/// update.
+pub fn require_asset_monitor_aux_blob<'a>(
+	blob: Option<&'a TaprootAssetMonitorAuxBlob>, expected: &TaprootAssetMonitorAuxBlobExpectation,
+) -> Result<&'a TaprootAssetMonitorAuxBlob, TaprootAssetMonitorAuxBlobError> {
+	let blob = blob.ok_or(TaprootAssetMonitorAuxBlobError::MissingAssetBlob)?;
+	validate_asset_monitor_aux_blob(blob, expected)?;
+	Ok(blob)
+}
+
+/// Validates that a Taproot Asset monitor aux blob matches the expected
+/// Lightning commitment state.
+pub fn validate_asset_monitor_aux_blob(
+	blob: &TaprootAssetMonitorAuxBlob, expected: &TaprootAssetMonitorAuxBlobExpectation,
+) -> Result<(), TaprootAssetMonitorAuxBlobError> {
+	blob.validate_integrity()?;
+	if blob.channel_id != expected.channel_id {
+		return Err(TaprootAssetMonitorAuxBlobError::ChannelIdMismatch);
+	}
+	if blob.asset_id != expected.asset_id {
+		return Err(TaprootAssetMonitorAuxBlobError::AssetIdMismatch);
+	}
+	if blob.commitment_number != expected.commitment_number {
+		return Err(TaprootAssetMonitorAuxBlobError::CommitmentNumberMismatch);
+	}
+	if blob.local_balance != expected.local_balance
+		|| blob.remote_balance != expected.remote_balance
+	{
+		return Err(TaprootAssetMonitorAuxBlobError::AmountMismatch);
+	}
+	if blob.proof_root_sum != expected.proof_root_sum {
+		return Err(TaprootAssetMonitorAuxBlobError::AmountMismatch);
+	}
+	if blob.state_digest != expected.state_digest {
+		return Err(TaprootAssetMonitorAuxBlobError::StateDigestMismatch);
+	}
+	if blob.proof_root_hash != expected.proof_root_hash {
+		return Err(TaprootAssetMonitorAuxBlobError::ProofRootMismatch);
+	}
+	Ok(())
+}
+
+impl_writeable!(TaprootAssetMonitorAuxBlob, {
+	schema_version,
+	channel_id,
+	asset_id,
+	commitment_number,
+	local_balance,
+	remote_balance,
+	state_digest,
+	proof_root_hash,
+	proof_root_sum,
+	nonce_digest,
+	signature_digest,
+	blob_digest
+});
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -407,6 +616,35 @@ mod tests {
 				total_amount: 1_000,
 			},
 			allocation: TaprootAssetFundingAllocation { local_amount: 700, remote_amount: 300 },
+		}
+	}
+
+	fn monitor_aux_blob() -> TaprootAssetMonitorAuxBlob {
+		TaprootAssetMonitorAuxBlob::new(
+			ChannelId::from_bytes([3; 32]),
+			asset_id(),
+			42,
+			700,
+			300,
+			[8; TAPROOT_ASSET_ID_LEN],
+			[6; TAPROOT_ASSET_ID_LEN],
+			1_000,
+			[10; TAPROOT_ASSET_ID_LEN],
+			[11; TAPROOT_ASSET_ID_LEN],
+		)
+		.unwrap()
+	}
+
+	fn monitor_aux_expectation() -> TaprootAssetMonitorAuxBlobExpectation {
+		TaprootAssetMonitorAuxBlobExpectation {
+			channel_id: ChannelId::from_bytes([3; 32]),
+			asset_id: asset_id(),
+			commitment_number: 42,
+			local_balance: 700,
+			remote_balance: 300,
+			state_digest: [8; TAPROOT_ASSET_ID_LEN],
+			proof_root_hash: [6; TAPROOT_ASSET_ID_LEN],
+			proof_root_sum: 1_000,
 		}
 	}
 
@@ -561,6 +799,50 @@ mod tests {
 		assert_eq!(
 			validate_asset_channel_funding(&request),
 			Err(TaprootAssetFundingError::AmountMismatch)
+		);
+	}
+
+	#[test]
+	fn validates_monitor_aux_blob() {
+		let blob = monitor_aux_blob();
+		let expected = monitor_aux_expectation();
+		assert!(validate_asset_monitor_aux_blob(&blob, &expected).is_ok());
+		assert_eq!(require_asset_monitor_aux_blob(Some(&blob), &expected).unwrap(), &blob);
+	}
+
+	#[test]
+	fn rejects_missing_or_stale_monitor_aux_blob() {
+		let blob = monitor_aux_blob();
+		let expected = monitor_aux_expectation();
+		assert_eq!(
+			require_asset_monitor_aux_blob(None, &expected),
+			Err(TaprootAssetMonitorAuxBlobError::MissingAssetBlob)
+		);
+
+		let mut stale = expected;
+		stale.commitment_number = 43;
+		assert_eq!(
+			validate_asset_monitor_aux_blob(&blob, &stale),
+			Err(TaprootAssetMonitorAuxBlobError::CommitmentNumberMismatch)
+		);
+	}
+
+	#[test]
+	fn rejects_malformed_monitor_aux_blob() {
+		let expected = monitor_aux_expectation();
+		let mut tampered = monitor_aux_blob();
+		tampered.state_digest = [12; TAPROOT_ASSET_ID_LEN];
+		assert_eq!(
+			validate_asset_monitor_aux_blob(&tampered, &expected),
+			Err(TaprootAssetMonitorAuxBlobError::BlobDigestMismatch)
+		);
+
+		let mut wrong_root = monitor_aux_blob();
+		wrong_root.proof_root_hash = [12; TAPROOT_ASSET_ID_LEN];
+		wrong_root.blob_digest = wrong_root.digest();
+		assert_eq!(
+			validate_asset_monitor_aux_blob(&wrong_root, &expected),
+			Err(TaprootAssetMonitorAuxBlobError::ProofRootMismatch)
 		);
 	}
 }
