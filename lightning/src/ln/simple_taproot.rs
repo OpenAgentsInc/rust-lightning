@@ -67,6 +67,18 @@ pub const MUSIG2_SECRET_NONCE_LEN: usize = 97;
 /// Byte length of `partial_signature || public_nonce`.
 pub const MUSIG2_PARTIAL_SIGNATURE_WITH_NONCE_LEN: usize =
 	MUSIG2_PARTIAL_SIGNATURE_LEN + MUSIG2_PUBLIC_NONCE_LEN;
+/// Domain-separated message used only for deterministic nonce pre-generation.
+///
+/// Simple-taproot commitment nonces are advertised before the commitment
+/// transaction message is known. The actual partial signature still signs the
+/// commitment transaction sighash; this value only keeps pre-generated counter
+/// nonces stable between announcement and signing.
+pub const SIMPLE_TAPROOT_COMMITMENT_NONCE_PREIMAGE: &[u8] =
+	b"ldk-simple-taproot-commitment-nonce-v1";
+/// Domain-separated message for deterministic nonces used when signing the
+/// counterparty's commitment transaction.
+pub const SIMPLE_TAPROOT_COUNTERPARTY_COMMITMENT_NONCE_PREIMAGE: &[u8] =
+	b"ldk-simple-taproot-counterparty-commitment-nonce-v1";
 /// BOLT simple-taproot NUMS point used for script-only commitment outputs.
 #[cfg(feature = "simple_taproot_musig2")]
 pub const SIMPLE_TAPROOT_NUMS_POINT_BYTES: [u8; 33] = [
@@ -274,6 +286,35 @@ impl Readable for SimpleTaprootPartialSignatureWithNonce {
 	}
 }
 
+/// A retransmittable simple-taproot commitment partial signature.
+#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
+pub struct SimpleTaprootSentCommitmentSignature {
+	/// Funding transaction ID for the signed commitment transaction.
+	pub funding_txid: Txid,
+	/// Commitment nonce index used for the signature.
+	pub nonce_index: u64,
+	/// The partial signature and public nonce that were sent.
+	pub partial_signature_with_nonce: SimpleTaprootPartialSignatureWithNonce,
+}
+
+impl Writeable for SimpleTaprootSentCommitmentSignature {
+	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), io::Error> {
+		self.funding_txid.write(writer)?;
+		self.nonce_index.write(writer)?;
+		self.partial_signature_with_nonce.write(writer)
+	}
+}
+
+impl Readable for SimpleTaprootSentCommitmentSignature {
+	fn read<R: Read>(reader: &mut R) -> Result<Self, DecodeError> {
+		Ok(Self {
+			funding_txid: Readable::read(reader)?,
+			nonce_index: Readable::read(reader)?,
+			partial_signature_with_nonce: Readable::read(reader)?,
+		})
+	}
+}
+
 /// A `next_local_nonces` entry keyed by funding transaction ID.
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
 pub struct SimpleTaprootNonceEntry {
@@ -293,6 +334,110 @@ impl Writeable for SimpleTaprootNonceEntry {
 impl Readable for SimpleTaprootNonceEntry {
 	fn read<R: Read>(reader: &mut R) -> Result<Self, DecodeError> {
 		Ok(Self { funding_txid: Readable::read(reader)?, public_nonce: Readable::read(reader)? })
+	}
+}
+
+/// Restart-persisted per-funding simple-taproot public nonce entries.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
+pub struct SimpleTaprootNonceEntries(pub Vec<SimpleTaprootNonceEntry>);
+
+impl SimpleTaprootNonceEntries {
+	/// Returns the nonce for a funding transaction, if one is known.
+	pub fn get(&self, funding_txid: Txid) -> Option<Musig2PublicNonce> {
+		self.0
+			.iter()
+			.find(|entry| entry.funding_txid == funding_txid)
+			.map(|entry| entry.public_nonce)
+	}
+
+	/// Inserts or replaces a funding transaction's advertised public nonce.
+	pub fn upsert(&mut self, entry: SimpleTaprootNonceEntry) {
+		if let Some(existing) =
+			self.0.iter_mut().find(|existing| existing.funding_txid == entry.funding_txid)
+		{
+			*existing = entry;
+		} else {
+			self.0.push(entry);
+		}
+	}
+
+	/// Returns true when no nonces are stored.
+	pub fn is_empty(&self) -> bool {
+		self.0.is_empty()
+	}
+}
+
+impl Writeable for SimpleTaprootNonceEntries {
+	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), io::Error> {
+		CollectionLength(self.0.len() as u64).write(writer)?;
+		for entry in self.0.iter() {
+			entry.write(writer)?;
+		}
+		Ok(())
+	}
+}
+
+impl Readable for SimpleTaprootNonceEntries {
+	fn read<R: Read>(reader: &mut R) -> Result<Self, DecodeError> {
+		let len: CollectionLength = Readable::read(reader)?;
+		let mut entries = Vec::new();
+		for _ in 0..len.0 {
+			entries.push(Readable::read(reader)?);
+		}
+		Ok(Self(entries))
+	}
+}
+
+/// Restart-persisted simple-taproot commitment signatures available for retransmission.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
+pub struct SimpleTaprootSentCommitmentSignatures(pub Vec<SimpleTaprootSentCommitmentSignature>);
+
+impl SimpleTaprootSentCommitmentSignatures {
+	/// Returns a previously sent partial signature for a funding txid and nonce index.
+	pub fn get(
+		&self, funding_txid: Txid, nonce_index: u64,
+	) -> Option<SimpleTaprootPartialSignatureWithNonce> {
+		self.0
+			.iter()
+			.find(|entry| entry.funding_txid == funding_txid && entry.nonce_index == nonce_index)
+			.map(|entry| entry.partial_signature_with_nonce)
+	}
+
+	/// Inserts or replaces a sent partial signature.
+	pub fn upsert(&mut self, entry: SimpleTaprootSentCommitmentSignature) {
+		if let Some(existing) = self.0.iter_mut().find(|existing| {
+			existing.funding_txid == entry.funding_txid && existing.nonce_index == entry.nonce_index
+		}) {
+			*existing = entry;
+		} else {
+			self.0.push(entry);
+		}
+	}
+
+	/// Returns true when no signatures are stored.
+	pub fn is_empty(&self) -> bool {
+		self.0.is_empty()
+	}
+}
+
+impl Writeable for SimpleTaprootSentCommitmentSignatures {
+	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), io::Error> {
+		CollectionLength(self.0.len() as u64).write(writer)?;
+		for entry in self.0.iter() {
+			entry.write(writer)?;
+		}
+		Ok(())
+	}
+}
+
+impl Readable for SimpleTaprootSentCommitmentSignatures {
+	fn read<R: Read>(reader: &mut R) -> Result<Self, DecodeError> {
+		let len: CollectionLength = Readable::read(reader)?;
+		let mut entries = Vec::new();
+		for _ in 0..len.0 {
+			entries.push(Readable::read(reader)?);
+		}
+		Ok(Self(entries))
 	}
 }
 
@@ -326,6 +471,8 @@ impl LengthReadable for SimpleTaprootNextLocalNonces {
 pub enum SimpleTaprootNonceScope {
 	/// A commitment transaction signature nonce.
 	Commitment,
+	/// A nonce consumed while signing a counterparty commitment transaction.
+	CounterpartyCommitment,
 	/// A cooperative-close signature nonce.
 	CooperativeClose,
 	/// A force-close signature nonce.
@@ -336,16 +483,18 @@ impl SimpleTaprootNonceScope {
 	fn wire_value(self) -> u8 {
 		match self {
 			Self::Commitment => 0,
-			Self::CooperativeClose => 1,
-			Self::ForceClose => 2,
+			Self::CounterpartyCommitment => 1,
+			Self::CooperativeClose => 2,
+			Self::ForceClose => 3,
 		}
 	}
 
 	fn from_wire_value(value: u8) -> Result<Self, DecodeError> {
 		match value {
 			0 => Ok(Self::Commitment),
-			1 => Ok(Self::CooperativeClose),
-			2 => Ok(Self::ForceClose),
+			1 => Ok(Self::CounterpartyCommitment),
+			2 => Ok(Self::CooperativeClose),
+			3 => Ok(Self::ForceClose),
 			_ => Err(DecodeError::InvalidValue),
 		}
 	}
@@ -1032,6 +1181,49 @@ mod tests {
 		assert_eq!(decoded.mark_used(nonce_use), Err(SimpleTaprootMusigError::DuplicateNonceUse));
 	}
 
+	#[test]
+	fn persisted_nonce_and_sent_signature_sets_upsert_and_round_trip() {
+		let funding_txid = Txid::from_slice(&[6; 32]).unwrap();
+		let mut nonce_entries = SimpleTaprootNonceEntries::default();
+		nonce_entries
+			.upsert(SimpleTaprootNonceEntry { funding_txid, public_nonce: sample_nonce(1) });
+		nonce_entries
+			.upsert(SimpleTaprootNonceEntry { funding_txid, public_nonce: sample_nonce(2) });
+		assert_eq!(nonce_entries.0.len(), 1);
+		assert_eq!(nonce_entries.get(funding_txid), Some(sample_nonce(2)));
+		let mut encoded_nonces = Vec::new();
+		nonce_entries.write(&mut encoded_nonces).unwrap();
+		let decoded_nonces = SimpleTaprootNonceEntries::read(&mut &encoded_nonces[..]).unwrap();
+		assert_eq!(decoded_nonces, nonce_entries);
+
+		let first_signature = SimpleTaprootPartialSignatureWithNonce::new(
+			SimpleTaprootPartialSignature::from_bytes([8; MUSIG2_PARTIAL_SIGNATURE_LEN]),
+			sample_nonce(1),
+		);
+		let second_signature = SimpleTaprootPartialSignatureWithNonce::new(
+			SimpleTaprootPartialSignature::from_bytes([9; MUSIG2_PARTIAL_SIGNATURE_LEN]),
+			sample_nonce(2),
+		);
+		let mut sent_signatures = SimpleTaprootSentCommitmentSignatures::default();
+		sent_signatures.upsert(SimpleTaprootSentCommitmentSignature {
+			funding_txid,
+			nonce_index: 42,
+			partial_signature_with_nonce: first_signature,
+		});
+		sent_signatures.upsert(SimpleTaprootSentCommitmentSignature {
+			funding_txid,
+			nonce_index: 42,
+			partial_signature_with_nonce: second_signature,
+		});
+		assert_eq!(sent_signatures.0.len(), 1);
+		assert_eq!(sent_signatures.get(funding_txid, 42), Some(second_signature));
+		let mut encoded_signatures = Vec::new();
+		sent_signatures.write(&mut encoded_signatures).unwrap();
+		let decoded_signatures =
+			SimpleTaprootSentCommitmentSignatures::read(&mut &encoded_signatures[..]).unwrap();
+		assert_eq!(decoded_signatures, sent_signatures);
+	}
+
 	#[cfg(feature = "simple_taproot_musig2")]
 	#[test]
 	fn musig2_signatures_aggregate_and_verify() {
@@ -1269,6 +1461,11 @@ mod tests {
 		let funding_txid = Txid::from_slice(&[10; 32]).unwrap();
 		let commitment_use =
 			SimpleTaprootNonceUse::new(funding_txid, 11, SimpleTaprootNonceScope::Commitment);
+		let counterparty_commitment_use = SimpleTaprootNonceUse::new(
+			funding_txid,
+			11,
+			SimpleTaprootNonceScope::CounterpartyCommitment,
+		);
 		let close_use =
 			SimpleTaprootNonceUse::new(funding_txid, 11, SimpleTaprootNonceScope::CooperativeClose);
 		let force_close_use =
@@ -1277,12 +1474,19 @@ mod tests {
 		let commitment_seed = [12; 32];
 		let commitment_nonce_seed =
 			derive_simple_taproot_counter_nonce_seed(&commitment_seed, &commitment_use);
+		let counterparty_commitment_nonce_seed = derive_simple_taproot_counter_nonce_seed(
+			&commitment_seed,
+			&counterparty_commitment_use,
+		);
 		let close_nonce_seed =
 			derive_simple_taproot_counter_nonce_seed(&commitment_seed, &close_use);
 		let force_close_nonce_seed =
 			derive_simple_taproot_counter_nonce_seed(&commitment_seed, &force_close_use);
+		assert_ne!(commitment_nonce_seed, counterparty_commitment_nonce_seed);
 		assert_ne!(commitment_nonce_seed, close_nonce_seed);
 		assert_ne!(commitment_nonce_seed, force_close_nonce_seed);
+		assert_ne!(counterparty_commitment_nonce_seed, close_nonce_seed);
+		assert_ne!(counterparty_commitment_nonce_seed, force_close_nonce_seed);
 		assert_ne!(close_nonce_seed, force_close_nonce_seed);
 
 		let jit_nonce_seed = derive_simple_taproot_jit_nonce_seed(&[13; 32], &commitment_use);
