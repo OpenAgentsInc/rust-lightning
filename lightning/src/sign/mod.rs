@@ -53,6 +53,13 @@ use crate::ln::channel_keys::{
 use crate::ln::inbound_payment::ExpandedKey;
 use crate::ln::msgs::{UnsignedChannelAnnouncement, UnsignedGossipMessage};
 use crate::ln::script::ShutdownScript;
+#[cfg(feature = "simple_taproot_musig2")]
+use crate::ln::simple_taproot::{
+	derive_simple_taproot_counter_nonce_seed, derive_simple_taproot_jit_nonce_seed,
+	Musig2PublicNonce, SimpleTaprootKeyAggContext, SimpleTaprootMusigError, SimpleTaprootNoncePair,
+	SimpleTaprootNonceScope, SimpleTaprootNonceState, SimpleTaprootNonceUse,
+	SimpleTaprootPartialSignatureWithNonce, SimpleTaprootSecretNonce,
+};
 use crate::offers::invoice::UnsignedBolt12Invoice;
 use crate::types::features::ChannelTypeFeatures;
 use crate::types::payment::PaymentPreimage;
@@ -829,6 +836,38 @@ pub trait ChannelSigner {
 	fn channel_keys_id(&self) -> [u8; 32];
 }
 
+/// A signer extension for BOLT simple-taproot MuSig2 funding signatures.
+#[cfg(feature = "simple_taproot_musig2")]
+pub trait SimpleTaprootChannelSigner: ChannelSigner {
+	/// Builds the sorted MuSig2 key aggregation context for a simple-taproot funding key pair.
+	fn simple_taproot_key_agg_context(
+		&self, counterparty_funding_pubkey: PublicKey, splice_parent_funding_txid: Option<Txid>,
+		secp_ctx: &Secp256k1<All>,
+	) -> Result<SimpleTaprootKeyAggContext, SimpleTaprootMusigError>;
+
+	/// Derives a counter-based nonce pair from the signer's channel commitment seed.
+	fn simple_taproot_counter_nonce_pair(
+		&self, counterparty_funding_pubkey: PublicKey, funding_txid: Txid, nonce_index: u64,
+		scope: SimpleTaprootNonceScope, message: &[u8], splice_parent_funding_txid: Option<Txid>,
+		secp_ctx: &Secp256k1<All>,
+	) -> Result<SimpleTaprootNoncePair, SimpleTaprootMusigError>;
+
+	/// Derives a JIT nonce pair from caller-supplied entropy.
+	fn simple_taproot_jit_nonce_pair(
+		&self, counterparty_funding_pubkey: PublicKey, funding_txid: Txid, nonce_index: u64,
+		scope: SimpleTaprootNonceScope, entropy: &[u8; 32], message: &[u8],
+		splice_parent_funding_txid: Option<Txid>, secp_ctx: &Secp256k1<All>,
+	) -> Result<SimpleTaprootNoncePair, SimpleTaprootMusigError>;
+
+	/// Produces a MuSig2 partial signature and records the nonce as consumed.
+	fn simple_taproot_sign_partial(
+		&self, counterparty_funding_pubkey: PublicKey, secret_nonce: SimpleTaprootSecretNonce,
+		public_nonces: &[Musig2PublicNonce], message: &[u8], funding_txid: Txid, nonce_index: u64,
+		scope: SimpleTaprootNonceScope, splice_parent_funding_txid: Option<Txid>,
+		secp_ctx: &Secp256k1<All>, nonce_state: &mut SimpleTaprootNonceState,
+	) -> Result<SimpleTaprootPartialSignatureWithNonce, SimpleTaprootMusigError>;
+}
+
 /// Represents the secret key material used for encrypting Peer Storage.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct PeerStorageKey {
@@ -1372,6 +1411,18 @@ impl InMemorySigner {
 		self.funding_key.with_tweak(tweak)
 	}
 
+	#[cfg(feature = "simple_taproot_musig2")]
+	fn simple_taproot_funding_secret_and_context(
+		&self, counterparty_funding_pubkey: PublicKey, splice_parent_funding_txid: Option<Txid>,
+		secp_ctx: &Secp256k1<All>,
+	) -> Result<(SecretKey, SimpleTaprootKeyAggContext), SimpleTaprootMusigError> {
+		let funding_secret = self.funding_key(splice_parent_funding_txid);
+		let funding_pubkey = PublicKey::from_secret_key(secp_ctx, &funding_secret);
+		let key_agg_ctx =
+			SimpleTaprootKeyAggContext::new(vec![funding_pubkey, counterparty_funding_pubkey])?;
+		Ok((funding_secret, key_agg_ctx))
+	}
+
 	/// Sign the single input of `spend_tx` at index `input_idx`, which spends the output described
 	/// by `descriptor`, returning the witness stack for the input.
 	///
@@ -1588,6 +1639,74 @@ impl ChannelSigner for InMemorySigner {
 
 	fn channel_keys_id(&self) -> [u8; 32] {
 		self.channel_keys_id
+	}
+}
+
+#[cfg(feature = "simple_taproot_musig2")]
+impl SimpleTaprootChannelSigner for InMemorySigner {
+	fn simple_taproot_key_agg_context(
+		&self, counterparty_funding_pubkey: PublicKey, splice_parent_funding_txid: Option<Txid>,
+		secp_ctx: &Secp256k1<All>,
+	) -> Result<SimpleTaprootKeyAggContext, SimpleTaprootMusigError> {
+		self.simple_taproot_funding_secret_and_context(
+			counterparty_funding_pubkey,
+			splice_parent_funding_txid,
+			secp_ctx,
+		)
+		.map(|(_, key_agg_ctx)| key_agg_ctx)
+	}
+
+	fn simple_taproot_counter_nonce_pair(
+		&self, counterparty_funding_pubkey: PublicKey, funding_txid: Txid, nonce_index: u64,
+		scope: SimpleTaprootNonceScope, message: &[u8], splice_parent_funding_txid: Option<Txid>,
+		secp_ctx: &Secp256k1<All>,
+	) -> Result<SimpleTaprootNoncePair, SimpleTaprootMusigError> {
+		let (funding_secret, key_agg_ctx) = self.simple_taproot_funding_secret_and_context(
+			counterparty_funding_pubkey,
+			splice_parent_funding_txid,
+			secp_ctx,
+		)?;
+		let nonce_use = SimpleTaprootNonceUse::new(funding_txid, nonce_index, scope);
+		let nonce_seed =
+			derive_simple_taproot_counter_nonce_seed(&self.commitment_seed, &nonce_use);
+		key_agg_ctx.generate_nonce_pair(&funding_secret, nonce_seed, message, &nonce_use)
+	}
+
+	fn simple_taproot_jit_nonce_pair(
+		&self, counterparty_funding_pubkey: PublicKey, funding_txid: Txid, nonce_index: u64,
+		scope: SimpleTaprootNonceScope, entropy: &[u8; 32], message: &[u8],
+		splice_parent_funding_txid: Option<Txid>, secp_ctx: &Secp256k1<All>,
+	) -> Result<SimpleTaprootNoncePair, SimpleTaprootMusigError> {
+		let (funding_secret, key_agg_ctx) = self.simple_taproot_funding_secret_and_context(
+			counterparty_funding_pubkey,
+			splice_parent_funding_txid,
+			secp_ctx,
+		)?;
+		let nonce_use = SimpleTaprootNonceUse::new(funding_txid, nonce_index, scope);
+		let nonce_seed = derive_simple_taproot_jit_nonce_seed(entropy, &nonce_use);
+		key_agg_ctx.generate_nonce_pair(&funding_secret, nonce_seed, message, &nonce_use)
+	}
+
+	fn simple_taproot_sign_partial(
+		&self, counterparty_funding_pubkey: PublicKey, secret_nonce: SimpleTaprootSecretNonce,
+		public_nonces: &[Musig2PublicNonce], message: &[u8], funding_txid: Txid, nonce_index: u64,
+		scope: SimpleTaprootNonceScope, splice_parent_funding_txid: Option<Txid>,
+		secp_ctx: &Secp256k1<All>, nonce_state: &mut SimpleTaprootNonceState,
+	) -> Result<SimpleTaprootPartialSignatureWithNonce, SimpleTaprootMusigError> {
+		let (funding_secret, key_agg_ctx) = self.simple_taproot_funding_secret_and_context(
+			counterparty_funding_pubkey,
+			splice_parent_funding_txid,
+			secp_ctx,
+		)?;
+		let nonce_use = SimpleTaprootNonceUse::new(funding_txid, nonce_index, scope);
+		key_agg_ctx.sign_partial(
+			&funding_secret,
+			secret_nonce,
+			public_nonces,
+			message,
+			nonce_use,
+			nonce_state,
+		)
 	}
 }
 
@@ -2706,6 +2825,135 @@ impl EntropySource for RandomBytes {
 		apply_chacha20(self.seed, nonce, &mut chacha_bytes);
 		chacha_bytes
 	}
+}
+
+#[cfg(all(test, feature = "simple_taproot_musig2"))]
+#[test]
+pub fn simple_taproot_in_memory_signer_interface_signs_and_rejects_reuse() {
+	let secp_ctx = Secp256k1::new();
+	let make_secret = |byte| SecretKey::from_slice(&[byte; 32]).unwrap();
+	let make_signer = |offset| {
+		InMemorySigner::new(
+			make_secret(offset),
+			make_secret(offset + 1),
+			make_secret(offset + 2),
+			make_secret(offset + 3),
+			false,
+			make_secret(offset + 4),
+			make_secret(offset + 5),
+			[offset + 6; 32],
+			[offset + 7; 32],
+			[offset + 8; 32],
+		)
+	};
+
+	let alice_signer = make_signer(1);
+	let bob_signer = make_signer(21);
+	let alice_pubkey = PublicKey::from_secret_key(&secp_ctx, &alice_signer.funding_key(None));
+	let bob_pubkey = PublicKey::from_secret_key(&secp_ctx, &bob_signer.funding_key(None));
+	let funding_txid = Txid::from_slice(&[42; 32]).unwrap();
+	let message = Sha256::hash(b"in-memory simple taproot signer").to_byte_array();
+
+	let alice_nonce = alice_signer
+		.simple_taproot_jit_nonce_pair(
+			bob_pubkey,
+			funding_txid,
+			3,
+			SimpleTaprootNonceScope::Commitment,
+			&[100; 32],
+			&message,
+			None,
+			&secp_ctx,
+		)
+		.unwrap();
+	let bob_nonce = bob_signer
+		.simple_taproot_counter_nonce_pair(
+			alice_pubkey,
+			funding_txid,
+			3,
+			SimpleTaprootNonceScope::Commitment,
+			&message,
+			None,
+			&secp_ctx,
+		)
+		.unwrap();
+	let public_nonces = [alice_nonce.public_nonce, bob_nonce.public_nonce];
+
+	let mut alice_nonce_state = SimpleTaprootNonceState::new();
+	let alice_partial = alice_signer
+		.simple_taproot_sign_partial(
+			bob_pubkey,
+			alice_nonce.secret_nonce.clone(),
+			&public_nonces,
+			&message,
+			funding_txid,
+			3,
+			SimpleTaprootNonceScope::Commitment,
+			None,
+			&secp_ctx,
+			&mut alice_nonce_state,
+		)
+		.unwrap();
+	assert_eq!(
+		alice_signer.simple_taproot_sign_partial(
+			bob_pubkey,
+			alice_nonce.secret_nonce,
+			&public_nonces,
+			&message,
+			funding_txid,
+			3,
+			SimpleTaprootNonceScope::Commitment,
+			None,
+			&secp_ctx,
+			&mut alice_nonce_state,
+		),
+		Err(SimpleTaprootMusigError::DuplicateNonceUse)
+	);
+
+	let mut bob_nonce_state = SimpleTaprootNonceState::new();
+	let bob_partial = bob_signer
+		.simple_taproot_sign_partial(
+			alice_pubkey,
+			bob_nonce.secret_nonce,
+			&public_nonces,
+			&message,
+			funding_txid,
+			3,
+			SimpleTaprootNonceScope::Commitment,
+			None,
+			&secp_ctx,
+			&mut bob_nonce_state,
+		)
+		.unwrap();
+
+	let key_agg_ctx =
+		alice_signer.simple_taproot_key_agg_context(bob_pubkey, None, &secp_ctx).unwrap();
+	key_agg_ctx
+		.verify_partial(
+			&alice_pubkey,
+			&alice_partial.public_nonce,
+			&alice_partial.partial_signature,
+			&public_nonces,
+			&message,
+		)
+		.unwrap();
+	key_agg_ctx
+		.verify_partial(
+			&bob_pubkey,
+			&bob_partial.public_nonce,
+			&bob_partial.partial_signature,
+			&public_nonces,
+			&message,
+		)
+		.unwrap();
+	let final_signature = key_agg_ctx
+		.aggregate_final_signature(
+			&[alice_partial.partial_signature, bob_partial.partial_signature],
+			&public_nonces,
+			&message,
+		)
+		.unwrap();
+	key_agg_ctx.verify_final_signature(&final_signature, &message).unwrap();
 }
 
 // Ensure that EcdsaChannelSigner can have a vtable

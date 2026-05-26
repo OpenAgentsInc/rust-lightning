@@ -11,17 +11,28 @@
 //!
 //! These types intentionally cover only the fixed-width TLV payloads defined by
 //! the draft simple-taproot BOLT. They provide native LDK serialization,
-//! fixed-length validation, and public nonce parsing for the message-level
-//! integration. They do not perform MuSig2 signing or partial-signature
-//! verification.
+//! fixed-length validation, and public nonce parsing. When the
+//! `simple_taproot_musig2` feature is enabled, this module also exposes the
+//! first native MuSig2 signing/session primitives needed by simple-taproot
+//! channel integration.
 
 use bitcoin::hash_types::Txid;
+#[cfg(feature = "simple_taproot_musig2")]
+use bitcoin::hashes::hmac::{Hmac, HmacEngine};
+#[cfg(feature = "simple_taproot_musig2")]
+use bitcoin::hashes::sha256::Hash as Sha256;
+#[cfg(feature = "simple_taproot_musig2")]
+use bitcoin::hashes::{Hash, HashEngine};
 use bitcoin::secp256k1::PublicKey;
+#[cfg(feature = "simple_taproot_musig2")]
+use bitcoin::secp256k1::{schnorr, SecretKey, XOnlyPublicKey};
 
 use crate::io::{self, Read};
 use crate::ln::msgs::DecodeError;
 use crate::prelude::*;
-use crate::util::ser::{LengthLimitedRead, LengthReadable, Readable, Writeable, Writer};
+use crate::util::ser::{
+	CollectionLength, LengthLimitedRead, LengthReadable, Readable, Writeable, Writer,
+};
 
 /// TLV type for `partial_signature_with_nonce`.
 pub const PARTIAL_SIGNATURE_WITH_NONCE_TLV_TYPE: u64 = 2;
@@ -45,9 +56,26 @@ pub const CLOSING_CLOSER_AND_CLOSEE_OUTPUTS_TLV_TYPE: u64 = 7;
 pub const MUSIG2_PUBLIC_NONCE_LEN: usize = 66;
 /// Byte length of a BIP-327 MuSig2 partial signature scalar.
 pub const MUSIG2_PARTIAL_SIGNATURE_LEN: usize = 32;
+/// Byte length of a BIP-327 MuSig2 secret nonce.
+pub const MUSIG2_SECRET_NONCE_LEN: usize = 97;
 /// Byte length of `partial_signature || public_nonce`.
 pub const MUSIG2_PARTIAL_SIGNATURE_WITH_NONCE_LEN: usize =
 	MUSIG2_PARTIAL_SIGNATURE_LEN + MUSIG2_PUBLIC_NONCE_LEN;
+
+/// Errors surfaced by the simple-taproot MuSig2 session helpers.
+#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
+pub enum SimpleTaprootMusigError {
+	/// A funding, aggregate, or secret key could not be parsed or used.
+	InvalidKey,
+	/// A public, aggregate, or secret nonce could not be parsed or used.
+	InvalidNonce,
+	/// A partial or final Schnorr signature failed parsing or verification.
+	InvalidSignature,
+	/// The signing state already consumed this nonce use.
+	DuplicateNonceUse,
+	/// A signer set was empty where at least one key was required.
+	EmptySignerSet,
+}
 
 /// A BIP-327 MuSig2 public nonce encoded as two compressed secp256k1 points.
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
@@ -74,6 +102,24 @@ impl Musig2PublicNonce {
 	/// Returns the fixed-width wire bytes.
 	pub fn as_bytes(&self) -> &[u8; MUSIG2_PUBLIC_NONCE_LEN] {
 		&self.0
+	}
+
+	/// Builds a public nonce from two public nonce points.
+	pub fn from_points(first: &PublicKey, second: &PublicKey) -> Self {
+		let mut bytes = [0; MUSIG2_PUBLIC_NONCE_LEN];
+		bytes[..33].copy_from_slice(&first.serialize());
+		bytes[33..].copy_from_slice(&second.serialize());
+		Self(bytes)
+	}
+
+	/// Returns the two public nonce points.
+	pub fn points(&self) -> Result<(PublicKey, PublicKey), SimpleTaprootMusigError> {
+		Ok((
+			PublicKey::from_slice(&self.0[..33])
+				.map_err(|_| SimpleTaprootMusigError::InvalidNonce)?,
+			PublicKey::from_slice(&self.0[33..])
+				.map_err(|_| SimpleTaprootMusigError::InvalidNonce)?,
+		))
 	}
 }
 
@@ -222,6 +268,423 @@ impl LengthReadable for SimpleTaprootNextLocalNonces {
 	}
 }
 
+/// The simple-taproot signing path that a MuSig2 nonce is assigned to.
+#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
+pub enum SimpleTaprootNonceScope {
+	/// A commitment transaction signature nonce.
+	Commitment,
+	/// A cooperative-close signature nonce.
+	CooperativeClose,
+	/// A force-close signature nonce.
+	ForceClose,
+}
+
+impl SimpleTaprootNonceScope {
+	fn wire_value(self) -> u8 {
+		match self {
+			Self::Commitment => 0,
+			Self::CooperativeClose => 1,
+			Self::ForceClose => 2,
+		}
+	}
+
+	fn from_wire_value(value: u8) -> Result<Self, DecodeError> {
+		match value {
+			0 => Ok(Self::Commitment),
+			1 => Ok(Self::CooperativeClose),
+			2 => Ok(Self::ForceClose),
+			_ => Err(DecodeError::InvalidValue),
+		}
+	}
+}
+
+impl Writeable for SimpleTaprootNonceScope {
+	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), io::Error> {
+		self.wire_value().write(writer)
+	}
+}
+
+impl Readable for SimpleTaprootNonceScope {
+	fn read<R: Read>(reader: &mut R) -> Result<Self, DecodeError> {
+		Self::from_wire_value(Readable::read(reader)?)
+	}
+}
+
+/// A unique MuSig2 nonce use within a simple-taproot channel.
+#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
+pub struct SimpleTaprootNonceUse {
+	/// Funding transaction ID for the channel or splice being signed.
+	pub funding_txid: Txid,
+	/// Commitment or close nonce index.
+	pub nonce_index: u64,
+	/// Signing path using this nonce.
+	pub scope: SimpleTaprootNonceScope,
+}
+
+impl SimpleTaprootNonceUse {
+	/// Builds a nonce-use key.
+	pub fn new(funding_txid: Txid, nonce_index: u64, scope: SimpleTaprootNonceScope) -> Self {
+		Self { funding_txid, nonce_index, scope }
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	fn extra_input(&self) -> [u8; 41] {
+		let mut extra_input = [0; 41];
+		extra_input[..32].copy_from_slice(self.funding_txid.as_byte_array());
+		extra_input[32..40].copy_from_slice(&self.nonce_index.to_be_bytes());
+		extra_input[40] = self.scope.wire_value();
+		extra_input
+	}
+}
+
+impl Writeable for SimpleTaprootNonceUse {
+	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), io::Error> {
+		self.funding_txid.write(writer)?;
+		self.nonce_index.write(writer)?;
+		self.scope.write(writer)
+	}
+}
+
+impl Readable for SimpleTaprootNonceUse {
+	fn read<R: Read>(reader: &mut R) -> Result<Self, DecodeError> {
+		Ok(Self {
+			funding_txid: Readable::read(reader)?,
+			nonce_index: Readable::read(reader)?,
+			scope: Readable::read(reader)?,
+		})
+	}
+}
+
+/// Restart-persistable record of MuSig2 nonces already consumed for signing.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
+pub struct SimpleTaprootNonceState {
+	used_nonces: Vec<SimpleTaprootNonceUse>,
+}
+
+impl SimpleTaprootNonceState {
+	/// Builds an empty nonce-use state.
+	pub fn new() -> Self {
+		Self { used_nonces: Vec::new() }
+	}
+
+	/// Returns the nonce-use records already consumed for signing.
+	pub fn used_nonces(&self) -> &[SimpleTaprootNonceUse] {
+		&self.used_nonces
+	}
+
+	/// Returns true if this nonce use has already been consumed.
+	pub fn is_used(&self, nonce_use: &SimpleTaprootNonceUse) -> bool {
+		self.used_nonces.iter().any(|used| used == nonce_use)
+	}
+
+	/// Marks a nonce use as consumed, rejecting duplicate use.
+	pub fn mark_used(
+		&mut self, nonce_use: SimpleTaprootNonceUse,
+	) -> Result<(), SimpleTaprootMusigError> {
+		if self.is_used(&nonce_use) {
+			return Err(SimpleTaprootMusigError::DuplicateNonceUse);
+		}
+		self.used_nonces.push(nonce_use);
+		Ok(())
+	}
+}
+
+impl Writeable for SimpleTaprootNonceState {
+	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), io::Error> {
+		CollectionLength(self.used_nonces.len() as u64).write(writer)?;
+		for nonce_use in self.used_nonces.iter() {
+			nonce_use.write(writer)?;
+		}
+		Ok(())
+	}
+}
+
+impl Readable for SimpleTaprootNonceState {
+	fn read<R: Read>(reader: &mut R) -> Result<Self, DecodeError> {
+		let len: CollectionLength = Readable::read(reader)?;
+		let mut used_nonces = Vec::new();
+		for _ in 0..len.0 {
+			used_nonces.push(Readable::read(reader)?);
+		}
+		Ok(Self { used_nonces })
+	}
+}
+
+/// A BIP-327 MuSig2 secret nonce.
+#[cfg(feature = "simple_taproot_musig2")]
+#[derive(Clone, PartialEq, Eq)]
+pub struct SimpleTaprootSecretNonce([u8; MUSIG2_SECRET_NONCE_LEN]);
+
+#[cfg(feature = "simple_taproot_musig2")]
+impl core::fmt::Debug for SimpleTaprootSecretNonce {
+	fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> Result<(), core::fmt::Error> {
+		formatter.write_str("SimpleTaprootSecretNonce(<redacted>)")
+	}
+}
+
+#[cfg(feature = "simple_taproot_musig2")]
+impl SimpleTaprootSecretNonce {
+	/// Builds a secret nonce after validating the BIP-327 encoding.
+	pub fn from_bytes(
+		bytes: [u8; MUSIG2_SECRET_NONCE_LEN],
+	) -> Result<Self, SimpleTaprootMusigError> {
+		musig2::SecNonce::from_bytes(&bytes).map_err(|_| SimpleTaprootMusigError::InvalidNonce)?;
+		Ok(Self(bytes))
+	}
+
+	/// Returns the fixed-width secret nonce bytes.
+	pub fn as_bytes(&self) -> &[u8; MUSIG2_SECRET_NONCE_LEN] {
+		&self.0
+	}
+
+	/// Returns the public nonce corresponding to this secret nonce.
+	pub fn public_nonce(&self) -> Result<Musig2PublicNonce, SimpleTaprootMusigError> {
+		let secret_nonce = self.to_musig2()?;
+		musig_public_nonce_to_wire(&secret_nonce.public_nonce())
+	}
+
+	fn from_musig2(secret_nonce: musig2::SecNonce) -> Self {
+		Self(secret_nonce.serialize())
+	}
+
+	fn to_musig2(&self) -> Result<musig2::SecNonce, SimpleTaprootMusigError> {
+		musig2::SecNonce::from_bytes(&self.0).map_err(|_| SimpleTaprootMusigError::InvalidNonce)
+	}
+}
+
+/// A generated simple-taproot MuSig2 nonce pair.
+#[cfg(feature = "simple_taproot_musig2")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SimpleTaprootNoncePair {
+	/// Secret nonce. This must be consumed at most once.
+	pub secret_nonce: SimpleTaprootSecretNonce,
+	/// Public nonce to share with the counterparty.
+	pub public_nonce: Musig2PublicNonce,
+}
+
+/// A sorted MuSig2 key aggregation context for simple-taproot funding keys.
+#[cfg(feature = "simple_taproot_musig2")]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct SimpleTaprootKeyAggContext {
+	sorted_pubkeys: Vec<PublicKey>,
+}
+
+#[cfg(feature = "simple_taproot_musig2")]
+impl SimpleTaprootKeyAggContext {
+	/// Builds a key aggregation context after BIP-327 key sorting.
+	pub fn new(mut pubkeys: Vec<PublicKey>) -> Result<Self, SimpleTaprootMusigError> {
+		if pubkeys.is_empty() {
+			return Err(SimpleTaprootMusigError::EmptySignerSet);
+		}
+		pubkeys.sort_by(|a, b| a.serialize().cmp(&b.serialize()));
+		Ok(Self { sorted_pubkeys: pubkeys })
+	}
+
+	/// Builds a two-party funding-key aggregation context.
+	pub fn for_funding_keys(local: PublicKey, remote: PublicKey) -> Self {
+		Self::new(vec![local, remote]).expect("two funding keys are never empty")
+	}
+
+	/// Returns the sorted funding keys used by this aggregation context.
+	pub fn sorted_pubkeys(&self) -> &[PublicKey] {
+		&self.sorted_pubkeys
+	}
+
+	/// Returns the aggregate x-only public key.
+	pub fn aggregate_xonly_public_key(&self) -> Result<XOnlyPublicKey, SimpleTaprootMusigError> {
+		let musig_ctx = self.musig_context()?;
+		let aggregate: musig2::secp::Point = musig_ctx.aggregated_pubkey();
+		XOnlyPublicKey::from_slice(&aggregate.serialize_xonly())
+			.map_err(|_| SimpleTaprootMusigError::InvalidKey)
+	}
+
+	/// Generates a BIP-327 secret/public nonce pair from caller-supplied entropy.
+	pub fn generate_nonce_pair(
+		&self, signer_secret_key: &SecretKey, nonce_seed: [u8; 32], message: &[u8],
+		nonce_use: &SimpleTaprootNonceUse,
+	) -> Result<SimpleTaprootNoncePair, SimpleTaprootMusigError> {
+		let signer_scalar = musig_scalar(signer_secret_key)?;
+		let musig_ctx = self.musig_context()?;
+		let aggregate: musig2::secp::Point = musig_ctx.aggregated_pubkey();
+		let extra_input = nonce_use.extra_input();
+		let secret_nonce =
+			musig2::SecNonce::generate(nonce_seed, signer_scalar, aggregate, message, extra_input);
+		let public_nonce = musig_public_nonce_to_wire(&secret_nonce.public_nonce())?;
+		Ok(SimpleTaprootNoncePair {
+			secret_nonce: SimpleTaprootSecretNonce::from_musig2(secret_nonce),
+			public_nonce,
+		})
+	}
+
+	/// Signs a message with a fresh secret nonce and records the nonce as consumed.
+	pub fn sign_partial(
+		&self, signer_secret_key: &SecretKey, secret_nonce: SimpleTaprootSecretNonce,
+		public_nonces: &[Musig2PublicNonce], message: &[u8], nonce_use: SimpleTaprootNonceUse,
+		nonce_state: &mut SimpleTaprootNonceState,
+	) -> Result<SimpleTaprootPartialSignatureWithNonce, SimpleTaprootMusigError> {
+		if nonce_state.is_used(&nonce_use) {
+			return Err(SimpleTaprootMusigError::DuplicateNonceUse);
+		}
+		let secret_nonce = secret_nonce.to_musig2()?;
+		let local_public_nonce = musig_public_nonce_to_wire(&secret_nonce.public_nonce())?;
+		let aggregate_nonce = aggregate_musig_public_nonces(public_nonces)?;
+		let signer_scalar = musig_scalar(signer_secret_key)?;
+		let musig_ctx = self.musig_context()?;
+		let partial_signature: musig2::PartialSignature = musig2::sign_partial(
+			&musig_ctx,
+			signer_scalar,
+			secret_nonce,
+			&aggregate_nonce,
+			message,
+		)
+		.map_err(|_| SimpleTaprootMusigError::InvalidSignature)?;
+		nonce_state.mark_used(nonce_use)?;
+		Ok(SimpleTaprootPartialSignatureWithNonce::new(
+			SimpleTaprootPartialSignature::from_bytes(partial_signature.serialize()),
+			local_public_nonce,
+		))
+	}
+
+	/// Verifies a peer's MuSig2 partial signature.
+	pub fn verify_partial(
+		&self, signer_pubkey: &PublicKey, signer_public_nonce: &Musig2PublicNonce,
+		partial_signature: &SimpleTaprootPartialSignature, public_nonces: &[Musig2PublicNonce],
+		message: &[u8],
+	) -> Result<(), SimpleTaprootMusigError> {
+		let musig_ctx = self.musig_context()?;
+		let aggregate_nonce = aggregate_musig_public_nonces(public_nonces)?;
+		let signer_pubkey = musig_point(signer_pubkey)?;
+		let signer_public_nonce = musig_public_nonce_from_wire(signer_public_nonce)?;
+		let partial_signature = musig_partial_signature(partial_signature)?;
+		musig2::verify_partial(
+			&musig_ctx,
+			partial_signature,
+			&aggregate_nonce,
+			signer_pubkey,
+			&signer_public_nonce,
+			message,
+		)
+		.map_err(|_| SimpleTaprootMusigError::InvalidSignature)
+	}
+
+	/// Aggregates verified MuSig2 partial signatures into a final Schnorr signature.
+	pub fn aggregate_final_signature(
+		&self, partial_signatures: &[SimpleTaprootPartialSignature],
+		public_nonces: &[Musig2PublicNonce], message: &[u8],
+	) -> Result<schnorr::Signature, SimpleTaprootMusigError> {
+		let musig_ctx = self.musig_context()?;
+		let aggregate_nonce = aggregate_musig_public_nonces(public_nonces)?;
+		let mut signatures = Vec::new();
+		for partial_signature in partial_signatures.iter() {
+			signatures.push(musig_partial_signature(partial_signature)?);
+		}
+		let final_signature: musig2::CompactSignature =
+			musig2::aggregate_partial_signatures(&musig_ctx, &aggregate_nonce, signatures, message)
+				.map_err(|_| SimpleTaprootMusigError::InvalidSignature)?;
+		schnorr::Signature::from_slice(&final_signature.serialize())
+			.map_err(|_| SimpleTaprootMusigError::InvalidSignature)
+	}
+
+	/// Verifies an aggregated Schnorr signature against this aggregate key.
+	pub fn verify_final_signature(
+		&self, signature: &schnorr::Signature, message: &[u8],
+	) -> Result<(), SimpleTaprootMusigError> {
+		let musig_ctx = self.musig_context()?;
+		let aggregate: musig2::secp::Point = musig_ctx.aggregated_pubkey();
+		musig2::verify_single(aggregate, signature.serialize(), message)
+			.map_err(|_| SimpleTaprootMusigError::InvalidSignature)
+	}
+
+	fn musig_context(&self) -> Result<musig2::KeyAggContext, SimpleTaprootMusigError> {
+		let mut points = Vec::new();
+		for pubkey in self.sorted_pubkeys.iter() {
+			points.push(musig_point(pubkey)?);
+		}
+		musig2::KeyAggContext::new(points).map_err(|_| SimpleTaprootMusigError::InvalidKey)
+	}
+}
+
+/// Derives a deterministic simple-taproot counter nonce seed from LDK's shachain seed.
+#[cfg(feature = "simple_taproot_musig2")]
+pub fn derive_simple_taproot_counter_nonce_seed(
+	commitment_seed: &[u8; 32], nonce_use: &SimpleTaprootNonceUse,
+) -> [u8; 32] {
+	let mut root_key = Vec::new();
+	root_key.extend_from_slice(b"taproot-rev-root");
+	root_key.extend_from_slice(nonce_use.funding_txid.as_byte_array());
+	let mut root_hmac = HmacEngine::<Sha256>::new(&root_key);
+	root_hmac.input(&Sha256::hash(commitment_seed).to_byte_array());
+	let musig2_shachain_root = Hmac::from_engine(root_hmac).to_byte_array();
+
+	let commitment_secret =
+		crate::ln::chan_utils::build_commitment_secret(commitment_seed, nonce_use.nonce_index);
+	let mut leaf_hmac = HmacEngine::<Sha256>::new(&musig2_shachain_root);
+	leaf_hmac.input(&commitment_secret);
+	leaf_hmac.input(&[nonce_use.scope.wire_value()]);
+	Hmac::from_engine(leaf_hmac).to_byte_array()
+}
+
+/// Derives a domain-separated JIT nonce seed from caller-supplied entropy.
+#[cfg(feature = "simple_taproot_musig2")]
+pub fn derive_simple_taproot_jit_nonce_seed(
+	entropy: &[u8; 32], nonce_use: &SimpleTaprootNonceUse,
+) -> [u8; 32] {
+	let mut hmac = HmacEngine::<Sha256>::new(b"simple-taproot-jit-nonce");
+	hmac.input(entropy);
+	hmac.input(&nonce_use.extra_input());
+	Hmac::from_engine(hmac).to_byte_array()
+}
+
+#[cfg(feature = "simple_taproot_musig2")]
+fn musig_point(pubkey: &PublicKey) -> Result<musig2::secp::Point, SimpleTaprootMusigError> {
+	musig2::secp::Point::from_slice(&pubkey.serialize())
+		.map_err(|_| SimpleTaprootMusigError::InvalidKey)
+}
+
+#[cfg(feature = "simple_taproot_musig2")]
+fn musig_scalar(secret_key: &SecretKey) -> Result<musig2::secp::Scalar, SimpleTaprootMusigError> {
+	musig2::secp::Scalar::from_slice(&secret_key.secret_bytes())
+		.map_err(|_| SimpleTaprootMusigError::InvalidKey)
+}
+
+#[cfg(feature = "simple_taproot_musig2")]
+fn musig_public_nonce_from_wire(
+	nonce: &Musig2PublicNonce,
+) -> Result<musig2::PubNonce, SimpleTaprootMusigError> {
+	musig2::PubNonce::from_bytes(nonce.as_bytes())
+		.map_err(|_| SimpleTaprootMusigError::InvalidNonce)
+}
+
+#[cfg(feature = "simple_taproot_musig2")]
+fn musig_public_nonce_to_wire(
+	nonce: &musig2::PubNonce,
+) -> Result<Musig2PublicNonce, SimpleTaprootMusigError> {
+	Musig2PublicNonce::from_bytes(nonce.serialize())
+		.map_err(|_| SimpleTaprootMusigError::InvalidNonce)
+}
+
+#[cfg(feature = "simple_taproot_musig2")]
+fn musig_partial_signature(
+	partial_signature: &SimpleTaprootPartialSignature,
+) -> Result<musig2::PartialSignature, SimpleTaprootMusigError> {
+	musig2::secp::MaybeScalar::from_slice(partial_signature.as_bytes())
+		.map_err(|_| SimpleTaprootMusigError::InvalidSignature)
+}
+
+#[cfg(feature = "simple_taproot_musig2")]
+fn aggregate_musig_public_nonces(
+	public_nonces: &[Musig2PublicNonce],
+) -> Result<musig2::AggNonce, SimpleTaprootMusigError> {
+	if public_nonces.is_empty() {
+		return Err(SimpleTaprootMusigError::InvalidNonce);
+	}
+	let mut parsed_nonces = Vec::new();
+	for nonce in public_nonces.iter() {
+		parsed_nonces.push(musig_public_nonce_from_wire(nonce)?);
+	}
+	Ok(musig2::AggNonce::sum(parsed_nonces.iter()))
+}
+
 /// Requires a simple-taproot nonce TLV after the caller has established that
 /// the message belongs to a simple-taproot channel.
 pub fn require_public_nonce(
@@ -265,7 +728,10 @@ fn validate_compressed_point(bytes: &[u8]) -> Result<(), DecodeError> {
 mod tests {
 	use super::*;
 	use crate::util::ser::{Readable, Writeable};
+	#[cfg(not(feature = "simple_taproot_musig2"))]
 	use bitcoin::hashes::Hash as _;
+	#[cfg(feature = "simple_taproot_musig2")]
+	use bitcoin::secp256k1::{Secp256k1, SecretKey};
 
 	fn sample_nonce(seed: u8) -> Musig2PublicNonce {
 		let mut bytes = [0; MUSIG2_PUBLIC_NONCE_LEN];
@@ -334,5 +800,156 @@ mod tests {
 		let decoded =
 			SimpleTaprootNextLocalNonces::read_from_fixed_length_buffer(&mut reader).unwrap();
 		assert_eq!(decoded, entries);
+	}
+
+	#[test]
+	fn nonce_state_rejects_duplicate_after_restart() {
+		let nonce_use = SimpleTaprootNonceUse::new(
+			Txid::from_slice(&[5; 32]).unwrap(),
+			7,
+			SimpleTaprootNonceScope::Commitment,
+		);
+		let mut state = SimpleTaprootNonceState::new();
+		state.mark_used(nonce_use).unwrap();
+		assert_eq!(state.mark_used(nonce_use), Err(SimpleTaprootMusigError::DuplicateNonceUse));
+
+		let mut encoded = Vec::new();
+		state.write(&mut encoded).unwrap();
+		let mut decoded = SimpleTaprootNonceState::read(&mut &encoded[..]).unwrap();
+		assert!(decoded.is_used(&nonce_use));
+		assert_eq!(decoded.mark_used(nonce_use), Err(SimpleTaprootMusigError::DuplicateNonceUse));
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	#[test]
+	fn musig2_signatures_aggregate_and_verify() {
+		let secp_ctx = Secp256k1::new();
+		let alice_secret = SecretKey::from_slice(&[1; 32]).unwrap();
+		let bob_secret = SecretKey::from_slice(&[2; 32]).unwrap();
+		let alice_pubkey = PublicKey::from_secret_key(&secp_ctx, &alice_secret);
+		let bob_pubkey = PublicKey::from_secret_key(&secp_ctx, &bob_secret);
+		let key_agg_ctx = SimpleTaprootKeyAggContext::for_funding_keys(bob_pubkey, alice_pubkey);
+		assert!(
+			key_agg_ctx.sorted_pubkeys()[0].serialize()
+				< key_agg_ctx.sorted_pubkeys()[1].serialize()
+		);
+		let _aggregate_key = key_agg_ctx.aggregate_xonly_public_key().unwrap();
+
+		let nonce_use = SimpleTaprootNonceUse::new(
+			Txid::from_slice(&[9; 32]).unwrap(),
+			42,
+			SimpleTaprootNonceScope::Commitment,
+		);
+		let message = Sha256::hash(b"simple taproot commitment").to_byte_array();
+		let alice_seed = derive_simple_taproot_jit_nonce_seed(&[7; 32], &nonce_use);
+		let bob_seed = derive_simple_taproot_jit_nonce_seed(&[8; 32], &nonce_use);
+		let alice_nonce = key_agg_ctx
+			.generate_nonce_pair(&alice_secret, alice_seed, &message, &nonce_use)
+			.unwrap();
+		let bob_nonce =
+			key_agg_ctx.generate_nonce_pair(&bob_secret, bob_seed, &message, &nonce_use).unwrap();
+		let public_nonces = [alice_nonce.public_nonce, bob_nonce.public_nonce];
+
+		let mut alice_state = SimpleTaprootNonceState::new();
+		let alice_partial = key_agg_ctx
+			.sign_partial(
+				&alice_secret,
+				alice_nonce.secret_nonce.clone(),
+				&public_nonces,
+				&message,
+				nonce_use,
+				&mut alice_state,
+			)
+			.unwrap();
+		assert_eq!(
+			key_agg_ctx.sign_partial(
+				&alice_secret,
+				alice_nonce.secret_nonce,
+				&public_nonces,
+				&message,
+				nonce_use,
+				&mut alice_state,
+			),
+			Err(SimpleTaprootMusigError::DuplicateNonceUse)
+		);
+
+		let mut bob_state = SimpleTaprootNonceState::new();
+		let bob_partial = key_agg_ctx
+			.sign_partial(
+				&bob_secret,
+				bob_nonce.secret_nonce,
+				&public_nonces,
+				&message,
+				nonce_use,
+				&mut bob_state,
+			)
+			.unwrap();
+
+		key_agg_ctx
+			.verify_partial(
+				&alice_pubkey,
+				&alice_partial.public_nonce,
+				&alice_partial.partial_signature,
+				&public_nonces,
+				&message,
+			)
+			.unwrap();
+		key_agg_ctx
+			.verify_partial(
+				&bob_pubkey,
+				&bob_partial.public_nonce,
+				&bob_partial.partial_signature,
+				&public_nonces,
+				&message,
+			)
+			.unwrap();
+
+		let mut bad_signature = *bob_partial.partial_signature.as_bytes();
+		bad_signature[0] ^= 1;
+		assert_eq!(
+			key_agg_ctx.verify_partial(
+				&bob_pubkey,
+				&bob_partial.public_nonce,
+				&SimpleTaprootPartialSignature::from_bytes(bad_signature),
+				&public_nonces,
+				&message,
+			),
+			Err(SimpleTaprootMusigError::InvalidSignature)
+		);
+
+		let final_signature = key_agg_ctx
+			.aggregate_final_signature(
+				&[alice_partial.partial_signature, bob_partial.partial_signature],
+				&public_nonces,
+				&message,
+			)
+			.unwrap();
+		key_agg_ctx.verify_final_signature(&final_signature, &message).unwrap();
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	#[test]
+	fn counter_and_jit_nonce_seeds_are_domain_separated() {
+		let funding_txid = Txid::from_slice(&[10; 32]).unwrap();
+		let commitment_use =
+			SimpleTaprootNonceUse::new(funding_txid, 11, SimpleTaprootNonceScope::Commitment);
+		let close_use =
+			SimpleTaprootNonceUse::new(funding_txid, 11, SimpleTaprootNonceScope::CooperativeClose);
+		let force_close_use =
+			SimpleTaprootNonceUse::new(funding_txid, 11, SimpleTaprootNonceScope::ForceClose);
+
+		let commitment_seed = [12; 32];
+		let commitment_nonce_seed =
+			derive_simple_taproot_counter_nonce_seed(&commitment_seed, &commitment_use);
+		let close_nonce_seed =
+			derive_simple_taproot_counter_nonce_seed(&commitment_seed, &close_use);
+		let force_close_nonce_seed =
+			derive_simple_taproot_counter_nonce_seed(&commitment_seed, &force_close_use);
+		assert_ne!(commitment_nonce_seed, close_nonce_seed);
+		assert_ne!(commitment_nonce_seed, force_close_nonce_seed);
+		assert_ne!(close_nonce_seed, force_close_nonce_seed);
+
+		let jit_nonce_seed = derive_simple_taproot_jit_nonce_seed(&[13; 32], &commitment_use);
+		assert_ne!(commitment_nonce_seed, jit_nonce_seed);
 	}
 }
