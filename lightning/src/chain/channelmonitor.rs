@@ -126,7 +126,7 @@ impl ChannelMonitorUpdate {
 				let funding_outpoint = channel_parameters
 					.funding_outpoint
 					.expect("Renegotiated funding must always have known outpoint");
-				let funding_script = channel_parameters.make_funding_redeemscript().to_p2wsh();
+				let funding_script = channel_parameters.make_funding_script_pubkey();
 				Some((funding_outpoint, funding_script))
 			},
 			_ => None,
@@ -1949,8 +1949,7 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitor<Signer> {
 
 		let funding_outpoint = channel_parameters.funding_outpoint
 			.expect("Funding outpoint must be known during initialization");
-		let funding_redeem_script = channel_parameters.make_funding_redeemscript();
-		let funding_script = funding_redeem_script.to_p2wsh();
+		let funding_script = channel_parameters.make_funding_script_pubkey();
 		let mut outputs_to_watch = new_hash_map();
 		outputs_to_watch.insert(
 			funding_outpoint.txid, vec![(funding_outpoint.index as u32, funding_script.clone())],
@@ -2196,7 +2195,7 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitor<Signer> {
 		for funding in core::iter::once(&lock.funding).chain(&lock.pending_funding) {
 			let funding_outpoint = funding.funding_outpoint();
 			log_trace!(&logger, "Registering funding outpoint {} with the filter to monitor confirmations", &funding_outpoint);
-			let script_pubkey = funding.channel_parameters.make_funding_redeemscript().to_p2wsh();
+			let script_pubkey = funding.channel_parameters.make_funding_script_pubkey();
 			filter.register_tx(&funding_outpoint.txid, &script_pubkey);
 		}
 		for (txid, outputs) in lock.get_outputs_to_watch().iter() {
@@ -4136,7 +4135,7 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 			return Err(());
 		}
 
-		let script_pubkey = channel_parameters.make_funding_redeemscript().to_p2wsh();
+		let script_pubkey = channel_parameters.make_funding_script_pubkey();
 		self.outputs_to_watch.insert(
 			alternative_funding_outpoint.txid,
 			vec![(alternative_funding_outpoint.index as u32, script_pubkey)],
@@ -4626,10 +4625,10 @@ impl<Signer: EcdsaChannelSigner> ChannelMonitorImpl<Signer> {
 			.expect("Funding outpoint must be set for active monitor")
 	}
 
-	/// Returns the P2WSH script we are currently monitoring the chain for spends. This will change
+	/// Returns the funding script we are currently monitoring the chain for spends. This will change
 	/// for every splice that has reached its intended confirmation depth.
 	fn get_funding_script(&self) -> ScriptBuf {
-		self.funding.channel_parameters.make_funding_redeemscript().to_p2wsh()
+		self.funding.channel_parameters.make_funding_script_pubkey()
 	}
 
 	pub fn channel_id(&self) -> ChannelId {

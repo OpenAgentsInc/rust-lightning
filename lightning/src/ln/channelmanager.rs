@@ -6577,7 +6577,10 @@ impl<
 					is_batch_funding,
 					|chan| {
 						let mut output_index = None;
-						let expected_spk = chan.funding.get_funding_redeemscript().to_p2wsh();
+						let expected_spk = chan
+							.funding
+							.get_funding_script_pubkey()
+							.ok_or("Channel funding script is unavailable")?;
 						let outpoint = match &funding {
 							FundingType::Checked(tx) | FundingType::CheckedManualBroadcast(tx) => {
 								for (idx, outp) in tx.output.iter().enumerate() {
@@ -9795,7 +9798,8 @@ impl<
 		ComplFunc: FnOnce(
 			Option<u64>,
 			bool,
-		) -> (Option<MonitorUpdateCompletionAction>, Option<RAAMonitorUpdateBlockingAction>),
+		)
+			-> (Option<MonitorUpdateCompletionAction>, Option<RAAMonitorUpdateBlockingAction>),
 	>(
 		&self, prev_hop: &HTLCPreviousHopData, payment_preimage: PaymentPreimage,
 		payment_info: Option<PaymentClaimDetails>, attribution_data: Option<AttributionData>,
@@ -9833,7 +9837,8 @@ impl<
 		ComplFunc: FnOnce(
 			Option<u64>,
 			bool,
-		) -> (Option<MonitorUpdateCompletionAction>, Option<RAAMonitorUpdateBlockingAction>),
+		)
+			-> (Option<MonitorUpdateCompletionAction>, Option<RAAMonitorUpdateBlockingAction>),
 	>(
 		&self, prev_hop: HTLCClaimSource, payment_preimage: PaymentPreimage,
 		payment_info: Option<PaymentClaimDetails>, attribution_data: Option<AttributionData>,
@@ -11696,7 +11701,14 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 								&peer_state.latest_features,
 							);
 							try_channel_entry!(self, peer_state, res, chan);
-							(unfunded_chan.funding.get_value_satoshis(), unfunded_chan.funding.get_funding_redeemscript().to_p2wsh(), unfunded_chan.context.get_user_id())
+							let output_script = unfunded_chan
+								.funding
+								.get_funding_script_pubkey()
+								.ok_or_else(|| MsgHandleErrInternal::send_err_msg_no_close(
+									"Unable to construct funding script for negotiated channel type".to_owned(),
+									msg.common_fields.temporary_channel_id,
+								))?;
+							(unfunded_chan.funding.get_value_satoshis(), output_script, unfunded_chan.context.get_user_id())
 						},
 						None => {
 							return Err(MsgHandleErrInternal::send_err_msg_no_close(format!("Got an unexpected accept_channel message from peer with counterparty_node_id {}", counterparty_node_id), msg.common_fields.temporary_channel_id));
@@ -17815,14 +17827,17 @@ pub fn provided_init_features(config: &UserConfig) -> InitFeatures {
 		features.set_anchor_zero_fee_commitments_optional();
 	}
 
-	if config.channel_handshake_config.negotiate_simple_taproot_channels
-		|| config.channel_handshake_config.negotiate_taproot_asset_channels
+	#[cfg(feature = "simple_taproot_musig2")]
 	{
-		features.set_simple_taproot_staging_optional();
-	}
+		if config.channel_handshake_config.negotiate_simple_taproot_channels
+			|| config.channel_handshake_config.negotiate_taproot_asset_channels
+		{
+			features.set_simple_taproot_staging_optional();
+		}
 
-	if config.channel_handshake_config.negotiate_taproot_asset_channels {
-		features.set_taproot_asset_channel_optional();
+		if config.channel_handshake_config.negotiate_taproot_asset_channels {
+			features.set_taproot_asset_channel_optional();
+		}
 	}
 
 	if config.enable_htlc_hold {

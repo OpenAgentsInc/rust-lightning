@@ -2702,12 +2702,13 @@ impl FundingScope {
 	/// was spent by the splice transaction) until the splice transaction reaches sufficient
 	/// confirmations to be locked (and we exchange `splice_locked` messages with our peer).
 	pub fn get_funding_output(&self) -> Option<TxOut> {
-		self.channel_transaction_parameters.make_funding_redeemscript_opt().map(|redeem_script| {
-			TxOut {
-				value: Amount::from_sat(self.get_value_satoshis()),
-				script_pubkey: redeem_script.to_p2wsh(),
-			}
+		self.channel_transaction_parameters.make_funding_script_pubkey_opt().map(|script_pubkey| {
+			TxOut { value: Amount::from_sat(self.get_value_satoshis()), script_pubkey }
 		})
+	}
+
+	pub fn get_funding_script_pubkey(&self) -> Option<ScriptBuf> {
+		self.channel_transaction_parameters.make_funding_script_pubkey_opt()
 	}
 
 	fn get_funding_txid(&self) -> Option<Txid> {
@@ -2732,7 +2733,7 @@ impl FundingScope {
 	}
 
 	/// Gets the redeemscript for the funding transaction output (ie the funding transaction output
-	/// pays to get_funding_redeemscript().to_p2wsh()).
+	/// pays to this script for legacy segwit channels).
 	/// Panics if called before accept_channel/InboundV1Channel::new
 	pub fn get_funding_redeemscript(&self) -> ScriptBuf {
 		self.channel_transaction_parameters.make_funding_redeemscript()
@@ -2942,7 +2943,9 @@ impl FundingScope {
 
 		let prev_output = TxOut {
 			value: Amount::from_sat(self.get_value_satoshis()),
-			script_pubkey: self.get_funding_redeemscript().to_p2wsh(),
+			script_pubkey: self
+				.get_funding_script_pubkey()
+				.expect("funding script should be set for splice input"),
 		};
 
 		let local_owned = self.value_to_self_msat / 1000;
@@ -4016,32 +4019,33 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 		debug_assert!(our_funding_satoshis == 0 || msg_push_msat == 0);
 		let value_to_self_msat = our_funding_satoshis * 1000 + msg_push_msat;
 
-		let counterparty_shutdown_scriptpubkey =
-			if their_features.supports_upfront_shutdown_script() {
-				match &open_channel_fields.shutdown_scriptpubkey {
-					&Some(ref script) => {
-						// Peer is signaling upfront_shutdown and has opt-out with a 0-length script. We don't enforce anything
-						if script.len() == 0 {
-							None
-						} else {
-							if !script::is_bolt2_compliant(&script, their_features) {
-								return Err(ChannelError::close(format!(
+		let counterparty_shutdown_scriptpubkey = if their_features
+			.supports_upfront_shutdown_script()
+		{
+			match &open_channel_fields.shutdown_scriptpubkey {
+				&Some(ref script) => {
+					// Peer is signaling upfront_shutdown and has opt-out with a 0-length script. We don't enforce anything
+					if script.len() == 0 {
+						None
+					} else {
+						if !script::is_bolt2_compliant(&script, their_features) {
+							return Err(ChannelError::close(format!(
 								"Peer is signaling upfront_shutdown but has provided an unacceptable scriptpubkey format: {script}"
 							)));
-							}
-							Some(script.clone())
 						}
-					},
-					// Peer is signaling upfront shutdown but don't opt-out with correct mechanism (a.k.a 0-length script). Peer looks buggy, we fail the channel
-					&None => {
-						return Err(ChannelError::close(String::from(
+						Some(script.clone())
+					}
+				},
+				// Peer is signaling upfront shutdown but don't opt-out with correct mechanism (a.k.a 0-length script). Peer looks buggy, we fail the channel
+				&None => {
+					return Err(ChannelError::close(String::from(
 						"Peer is signaling upfront_shutdown but we don't get any script. Use 0-length script to opt-out"
 					)));
-					},
-				}
-			} else {
-				None
-			};
+				},
+			}
+		} else {
+			None
+		};
 
 		let shutdown_scriptpubkey =
 			if config.channel_handshake_config.commit_upfront_shutdown_pubkey {
@@ -4972,32 +4976,33 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 			)));
 		}
 
-		let counterparty_shutdown_scriptpubkey =
-			if their_features.supports_upfront_shutdown_script() {
-				match &common_fields.shutdown_scriptpubkey {
-					&Some(ref script) => {
-						// Peer is signaling upfront_shutdown and has opt-out with a 0-length script. We don't enforce anything
-						if script.len() == 0 {
-							None
-						} else {
-							if !script::is_bolt2_compliant(&script, their_features) {
-								return Err(ChannelError::close(format!(
+		let counterparty_shutdown_scriptpubkey = if their_features
+			.supports_upfront_shutdown_script()
+		{
+			match &common_fields.shutdown_scriptpubkey {
+				&Some(ref script) => {
+					// Peer is signaling upfront_shutdown and has opt-out with a 0-length script. We don't enforce anything
+					if script.len() == 0 {
+						None
+					} else {
+						if !script::is_bolt2_compliant(&script, their_features) {
+							return Err(ChannelError::close(format!(
 								"Peer is signaling upfront_shutdown but has provided an unacceptable scriptpubkey format: {script}"
 							)));
-							}
-							Some(script.clone())
 						}
-					},
-					// Peer is signaling upfront shutdown but don't opt-out with correct mechanism (a.k.a 0-length script). Peer looks buggy, we fail the channel
-					&None => {
-						return Err(ChannelError::close(String::from(
+						Some(script.clone())
+					}
+				},
+				// Peer is signaling upfront shutdown but don't opt-out with correct mechanism (a.k.a 0-length script). Peer looks buggy, we fail the channel
+				&None => {
+					return Err(ChannelError::close(String::from(
 						"Peer is signaling upfront_shutdown but we don't get any script. Use 0-length script to opt-out"
 					)));
-					},
-				}
-			} else {
-				None
-			};
+				},
+			}
+		} else {
+			None
+		};
 
 		self.counterparty_dust_limit_satoshis = common_fields.dust_limit_satoshis;
 		self.counterparty_max_htlc_value_in_flight_msat = cmp::min(
@@ -6751,7 +6756,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 			if tx.txid() == funding_txo.txid {
 				let tx = tx.tx();
 				let txo_idx = funding_txo.index as usize;
-				if txo_idx >= tx.output.len() || tx.output[txo_idx].script_pubkey != funding.get_funding_redeemscript().to_p2wsh() ||
+				if txo_idx >= tx.output.len() || Some(&tx.output[txo_idx].script_pubkey) != funding.get_funding_script_pubkey().as_ref() ||
 						tx.output[txo_idx].value.to_sat() != funding.get_value_satoshis() {
 					if funding.is_outbound() {
 						// If we generated the funding transaction and it doesn't match what it
@@ -6974,7 +6979,9 @@ impl FundingNegotiationContext {
 
 		let shared_funding_output = TxOut {
 			value: Amount::from_sat(funding.get_value_satoshis()),
-			script_pubkey: funding.get_funding_redeemscript().to_p2wsh(),
+			script_pubkey: funding
+				.get_funding_script_pubkey()
+				.expect("funding script should be set for interactive funding"),
 		};
 
 		let constructor_args = InteractiveTxConstructorArgs {
@@ -15709,7 +15716,9 @@ impl<SP: SignerProvider> PendingV2Channel<SP> {
 		};
 		let shared_funding_output = TxOut {
 			value: Amount::from_sat(funding.get_value_satoshis()),
-			script_pubkey: funding.get_funding_redeemscript().to_p2wsh(),
+			script_pubkey: funding
+				.get_funding_script_pubkey()
+				.expect("funding script should be set for interactive funding"),
 		};
 
 		let interactive_tx_constructor = Some(InteractiveTxConstructor::new_for_inbound(
@@ -15853,10 +15862,11 @@ pub(super) fn get_initial_channel_type(
 		ret.set_anchors_zero_fee_htlc_tx_required();
 	}
 
-	let negotiate_simple_taproot =
-		config.channel_handshake_config.negotiate_simple_taproot_channels
-			&& their_features.supports_simple_taproot_staging();
+	let negotiate_simple_taproot = cfg!(feature = "simple_taproot_musig2")
+		&& config.channel_handshake_config.negotiate_simple_taproot_channels
+		&& their_features.supports_simple_taproot_staging();
 	let negotiate_taproot_asset = config.channel_handshake_config.negotiate_taproot_asset_channels
+		&& cfg!(feature = "simple_taproot_musig2")
 		&& their_features.supports_simple_taproot_staging()
 		&& their_features.supports_taproot_asset_channel();
 	if negotiate_simple_taproot || negotiate_taproot_asset {

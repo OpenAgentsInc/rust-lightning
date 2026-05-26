@@ -242,6 +242,129 @@ fn do_test_manual_inbound_accept_with_override(
 	get_event_msg!(nodes[2], MessageSendEvent::SendAcceptChannel, node_a)
 }
 
+#[cfg(feature = "simple_taproot_musig2")]
+#[test]
+fn test_simple_taproot_funding_generation_uses_p2tr_and_rejects_wrong_script() {
+	let mut simple_taproot_config = UserConfig::default();
+	simple_taproot_config.channel_handshake_config.negotiate_simple_taproot_channels = true;
+
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(
+		2,
+		&node_cfgs,
+		&[Some(simple_taproot_config.clone()), Some(simple_taproot_config)],
+	);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node.get_our_node_id();
+	nodes[0].node.create_channel(node_b_id, 1_000_000, 0, 42, None, None).unwrap();
+	let open_channel_msg = get_event_msg!(nodes[0], MessageSendEvent::SendOpenChannel, node_b_id);
+	handle_and_accept_open_channel(&nodes[1], node_a_id, &open_channel_msg);
+	let accept_channel_msg =
+		get_event_msg!(nodes[1], MessageSendEvent::SendAcceptChannel, node_a_id);
+	let expected_script = crate::ln::simple_taproot::SimpleTaprootKeyAggContext::for_funding_keys(
+		open_channel_msg.common_fields.funding_pubkey,
+		accept_channel_msg.common_fields.funding_pubkey,
+	)
+	.bip86_funding_script_pubkey(&nodes[0].node.secp_ctx)
+	.unwrap();
+
+	nodes[0].node.handle_accept_channel(node_b_id, &accept_channel_msg);
+	let events = nodes[0].node.get_and_clear_pending_events();
+	assert_eq!(events.len(), 1);
+	let (temporary_channel_id, channel_value_satoshis, output_script) =
+		match events.into_iter().next().unwrap() {
+			Event::FundingGenerationReady {
+				temporary_channel_id,
+				counterparty_node_id,
+				channel_value_satoshis,
+				output_script,
+				user_channel_id,
+			} => {
+				assert_eq!(counterparty_node_id, node_b_id);
+				assert_eq!(user_channel_id, 42);
+				(temporary_channel_id, channel_value_satoshis, output_script)
+			},
+			_ => panic!("Unexpected event"),
+		};
+	assert!(output_script.is_p2tr());
+	assert!(!output_script.is_p2wsh());
+	assert_eq!(output_script, expected_script);
+
+	let funding_tx = Transaction {
+		version: Version::ONE,
+		lock_time: LockTime::ZERO,
+		input: Vec::new(),
+		output: vec![TxOut {
+			value: Amount::from_sat(channel_value_satoshis),
+			script_pubkey: output_script,
+		}],
+	};
+	nodes[0]
+		.node
+		.funding_transaction_generated(temporary_channel_id, node_b_id, funding_tx)
+		.unwrap();
+	let funding_created = get_event_msg!(nodes[0], MessageSendEvent::SendFundingCreated, node_b_id);
+	assert_eq!(funding_created.temporary_channel_id, temporary_channel_id);
+
+	nodes[0].node.create_channel(node_b_id, 1_000_000, 0, 43, None, None).unwrap();
+	let open_channel_msg = get_event_msg!(nodes[0], MessageSendEvent::SendOpenChannel, node_b_id);
+	handle_and_accept_open_channel(&nodes[1], node_a_id, &open_channel_msg);
+	let accept_channel_msg =
+		get_event_msg!(nodes[1], MessageSendEvent::SendAcceptChannel, node_a_id);
+	nodes[0].node.handle_accept_channel(node_b_id, &accept_channel_msg);
+	let events = nodes[0].node.get_and_clear_pending_events();
+	assert_eq!(events.len(), 1);
+	let (temporary_channel_id, channel_value_satoshis) = match events.into_iter().next().unwrap() {
+		Event::FundingGenerationReady {
+			temporary_channel_id,
+			channel_value_satoshis,
+			user_channel_id,
+			..
+		} => {
+			assert_eq!(user_channel_id, 43);
+			(temporary_channel_id, channel_value_satoshis)
+		},
+		_ => panic!("Unexpected event"),
+	};
+	let bad_funding_tx = Transaction {
+		version: Version::ONE,
+		lock_time: LockTime::ZERO,
+		input: Vec::new(),
+		output: vec![TxOut {
+			value: Amount::from_sat(channel_value_satoshis),
+			script_pubkey: ScriptBuf::new(),
+		}],
+	};
+	match nodes[0].node.funding_transaction_generated(
+		temporary_channel_id,
+		node_b_id,
+		bad_funding_tx,
+	) {
+		Err(APIError::APIMisuseError { err }) => {
+			assert!(err.contains("No output matched the script_pubkey and value"));
+		},
+		other => panic!("Expected invalid funding script rejection, got {:?}", other),
+	}
+	let error_msg = get_err_msg(&nodes[0], &node_b_id);
+	assert_eq!(error_msg.channel_id, temporary_channel_id);
+	assert!(error_msg.data.contains("No output matched the script_pubkey and value"));
+	let events = nodes[0].node.get_and_clear_pending_events();
+	assert_eq!(events.len(), 1);
+	match &events[0] {
+		Event::ChannelClosed { channel_id, user_channel_id, reason, .. } => {
+			assert_eq!(*channel_id, temporary_channel_id);
+			assert_eq!(*user_channel_id, 43);
+			assert!(
+				matches!(reason, ClosureReason::ProcessingError { err } if err.contains("No output matched the script_pubkey and value"))
+			);
+		},
+		_ => panic!("Expected channel close after invalid funding script"),
+	}
+}
+
 #[test]
 fn test_anchors_zero_fee_htlc_tx_downgrade() {
 	// Tests that if both nodes support anchors, but the remote node does not want to accept

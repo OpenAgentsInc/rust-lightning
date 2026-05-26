@@ -46,6 +46,8 @@ use super::channel_keys::{
 	DelayedPaymentBasepoint, DelayedPaymentKey, HtlcBasepoint, HtlcKey, RevocationBasepoint,
 	RevocationKey,
 };
+#[cfg(feature = "simple_taproot_musig2")]
+use super::simple_taproot::SimpleTaprootKeyAggContext;
 use crate::chain;
 use crate::crypto::utils::{sign, sign_with_aux_rand};
 use crate::io;
@@ -1129,6 +1131,40 @@ impl ChannelTransactionParameters {
 				&p.pubkeys.funding_pubkey,
 			)
 		})
+	}
+
+	pub(crate) fn make_funding_script_pubkey(&self) -> ScriptBuf {
+		self.make_funding_script_pubkey_opt().unwrap()
+	}
+
+	pub(crate) fn make_funding_script_pubkey_opt(&self) -> Option<ScriptBuf> {
+		let p = self.counterparty_parameters.as_ref()?;
+		if self.channel_type_features.requires_simple_taproot()
+			|| self.channel_type_features.requires_simple_taproot_staging()
+		{
+			#[cfg(feature = "simple_taproot_musig2")]
+			{
+				let secp_ctx = Secp256k1::verification_only();
+				return SimpleTaprootKeyAggContext::for_funding_keys(
+					self.holder_pubkeys.funding_pubkey,
+					p.pubkeys.funding_pubkey,
+				)
+				.bip86_funding_script_pubkey(&secp_ctx)
+				.ok();
+			}
+			#[cfg(not(feature = "simple_taproot_musig2"))]
+			{
+				return None;
+			}
+		}
+
+		Some(
+			make_funding_redeemscript(
+				&self.holder_pubkeys.funding_pubkey,
+				&p.pubkeys.funding_pubkey,
+			)
+			.to_p2wsh(),
+		)
 	}
 
 	/// Returns the counterparty's pubkeys.

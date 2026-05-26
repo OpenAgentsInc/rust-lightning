@@ -96,6 +96,7 @@ fn test_option_zero_fee_commitments_from_zero_htlc_anchors_initial() {
 	)
 }
 
+#[cfg(feature = "simple_taproot_musig2")]
 #[test]
 fn test_experimental_simple_taproot_staging_channel_initial() {
 	let mut expected_type = ChannelTypeFeatures::only_static_remote_key();
@@ -115,6 +116,7 @@ fn test_experimental_simple_taproot_staging_channel_initial() {
 	)
 }
 
+#[cfg(feature = "simple_taproot_musig2")]
 #[test]
 fn test_experimental_taproot_asset_channel_initial() {
 	let mut expected_type = ChannelTypeFeatures::simple_taproot_staging();
@@ -268,6 +270,7 @@ fn test_supports_zero_fee_commitments_and_htlc_tx_fee() {
 	do_test_supports_channel_type(config, expected_channel_type)
 }
 
+#[cfg(feature = "simple_taproot_musig2")]
 #[test]
 fn test_supports_simple_taproot_staging_channel_type() {
 	let mut config = UserConfig::default();

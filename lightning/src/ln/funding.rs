@@ -486,11 +486,11 @@ fn estimate_transaction_fee(
 	if is_initiator {
 		weight = weight
 			.saturating_add(TX_COMMON_FIELDS_WEIGHT)
-			// The weight of the funding output, a P2WSH output
+			// The weight of the shared funding output. P2WSH and P2TR are both 34-byte
+			// scriptPubKeys, so this remains valid for simple-taproot funding.
 			// NOTE: The witness script hash given here is irrelevant as it's a fixed size and we just want
 			// to calculate the contributed weight, so we use an all-zero hash.
 			//
-			// TODO(taproot): Needs to consider different weights based on channel type
 			.saturating_add(
 				get_output_weight(&ScriptBuf::new_p2wsh(&WScriptHash::from_raw_hash(
 					Hash::all_zeros(),

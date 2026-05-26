@@ -23,9 +23,11 @@ use bitcoin::hashes::hmac::{Hmac, HmacEngine};
 use bitcoin::hashes::sha256::Hash as Sha256;
 #[cfg(feature = "simple_taproot_musig2")]
 use bitcoin::hashes::{Hash, HashEngine};
+#[cfg(feature = "simple_taproot_musig2")]
+use bitcoin::script::ScriptBuf;
 use bitcoin::secp256k1::PublicKey;
 #[cfg(feature = "simple_taproot_musig2")]
-use bitcoin::secp256k1::{schnorr, SecretKey, XOnlyPublicKey};
+use bitcoin::secp256k1::{schnorr, Secp256k1, SecretKey, Verification, XOnlyPublicKey};
 
 use crate::io::{self, Read};
 use crate::ln::msgs::DecodeError;
@@ -498,6 +500,18 @@ impl SimpleTaprootKeyAggContext {
 			.map_err(|_| SimpleTaprootMusigError::InvalidKey)
 	}
 
+	/// Returns the BIP86 funding scriptPubKey for the sorted aggregate funding key.
+	///
+	/// Simple-taproot funding has no script path at this stage, so the aggregate
+	/// MuSig2 key is used as the Taproot internal key and tweaked with an empty
+	/// merkle root.
+	pub fn bip86_funding_script_pubkey<C: Verification>(
+		&self, secp_ctx: &Secp256k1<C>,
+	) -> Result<ScriptBuf, SimpleTaprootMusigError> {
+		let internal_key = self.aggregate_xonly_public_key()?;
+		Ok(ScriptBuf::new_p2tr(secp_ctx, internal_key, None))
+	}
+
 	/// Generates a BIP-327 secret/public nonce pair from caller-supplied entropy.
 	pub fn generate_nonce_pair(
 		&self, signer_secret_key: &SecretKey, nonce_seed: [u8; 32], message: &[u8],
@@ -731,6 +745,8 @@ mod tests {
 	#[cfg(not(feature = "simple_taproot_musig2"))]
 	use bitcoin::hashes::Hash as _;
 	#[cfg(feature = "simple_taproot_musig2")]
+	use bitcoin::hex::FromHex;
+	#[cfg(feature = "simple_taproot_musig2")]
 	use bitcoin::secp256k1::{Secp256k1, SecretKey};
 
 	fn sample_nonce(seed: u8) -> Musig2PublicNonce {
@@ -925,6 +941,38 @@ mod tests {
 			)
 			.unwrap();
 		key_agg_ctx.verify_final_signature(&final_signature, &message).unwrap();
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	#[test]
+	fn bip86_funding_script_matches_bolt_vector() {
+		let secp_ctx = Secp256k1::new();
+		let local_funding_pubkey = PublicKey::from_slice(
+			&Vec::<u8>::from_hex(
+				"03b7203dec7c13896b6ff1f58b24f84458c441720a12b5a57426397e22f0a8c78b",
+			)
+			.unwrap(),
+		)
+		.unwrap();
+		let remote_funding_pubkey = PublicKey::from_slice(
+			&Vec::<u8>::from_hex(
+				"02956e6845a6f346f97c5e028c0f8ab38a76b0124fd7184deab60f682b3e657fdb",
+			)
+			.unwrap(),
+		)
+		.unwrap();
+		let key_agg_ctx = SimpleTaprootKeyAggContext::for_funding_keys(
+			local_funding_pubkey,
+			remote_funding_pubkey,
+		);
+		let script_pubkey = key_agg_ctx.bip86_funding_script_pubkey(&secp_ctx).unwrap();
+		assert_eq!(
+			script_pubkey.as_bytes(),
+			&Vec::<u8>::from_hex(
+				"5120d0ebb4909d563a7ae1213fddede4ae54132fba0ef0b97ee3f8469191fecd348e",
+			)
+			.unwrap()[..]
+		);
 	}
 
 	#[cfg(feature = "simple_taproot_musig2")]
