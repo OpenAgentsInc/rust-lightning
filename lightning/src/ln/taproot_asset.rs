@@ -282,6 +282,121 @@ pub struct TaprootAssetHtlcMetadataExpectation {
 	pub quote_expiry_unix_seconds: u64,
 }
 
+/// Final asset allocation exported during cooperative close.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct TaprootAssetCloseAllocation {
+	/// Taproot Asset channel protocol version for this close allocation.
+	pub protocol_version: u16,
+	/// Channel ID whose close is exporting this allocation.
+	pub channel_id: ChannelId,
+	/// Asset ID being returned to both channel parties.
+	pub asset_id: [u8; TAPROOT_ASSET_ID_LEN],
+	/// Latest mutually safe Lightning commitment number.
+	pub commitment_number: u64,
+	/// Final local asset amount.
+	pub local_amount: u64,
+	/// Final remote asset amount.
+	pub remote_amount: u64,
+	/// Taproot Asset proof/root reference hash for the close state.
+	pub proof_root_hash: [u8; TAPROOT_ASSET_ID_LEN],
+	/// Taproot Asset proof/root sum for the close state.
+	pub proof_root_sum: u64,
+	/// Digest of the proof material handed to the local wallet.
+	pub local_proof_digest: [u8; TAPROOT_ASSET_ID_LEN],
+	/// Digest of the proof material handed to the remote wallet.
+	pub remote_proof_digest: [u8; TAPROOT_ASSET_ID_LEN],
+	/// Integrity digest over the close allocation.
+	pub allocation_digest: [u8; TAPROOT_ASSET_ID_LEN],
+}
+
+impl TaprootAssetCloseAllocation {
+	/// Builds a validated cooperative-close allocation.
+	pub fn new(
+		channel_id: ChannelId, asset_id: [u8; TAPROOT_ASSET_ID_LEN], commitment_number: u64,
+		local_amount: u64, remote_amount: u64, proof_root_hash: [u8; TAPROOT_ASSET_ID_LEN],
+		proof_root_sum: u64, local_proof_digest: [u8; TAPROOT_ASSET_ID_LEN],
+		remote_proof_digest: [u8; TAPROOT_ASSET_ID_LEN],
+	) -> Result<Self, TaprootAssetCloseAllocationError> {
+		let mut allocation = Self {
+			protocol_version: SUPPORTED_TAPROOT_ASSET_CHANNEL_PROTOCOL_VERSION,
+			channel_id,
+			asset_id,
+			commitment_number,
+			local_amount,
+			remote_amount,
+			proof_root_hash,
+			proof_root_sum,
+			local_proof_digest,
+			remote_proof_digest,
+			allocation_digest: [0; TAPROOT_ASSET_ID_LEN],
+		};
+		allocation.allocation_digest = allocation.digest();
+		allocation.validate_integrity()?;
+		Ok(allocation)
+	}
+
+	/// Recomputes the cooperative-close allocation digest.
+	pub fn digest(&self) -> [u8; TAPROOT_ASSET_ID_LEN] {
+		let mut engine = Sha256::engine();
+		engine.input(b"openagents:taproot-asset-close-allocation:v1");
+		engine.input(&self.protocol_version.to_be_bytes());
+		engine.input(&self.channel_id.0);
+		engine.input(&self.asset_id);
+		engine.input(&self.commitment_number.to_be_bytes());
+		engine.input(&self.local_amount.to_be_bytes());
+		engine.input(&self.remote_amount.to_be_bytes());
+		engine.input(&self.proof_root_hash);
+		engine.input(&self.proof_root_sum.to_be_bytes());
+		engine.input(&self.local_proof_digest);
+		engine.input(&self.remote_proof_digest);
+		Sha256::from_engine(engine).to_byte_array()
+	}
+
+	/// Checks internal close-allocation integrity before a caller compares it
+	/// to the latest safe commitment.
+	pub fn validate_integrity(&self) -> Result<(), TaprootAssetCloseAllocationError> {
+		if self.protocol_version != SUPPORTED_TAPROOT_ASSET_CHANNEL_PROTOCOL_VERSION {
+			return Err(TaprootAssetCloseAllocationError::UnsupportedProtocolVersion);
+		}
+		if self.channel_id.is_zero()
+			|| self.asset_id == [0; TAPROOT_ASSET_ID_LEN]
+			|| self.proof_root_hash == [0; TAPROOT_ASSET_ID_LEN]
+			|| self.local_proof_digest == [0; TAPROOT_ASSET_ID_LEN]
+			|| self.remote_proof_digest == [0; TAPROOT_ASSET_ID_LEN]
+		{
+			return Err(TaprootAssetCloseAllocationError::MalformedAllocation);
+		}
+		if self.local_amount.checked_add(self.remote_amount).is_none()
+			|| self.local_amount + self.remote_amount != self.proof_root_sum
+		{
+			return Err(TaprootAssetCloseAllocationError::AmountMismatch);
+		}
+		if self.allocation_digest != self.digest() {
+			return Err(TaprootAssetCloseAllocationError::AllocationDigestMismatch);
+		}
+		Ok(())
+	}
+}
+
+/// Expected allocation for a cooperative asset-channel close.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct TaprootAssetCloseAllocationExpectation {
+	/// Expected channel ID.
+	pub channel_id: ChannelId,
+	/// Expected asset ID.
+	pub asset_id: [u8; TAPROOT_ASSET_ID_LEN],
+	/// Latest safe commitment number.
+	pub latest_commitment_number: u64,
+	/// Expected final local amount.
+	pub local_amount: u64,
+	/// Expected final remote amount.
+	pub remote_amount: u64,
+	/// Expected close proof/root hash.
+	pub proof_root_hash: [u8; TAPROOT_ASSET_ID_LEN],
+	/// Expected close proof/root sum.
+	pub proof_root_sum: u64,
+}
+
 /// Asset-channel state that must be persisted with the matching
 /// [`ChannelMonitorUpdate`](crate::chain::channelmonitor::ChannelMonitorUpdate).
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -487,6 +602,31 @@ pub enum TaprootAssetHtlcMetadataError {
 	FinalHopDigestMismatch,
 }
 
+/// Errors returned by cooperative asset-channel close allocation validation.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum TaprootAssetCloseAllocationError {
+	/// The close allocation path was used without an asset-channel negotiation.
+	ChannelNotNegotiated,
+	/// An asset-channel close required an allocation but none was present.
+	MissingCloseAllocation,
+	/// The close allocation used an unsupported protocol version.
+	UnsupportedProtocolVersion,
+	/// The close allocation was zeroed or internally malformed.
+	MalformedAllocation,
+	/// The close allocation channel ID did not match the expected channel.
+	ChannelIdMismatch,
+	/// The close allocation asset ID did not match the expected asset.
+	AssetIdMismatch,
+	/// The close allocation commitment number was not the latest safe state.
+	CommitmentNumberMismatch,
+	/// The close allocation amounts did not conserve the expected root sum.
+	AmountMismatch,
+	/// The close allocation proof root did not match the expected proof root.
+	ProofRootMismatch,
+	/// The close allocation digest did not match the serialized fields.
+	AllocationDigestMismatch,
+}
+
 /// Errors returned by Taproot Asset monitor aux blob validation.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum TaprootAssetMonitorAuxBlobError {
@@ -649,6 +789,57 @@ pub fn prepare_asset_htlc_metadata(
 	Ok(metadata)
 }
 
+/// Prepares a cooperative-close asset allocation after confirming the channel
+/// negotiated the experimental single-asset type.
+pub fn prepare_cooperative_close_asset_allocation(
+	local_features: &InitFeatures, remote_features: &InitFeatures,
+	proposed_channel_type: &ChannelTypeFeatures, descriptor: TaprootAssetChannelDescriptor,
+	allocation: TaprootAssetCloseAllocation,
+) -> Result<TaprootAssetCloseAllocation, TaprootAssetCloseAllocationError> {
+	validate_single_asset_channel_open(
+		local_features,
+		remote_features,
+		proposed_channel_type,
+		descriptor,
+	)
+	.map_err(|_| TaprootAssetCloseAllocationError::ChannelNotNegotiated)?;
+	allocation.validate_integrity()?;
+	if allocation.asset_id != *descriptor.asset_id() {
+		return Err(TaprootAssetCloseAllocationError::AssetIdMismatch);
+	}
+	Ok(allocation)
+}
+
+/// Requires and validates the cooperative-close allocation for an asset
+/// channel before the close is treated as final.
+pub fn validate_cooperative_close_asset_allocation<'a>(
+	allocation: Option<&'a TaprootAssetCloseAllocation>,
+	expected: &TaprootAssetCloseAllocationExpectation,
+) -> Result<&'a TaprootAssetCloseAllocation, TaprootAssetCloseAllocationError> {
+	let allocation = allocation.ok_or(TaprootAssetCloseAllocationError::MissingCloseAllocation)?;
+	allocation.validate_integrity()?;
+	if allocation.channel_id != expected.channel_id {
+		return Err(TaprootAssetCloseAllocationError::ChannelIdMismatch);
+	}
+	if allocation.asset_id != expected.asset_id {
+		return Err(TaprootAssetCloseAllocationError::AssetIdMismatch);
+	}
+	if allocation.commitment_number != expected.latest_commitment_number {
+		return Err(TaprootAssetCloseAllocationError::CommitmentNumberMismatch);
+	}
+	if allocation.local_amount != expected.local_amount
+		|| allocation.remote_amount != expected.remote_amount
+	{
+		return Err(TaprootAssetCloseAllocationError::AmountMismatch);
+	}
+	if allocation.proof_root_hash != expected.proof_root_hash
+		|| allocation.proof_root_sum != expected.proof_root_sum
+	{
+		return Err(TaprootAssetCloseAllocationError::ProofRootMismatch);
+	}
+	Ok(allocation)
+}
+
 /// Requires and validates asset HTLC metadata before final-hop settlement.
 pub fn validate_asset_htlc_final_hop<'a>(
 	metadata: Option<&'a TaprootAssetHtlcMetadata>, expected: &TaprootAssetHtlcMetadataExpectation,
@@ -722,6 +913,20 @@ pub fn validate_asset_monitor_aux_blob(
 	}
 	Ok(())
 }
+
+impl_writeable!(TaprootAssetCloseAllocation, {
+	protocol_version,
+	channel_id,
+	asset_id,
+	commitment_number,
+	local_amount,
+	remote_amount,
+	proof_root_hash,
+	proof_root_sum,
+	local_proof_digest,
+	remote_proof_digest,
+	allocation_digest
+});
 
 impl_writeable!(TaprootAssetHtlcMetadata, {
 	protocol_version,
@@ -876,6 +1081,33 @@ mod tests {
 			quote_accepted: true,
 			now_unix_seconds: 1_002,
 			quote_expiry_unix_seconds: 1_100,
+		}
+	}
+
+	fn close_allocation() -> TaprootAssetCloseAllocation {
+		TaprootAssetCloseAllocation::new(
+			ChannelId::from_bytes([3; 32]),
+			asset_id(),
+			43,
+			575,
+			425,
+			[6; TAPROOT_ASSET_ID_LEN],
+			1_000,
+			[14; TAPROOT_ASSET_ID_LEN],
+			[15; TAPROOT_ASSET_ID_LEN],
+		)
+		.unwrap()
+	}
+
+	fn close_expectation() -> TaprootAssetCloseAllocationExpectation {
+		TaprootAssetCloseAllocationExpectation {
+			channel_id: ChannelId::from_bytes([3; 32]),
+			asset_id: asset_id(),
+			latest_commitment_number: 43,
+			local_amount: 575,
+			remote_amount: 425,
+			proof_root_hash: [6; TAPROOT_ASSET_ID_LEN],
+			proof_root_sum: 1_000,
 		}
 	}
 
@@ -1157,6 +1389,91 @@ mod tests {
 		assert_eq!(
 			validate_asset_htlc_final_hop(Some(&wrong_digest), &expected),
 			Err(TaprootAssetHtlcMetadataError::FinalHopDigestMismatch)
+		);
+	}
+
+	#[test]
+	fn prepares_cooperative_close_asset_allocation() {
+		let local = asset_features();
+		let remote = asset_features();
+		let channel_type = ChannelTypeFeatures::taproot_asset_single_asset();
+		let allocation = close_allocation();
+		let prepared = prepare_cooperative_close_asset_allocation(
+			&local,
+			&remote,
+			&channel_type,
+			descriptor(),
+			allocation,
+		)
+		.unwrap();
+		assert_eq!(prepared, allocation);
+	}
+
+	#[test]
+	fn cooperative_close_allocation_requires_asset_channel_gate() {
+		let remote = asset_features();
+		let channel_type = ChannelTypeFeatures::taproot_asset_single_asset();
+		assert_eq!(
+			prepare_cooperative_close_asset_allocation(
+				&InitFeatures::empty(),
+				&remote,
+				&channel_type,
+				descriptor(),
+				close_allocation(),
+			),
+			Err(TaprootAssetCloseAllocationError::ChannelNotNegotiated)
+		);
+	}
+
+	#[test]
+	fn validates_cooperative_close_asset_allocation() {
+		let allocation = close_allocation();
+		let expected = close_expectation();
+		assert_eq!(
+			validate_cooperative_close_asset_allocation(Some(&allocation), &expected).unwrap(),
+			&allocation
+		);
+	}
+
+	#[test]
+	fn rejects_missing_stale_or_wrong_close_allocation() {
+		let allocation = close_allocation();
+		let expected = close_expectation();
+		assert_eq!(
+			validate_cooperative_close_asset_allocation(None, &expected),
+			Err(TaprootAssetCloseAllocationError::MissingCloseAllocation)
+		);
+
+		let mut stale = allocation;
+		stale.commitment_number = 42;
+		stale.allocation_digest = stale.digest();
+		assert_eq!(
+			validate_cooperative_close_asset_allocation(Some(&stale), &expected),
+			Err(TaprootAssetCloseAllocationError::CommitmentNumberMismatch)
+		);
+
+		let mut wrong_amount = allocation;
+		wrong_amount.local_amount = 574;
+		wrong_amount.remote_amount = 426;
+		wrong_amount.allocation_digest = wrong_amount.digest();
+		assert_eq!(
+			validate_cooperative_close_asset_allocation(Some(&wrong_amount), &expected),
+			Err(TaprootAssetCloseAllocationError::AmountMismatch)
+		);
+
+		let mut wrong_root = allocation;
+		wrong_root.proof_root_hash = [16; TAPROOT_ASSET_ID_LEN];
+		wrong_root.allocation_digest = wrong_root.digest();
+		assert_eq!(
+			validate_cooperative_close_asset_allocation(Some(&wrong_root), &expected),
+			Err(TaprootAssetCloseAllocationError::ProofRootMismatch)
+		);
+
+		let mut wrong_digest = allocation;
+		wrong_digest.allocation_digest = [16; TAPROOT_ASSET_ID_LEN];
+		assert_eq!(
+			validate_cooperative_close_asset_allocation(Some(&wrong_digest), &expected),
+			Err(TaprootAssetCloseAllocationError::AllocationDigestMismatch)
 		);
 	}
 
