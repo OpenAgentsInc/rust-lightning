@@ -3937,7 +3937,8 @@ impl<NS: NodeSigner> ReadableArgs<(Option<PublicKey>, NS)> for InboundOnionPaylo
 					used_aad,
 				} => {
 					if amt.is_some()
-						|| cltv_value.is_some() || total_msat.is_some()
+						|| cltv_value.is_some()
+						|| total_msat.is_some()
 						|| keysend_preimage.is_some()
 						|| invoice_request.is_some()
 						|| used_aad != TriPolyAADUsed::None
@@ -3959,7 +3960,8 @@ impl<NS: NodeSigner> ReadableArgs<(Option<PublicKey>, NS)> for InboundOnionPaylo
 					used_aad,
 				} => {
 					if amt.is_some()
-						|| cltv_value.is_some() || total_msat.is_some()
+						|| cltv_value.is_some()
+						|| total_msat.is_some()
 						|| keysend_preimage.is_some()
 						|| invoice_request.is_some()
 						|| used_aad == TriPolyAADUsed::None
@@ -4107,7 +4109,8 @@ impl<NS: NodeSigner> ReadableArgs<(Option<PublicKey>, NS)> for InboundTrampoline
 					used_aad,
 				} => {
 					if amt.is_some()
-						|| cltv_value.is_some() || total_msat.is_some()
+						|| cltv_value.is_some()
+						|| total_msat.is_some()
 						|| keysend_preimage.is_some()
 						|| invoice_request.is_some()
 						|| used_aad != TriPolyAADUsed::None
@@ -4647,6 +4650,7 @@ mod tests {
 		require_public_nonce, Musig2PublicNonce, SimpleTaprootNextLocalNonces,
 		SimpleTaprootNonceEntry, SimpleTaprootPartialSignature,
 		SimpleTaprootPartialSignatureWithNonce, MUSIG2_PARTIAL_SIGNATURE_LEN,
+		MUSIG2_PUBLIC_NONCE_LEN,
 	};
 	use crate::ln::types::ChannelId;
 	use crate::routing::gossip::{NodeAlias, NodeId};
@@ -4928,6 +4932,64 @@ mod tests {
 		BigSize(typ).write(bytes).unwrap();
 		BigSize(value.len() as u64).write(bytes).unwrap();
 		bytes.extend_from_slice(value);
+	}
+
+	#[test]
+	fn simple_taproot_bolt_tlv_payload_vectors() {
+		let local_nonce = Vec::<u8>::from_hex(
+			"025f2272ea289c5fe9d52d411f5a50a6d4882341bf0ecb201d5675850a2ba0b09\
+			 d025bc489cf67752134ba81f8d7f1146d7455baf3190de75a6a661e2405212991a9",
+		)
+		.unwrap();
+		let remote_nonce = Vec::<u8>::from_hex(
+			"02d324627074522af8cf4287caf1e073a3493550b99aed2697e58f476ec402e272039\
+			 c25fc616207e15917b7145cefcb4c9c702580baf255597d2fa115564a74a130",
+		)
+		.unwrap();
+		let partial_signature =
+			Vec::<u8>::from_hex("3fa93659d4c2d590eadbd422595a37597ed58607e026a91f4e6e19329134a931")
+				.unwrap();
+		assert_eq!(local_nonce.len(), MUSIG2_PUBLIC_NONCE_LEN);
+		assert_eq!(remote_nonce.len(), MUSIG2_PUBLIC_NONCE_LEN);
+		assert_eq!(partial_signature.len(), MUSIG2_PARTIAL_SIGNATURE_LEN);
+
+		let local_nonce = Musig2PublicNonce::from_slice(&local_nonce).unwrap();
+		let remote_nonce = Musig2PublicNonce::from_slice(&remote_nonce).unwrap();
+		let partial_signature =
+			SimpleTaprootPartialSignature::from_slice(&partial_signature).unwrap();
+		let partial_with_nonce =
+			SimpleTaprootPartialSignatureWithNonce::new(partial_signature, remote_nonce);
+
+		let mut partial_with_nonce_payload = Vec::new();
+		partial_with_nonce.write(&mut partial_with_nonce_payload).unwrap();
+		let mut expected_partial_with_nonce = Vec::new();
+		expected_partial_with_nonce.extend_from_slice(partial_signature.as_bytes());
+		expected_partial_with_nonce.extend_from_slice(remote_nonce.as_bytes());
+		assert_eq!(partial_with_nonce_payload, expected_partial_with_nonce);
+
+		let mut partial_with_nonce_tlv = Vec::new();
+		append_tlv(&mut partial_with_nonce_tlv, 2, &partial_with_nonce_payload);
+		let mut expected_partial_with_nonce_tlv = vec![2, 98];
+		expected_partial_with_nonce_tlv.extend_from_slice(&expected_partial_with_nonce);
+		assert_eq!(partial_with_nonce_tlv, expected_partial_with_nonce_tlv);
+
+		let mut next_local_nonce_tlv = Vec::new();
+		append_tlv(&mut next_local_nonce_tlv, 4, local_nonce.as_bytes());
+		let mut expected_next_local_nonce_tlv = vec![4, 66];
+		expected_next_local_nonce_tlv.extend_from_slice(local_nonce.as_bytes());
+		assert_eq!(next_local_nonce_tlv, expected_next_local_nonce_tlv);
+
+		let mut shutdown_nonce_tlv = Vec::new();
+		append_tlv(&mut shutdown_nonce_tlv, 8, local_nonce.as_bytes());
+		let mut expected_shutdown_nonce_tlv = vec![8, 66];
+		expected_shutdown_nonce_tlv.extend_from_slice(local_nonce.as_bytes());
+		assert_eq!(shutdown_nonce_tlv, expected_shutdown_nonce_tlv);
+
+		let mut next_closee_nonce_tlv = Vec::new();
+		append_tlv(&mut next_closee_nonce_tlv, 22, local_nonce.as_bytes());
+		let mut expected_next_closee_nonce_tlv = vec![22, 66];
+		expected_next_closee_nonce_tlv.extend_from_slice(local_nonce.as_bytes());
+		assert_eq!(next_closee_nonce_tlv, expected_next_closee_nonce_tlv);
 	}
 
 	#[test]

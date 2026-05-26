@@ -2603,6 +2603,25 @@ mod tests {
 		assert_eq!(out.script_pubkey.as_bytes(), &<Vec<u8>>::from_hex(script_hex).unwrap()[..]);
 	}
 
+	#[cfg(feature = "simple_taproot_musig2")]
+	fn assert_p2tr_txout_value(out: &TxOut, value_sat: u64) {
+		assert_eq!(out.value.to_sat(), value_sat);
+		assert!(out.script_pubkey.is_p2tr());
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	fn bolt_simple_taproot_htlc(
+		incoming: bool, amount_msat: u64, cltv_expiry: u32, preimage_byte: u8,
+	) -> HTLCOutputInCommitment {
+		HTLCOutputInCommitment {
+			offered: !incoming,
+			amount_msat,
+			cltv_expiry,
+			payment_hash: PaymentHash(Sha256::hash(&[preimage_byte; 32]).to_byte_array()),
+			transaction_output_index: None,
+		}
+	}
+
 	#[test]
 	#[rustfmt::skip]
 	fn test_anchors() {
@@ -2778,6 +2797,37 @@ mod tests {
 		assert_eq!(htlc_success.output[0].script_pubkey.as_bytes(), &<Vec<u8>>::from_hex("5120df20bcec43daa75161f7d013254e401812e0fee8bc3369220b6a33672fc18ba0").unwrap()[..]);
 
 		assert_eq!(commit_tx_fee_sat(15_000, 0, &ChannelTypeFeatures::simple_taproot_staging()), 14_520);
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	#[test]
+	#[rustfmt::skip]
+	fn test_simple_taproot_bolt_multi_htlc_commitment_value_vectors() {
+		let mut builder = simple_taproot_vector_builder();
+		builder.feerate_per_kw = 644;
+		let htlcs = vec![
+			bolt_simple_taproot_htlc(true, 1_000_000, 500, 0),
+			bolt_simple_taproot_htlc(true, 2_000_000, 501, 1),
+			bolt_simple_taproot_htlc(false, 2_000_000, 502, 2),
+			bolt_simple_taproot_htlc(false, 3_000_000, 503, 3),
+			bolt_simple_taproot_htlc(true, 4_000_000, 504, 4),
+		];
+		let tx = builder.build(6_988_000, 3_000_000, htlcs.clone());
+		let outputs = &tx.built.transaction.output;
+		assert_eq!(outputs.len(), 9);
+		assert_p2tr_txout_value(&outputs[2], 1_000);
+		assert_p2tr_txout_value(&outputs[3], 2_000);
+		assert_p2tr_txout_value(&outputs[4], 2_000);
+		assert_p2tr_txout_value(&outputs[5], 3_000);
+		assert_p2tr_txout_value(&outputs[6], 4_000);
+		assert!(builder.verify(&tx).is_ok());
+
+		let tx = builder.build(6_988_000, 3_000_000, vec![htlcs[3].clone(), htlcs[4].clone()]);
+		let outputs = &tx.built.transaction.output;
+		assert_eq!(outputs.len(), 6);
+		assert_p2tr_txout_value(&outputs[2], 3_000);
+		assert_p2tr_txout_value(&outputs[3], 4_000);
+		assert!(builder.verify(&tx).is_ok());
 	}
 
 	#[test]

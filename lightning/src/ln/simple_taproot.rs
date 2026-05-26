@@ -1870,6 +1870,14 @@ mod tests {
 	}
 
 	#[cfg(feature = "simple_taproot_musig2")]
+	fn assert_leaf_hash(script: &ScriptBuf, expected_hex: &str) {
+		assert_eq!(
+			TapLeafHash::from_script(script, LeafVersion::TapScript).to_byte_array(),
+			hash_from_hex(expected_hex)
+		);
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
 	fn hash_from_hex(hex: &str) -> [u8; 32] {
 		Vec::<u8>::from_hex(hex).unwrap().try_into().unwrap()
 	}
@@ -1896,9 +1904,17 @@ mod tests {
 			&to_local.revocation.script,
 			"2015ec0138eb42f1ab4603042123988d53c854e89d1d87aa4dbb97a57482029c057520d4c77088d346bce67c13bbbf82ca112588f4b1c9595a1f8af3be9b2f95a109a0ac",
 		);
+		assert_leaf_hash(
+			&to_local.revocation.script,
+			"8fcd64d212bbbf1bcec2360bbf229963240d05992fc2efb482fe6dca85b9469a",
+		);
 		assert_script_hex(
 			&to_local.delay.script,
 			"2015ec0138eb42f1ab4603042123988d53c854e89d1d87aa4dbb97a57482029c05ad029000b2",
+		);
+		assert_leaf_hash(
+			&to_local.delay.script,
+			"dbf0400e9c7c57f30b6ad0b0677e396b5a002cbf050d873c8925b966048e6a62",
 		);
 		assert_eq!(
 			to_local.tapscript_root,
@@ -1918,6 +1934,10 @@ mod tests {
 			&to_remote.spend.script,
 			"20595f2ef2a51d2250a21077dbea4a7fc3ce550f10676996bf63719e2a71d1f4c9ad51b2",
 		);
+		assert_leaf_hash(
+			&to_remote.spend.script,
+			"63ce35b16eb8f8687293d5a88c1d8ada3236843b79ca315fe9dd7c47f30f2bc9",
+		);
 		assert_eq!(
 			to_remote.tapscript_root,
 			hash_from_hex("63ce35b16eb8f8687293d5a88c1d8ada3236843b79ca315fe9dd7c47f30f2bc9")
@@ -1932,6 +1952,10 @@ mod tests {
 		let local_anchor =
 			simple_taproot_anchor_spend_info(&secp_ctx, &local_delayed_pubkey).unwrap();
 		assert_script_hex(&local_anchor.spend.script, "60b2");
+		assert_leaf_hash(
+			&local_anchor.spend.script,
+			"2b88a8f3f52386d61d5b3f2d822df659c35214d7360ed05352ad7ddc1ab03912",
+		);
 		assert_eq!(
 			local_anchor.tapscript_root,
 			hash_from_hex("2b88a8f3f52386d61d5b3f2d822df659c35214d7360ed05352ad7ddc1ab03912")
@@ -1979,9 +2003,17 @@ mod tests {
 			&offered.success.script,
 			"82012088a914b8bcb07f6344b42ab04250c86a6e8b75d3fdbbc688202deba21cf03c42362c9f912094f62ba045a040a2060882ba1ed3abf1f664a47dad51b2",
 		);
+		assert_leaf_hash(
+			&offered.success.script,
+			"cd4b7ba74d132998f2bcea85f76082f5018e614c86f27f2631b6569c4914320f",
+		);
 		assert_script_hex(
 			&offered.timeout.script,
 			"2071e82ef65d5c667159036bfcf662cac2f6c41e38323d148bbbd00fdcd923739ead202deba21cf03c42362c9f912094f62ba045a040a2060882ba1ed3abf1f664a47dac",
+		);
+		assert_leaf_hash(
+			&offered.timeout.script,
+			"dd0bd08b3df902c399f5493a682f6c50c476c89e233ba454e89a234d2d16ffe3",
 		);
 		assert_eq!(
 			offered.tapscript_root,
@@ -2009,9 +2041,17 @@ mod tests {
 			&accepted.success.script,
 			"82012088a914b8bcb07f6344b42ab04250c86a6e8b75d3fdbbc688202deba21cf03c42362c9f912094f62ba045a040a2060882ba1ed3abf1f664a47dad2071e82ef65d5c667159036bfcf662cac2f6c41e38323d148bbbd00fdcd923739eac",
 		);
+		assert_leaf_hash(
+			&accepted.success.script,
+			"69192ca730d4480044ade8741b8bd0845a32880aebaf58bc6f9186f8d2be8cbf",
+		);
 		assert_script_hex(
 			&accepted.timeout.script,
 			"2071e82ef65d5c667159036bfcf662cac2f6c41e38323d148bbbd00fdcd923739ead51b26902f401b1",
+		);
+		assert_leaf_hash(
+			&accepted.timeout.script,
+			"4da43c795365bf757ed1e9656d12ea744b4cf52b01719a3ea94e6569115623f0",
 		);
 		assert_eq!(
 			accepted.tapscript_root,
@@ -2035,6 +2075,10 @@ mod tests {
 		assert_script_hex(
 			&second_level.spend.script,
 			"2015ec0138eb42f1ab4603042123988d53c854e89d1d87aa4dbb97a57482029c05ad029000b2",
+		);
+		assert_leaf_hash(
+			&second_level.spend.script,
+			"dbf0400e9c7c57f30b6ad0b0677e396b5a002cbf050d873c8925b966048e6a62",
 		);
 		assert_eq!(
 			second_level.tapscript_root,
