@@ -940,6 +940,7 @@ pub fn do_test_fee_spike_buffer(cfg: Option<UserConfig>, htlc_fails: bool) {
 		per_commitment_secret: local_secret,
 		next_per_commitment_point: next_local_point,
 		release_htlc_message_paths: Vec::new(),
+		simple_taproot_next_local_nonce: None,
 		simple_taproot_next_local_nonces: None,
 	};
 	nodes[1].node.handle_revoke_and_ack(node_a_id, &raa_msg);
@@ -2319,6 +2320,7 @@ pub fn do_test_dust_limit_fee_accounting(can_afford: bool) {
 			per_commitment_secret: local_secret,
 			next_per_commitment_point: next_local_point,
 			release_htlc_message_paths: Vec::new(),
+			simple_taproot_next_local_nonce: None,
 			simple_taproot_next_local_nonces: None,
 		};
 		nodes[1].node.handle_revoke_and_ack(node_a_id, &raa_msg);
@@ -2733,6 +2735,7 @@ fn manually_trigger_update_fail_htlc<'a, 'b, 'c, 'd>(
 		per_commitment_secret: local_secret,
 		next_per_commitment_point: next_local_point,
 		release_htlc_message_paths: Vec::new(),
+		simple_taproot_next_local_nonce: None,
 		simple_taproot_next_local_nonces: None,
 	};
 	nodes[1].node.handle_revoke_and_ack(node_a_id, &raa_msg);

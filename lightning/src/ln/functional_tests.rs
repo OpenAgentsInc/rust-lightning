@@ -6708,6 +6708,7 @@ pub fn test_counterparty_raa_skip_no_crash() {
 		per_commitment_secret,
 		next_per_commitment_point,
 		release_htlc_message_paths: Vec::new(),
+		simple_taproot_next_local_nonce: None,
 		simple_taproot_next_local_nonces: None,
 	};
 	nodes[1].node.handle_revoke_and_ack(node_a_id, &raa);

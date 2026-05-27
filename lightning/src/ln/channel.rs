@@ -6281,11 +6281,13 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 	}
 
 	fn simple_taproot_store_counterparty_next_local_nonces(
-		&mut self, next_local_nonces: Option<&SimpleTaprootNextLocalNonces>,
-		expected_funding_txids: &[Txid],
+		&mut self, legacy_next_local_nonce: Option<Musig2PublicNonce>,
+		next_local_nonces: Option<&SimpleTaprootNextLocalNonces>, expected_funding_txids: &[Txid],
 	) -> Result<(), ChannelError> {
 		if expected_funding_txids.is_empty() {
-			if next_local_nonces.map_or(false, |nonces| !nonces.0.is_empty()) {
+			if legacy_next_local_nonce.is_some()
+				|| next_local_nonces.map_or(false, |nonces| !nonces.0.is_empty())
+			{
 				return Err(ChannelError::close(
 					"Peer sent unexpected simple-taproot nonce state".to_owned(),
 				));
@@ -6293,9 +6295,25 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 			return Ok(());
 		}
 
-		let next_local_nonces = next_local_nonces.ok_or_else(|| {
-			ChannelError::close("Peer omitted simple-taproot next-local nonces".to_owned())
-		})?;
+		let next_local_nonces = match next_local_nonces {
+			Some(next_local_nonces) => next_local_nonces,
+			None => {
+				let legacy_next_local_nonce = legacy_next_local_nonce.ok_or_else(|| {
+					ChannelError::close("Peer omitted simple-taproot next-local nonces".to_owned())
+				})?;
+				if expected_funding_txids.len() != 1 {
+					return Err(ChannelError::close(
+						"Peer sent legacy simple-taproot nonce for multiple funding txids"
+							.to_owned(),
+					));
+				}
+				self.simple_taproot_store_counterparty_next_local_nonce(
+					expected_funding_txids[0],
+					legacy_next_local_nonce,
+				);
+				return Ok(());
+			},
+		};
 		let mut seen_funding_txids = Vec::new();
 		for entry in next_local_nonces.0.iter() {
 			if !expected_funding_txids.iter().any(|txid| *txid == entry.funding_txid) {
@@ -8228,10 +8246,12 @@ where
 	}
 
 	fn simple_taproot_store_counterparty_next_local_nonces(
-		&mut self, next_local_nonces: Option<&SimpleTaprootNextLocalNonces>,
+		&mut self, legacy_next_local_nonce: Option<Musig2PublicNonce>,
+		next_local_nonces: Option<&SimpleTaprootNextLocalNonces>,
 	) -> Result<(), ChannelError> {
 		let expected_funding_txids = self.simple_taproot_expected_funding_txids()?;
 		self.context.simple_taproot_store_counterparty_next_local_nonces(
+			legacy_next_local_nonce,
 			next_local_nonces,
 			&expected_funding_txids,
 		)
@@ -10202,6 +10222,7 @@ where
 				ChannelError::close("Previous secrets did not match new one".to_owned())
 			})?;
 		self.simple_taproot_store_counterparty_next_local_nonces(
+			msg.simple_taproot_next_local_nonce,
 			msg.simple_taproot_next_local_nonces.as_ref(),
 		)?;
 		self.context.latest_monitor_update_id += 1;
@@ -11377,11 +11398,20 @@ where
 						return None;
 					},
 				};
+				let simple_taproot_next_local_nonce =
+					simple_taproot_next_local_nonces.as_ref().and_then(|nonces| {
+						if nonces.0.len() == 1 {
+							Some(nonces.0[0].public_nonce)
+						} else {
+							None
+						}
+					});
 				return Some(msgs::RevokeAndACK {
 					channel_id: self.context.channel_id,
 					per_commitment_secret,
 					next_per_commitment_point: self.holder_commitment_point.next_point(),
 					release_htlc_message_paths,
+					simple_taproot_next_local_nonce,
 					simple_taproot_next_local_nonces,
 				});
 			}
@@ -11618,6 +11648,7 @@ where
 			)));
 		}
 		self.simple_taproot_store_counterparty_next_local_nonces(
+			msg.simple_taproot_next_local_nonce,
 			msg.simple_taproot_next_local_nonces.as_ref(),
 		)?;
 
@@ -14183,6 +14214,14 @@ where
 				None
 			},
 		};
+		let simple_taproot_next_local_nonce =
+			simple_taproot_next_local_nonces.as_ref().and_then(|nonces| {
+				if nonces.0.len() == 1 {
+					Some(nonces.0[0].public_nonce)
+				} else {
+					None
+				}
+			});
 		msgs::ChannelReestablish {
 			channel_id: self.context.channel_id(),
 			// The protocol has two different commitment number concepts - the "commitment
@@ -14207,6 +14246,7 @@ where
 			my_current_per_commitment_point: dummy_pubkey,
 			next_funding: self.maybe_get_next_funding(),
 			my_current_funding_locked,
+			simple_taproot_next_local_nonce,
 			simple_taproot_next_local_nonces,
 		}
 	}

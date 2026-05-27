@@ -944,6 +944,8 @@ pub struct RevokeAndACK {
 	///
 	/// [`HeldHtlcAvailable`]: crate::onion_message::async_payments::HeldHtlcAvailable
 	pub release_htlc_message_paths: Vec<(u64, BlindedMessagePath)>,
+	/// Legacy single next local MuSig2 nonce for staging simple-taproot commitments.
+	pub simple_taproot_next_local_nonce: Option<Musig2PublicNonce>,
 	/// Per-funding-transaction next local MuSig2 nonces for simple-taproot commitments.
 	pub simple_taproot_next_local_nonces: Option<SimpleTaprootNextLocalNonces>,
 }
@@ -996,6 +998,8 @@ pub struct ChannelReestablish {
 	///
 	/// Also contains a bitfield indicating which messages should be retransmitted.
 	pub my_current_funding_locked: Option<FundingLocked>,
+	/// Legacy single next local MuSig2 nonce for staging simple-taproot channel reestablishment.
+	pub simple_taproot_next_local_nonce: Option<Musig2PublicNonce>,
 	/// Per-funding-transaction next local MuSig2 nonces for simple-taproot retransmission.
 	pub simple_taproot_next_local_nonces: Option<SimpleTaprootNextLocalNonces>,
 }
@@ -3214,6 +3218,7 @@ impl_writeable_msg!(ChannelReestablish, {
 	my_current_per_commitment_point,
 }, {
 	(1, next_funding, option),
+	(4, simple_taproot_next_local_nonce, option),
 	(5, my_current_funding_locked, option),
 	(22, simple_taproot_next_local_nonces, option),
 });
@@ -3551,6 +3556,7 @@ impl_writeable_msg!(RevokeAndACK, {
 	per_commitment_secret,
 	next_per_commitment_point
 }, {
+	(4, simple_taproot_next_local_nonce, option),
 	(22, simple_taproot_next_local_nonces, option),
 	(75537, release_htlc_message_paths, optional_vec)
 });
@@ -4729,6 +4735,7 @@ mod tests {
 			my_current_per_commitment_point: public_key,
 			next_funding: None,
 			my_current_funding_locked: None,
+			simple_taproot_next_local_nonce: None,
 			simple_taproot_next_local_nonces: None,
 		};
 
@@ -4785,6 +4792,7 @@ mod tests {
 				retransmit_flags: 1,
 			}),
 			my_current_funding_locked: None,
+			simple_taproot_next_local_nonce: None,
 			simple_taproot_next_local_nonces: None,
 		};
 
@@ -4845,6 +4853,7 @@ mod tests {
 				),
 				retransmit_flags: 1,
 			}),
+			simple_taproot_next_local_nonce: None,
 			simple_taproot_next_local_nonces: None,
 		};
 
@@ -4946,6 +4955,42 @@ mod tests {
 		BigSize(typ).write(bytes).unwrap();
 		BigSize(value.len() as u64).write(bytes).unwrap();
 		bytes.extend_from_slice(value);
+	}
+
+	#[test]
+	fn channel_reestablish_simple_taproot_nonce_tlvs_match_lnd_staging_order() {
+		let nonce = sample_musig2_nonce();
+		let next_local_nonces = sample_next_local_nonces();
+		let public_key =
+			sample_pubkey("0101010101010101010101010101010101010101010101010101010101010101");
+		let funding_txid =
+			Txid::from_str("c2d4449afa8d26140898dd54d3390b057ba2a5afcf03ba29d7dc0d8b9ffe966e")
+				.unwrap();
+		let channel_reestablish = msgs::ChannelReestablish {
+			channel_id: ChannelId::from_bytes([3; 32]),
+			next_local_commitment_number: 1,
+			next_remote_commitment_number: 1,
+			your_last_per_commitment_secret: [1; 32],
+			my_current_per_commitment_point: public_key,
+			next_funding: None,
+			my_current_funding_locked: Some(msgs::FundingLocked {
+				txid: funding_txid,
+				retransmit_flags: 1,
+			}),
+			simple_taproot_next_local_nonce: Some(nonce),
+			simple_taproot_next_local_nonces: Some(next_local_nonces),
+		};
+
+		let encoded = channel_reestablish.encode();
+		let tlv_start = 32 + 8 + 8 + 32 + 33;
+		let tlvs = &encoded[tlv_start..];
+		assert_eq!(tlvs[0], 4);
+		assert_eq!(tlvs[1], MUSIG2_PUBLIC_NONCE_LEN as u8);
+		assert_eq!(&tlvs[2..68], nonce.as_bytes());
+		assert_eq!(tlvs[68], 5);
+		assert_eq!(tlvs[69], 33);
+		assert_eq!(tlvs[103], 22);
+		assert_eq!(tlvs[104], 98);
 	}
 
 	#[test]
@@ -5173,8 +5218,13 @@ mod tests {
 			per_commitment_secret: [1; 32],
 			next_per_commitment_point: open_channel.common_fields.first_per_commitment_point,
 			release_htlc_message_paths: Vec::new(),
+			simple_taproot_next_local_nonce: Some(nonce),
 			simple_taproot_next_local_nonces: Some(next_local_nonces.clone()),
 		};
+		assert_eq!(
+			round_trip_message(&revoke_and_ack).simple_taproot_next_local_nonce,
+			Some(nonce)
+		);
 		assert_eq!(
 			round_trip_message(&revoke_and_ack).simple_taproot_next_local_nonces,
 			Some(next_local_nonces.clone())
@@ -5188,8 +5238,13 @@ mod tests {
 			my_current_per_commitment_point: open_channel.common_fields.first_per_commitment_point,
 			next_funding: None,
 			my_current_funding_locked: None,
+			simple_taproot_next_local_nonce: Some(nonce),
 			simple_taproot_next_local_nonces: Some(next_local_nonces.clone()),
 		};
+		assert_eq!(
+			round_trip_message(&channel_reestablish).simple_taproot_next_local_nonce,
+			Some(nonce)
+		);
 		assert_eq!(
 			round_trip_message(&channel_reestablish).simple_taproot_next_local_nonces,
 			Some(next_local_nonces)
@@ -6760,6 +6815,7 @@ mod tests {
 			],
 			next_per_commitment_point: pubkey_1,
 			release_htlc_message_paths: Vec::new(),
+			simple_taproot_next_local_nonce: None,
 			simple_taproot_next_local_nonces: None,
 		};
 		let encoded_value = raa.encode();
