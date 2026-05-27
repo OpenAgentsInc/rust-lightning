@@ -28,7 +28,9 @@ std = []
 
 dnssec = ["dnssec-prover/validation"]
 
-simple_taproot_musig2 = ["std", "dep:musig2"]
+simple_close = []
+
+simple_taproot_musig2 = ["std", "simple_close", "dep:musig2"]
 
 # Generates low-r bitcoin signatures, which saves 1 byte in 50% of the cases
 grind_signatures = []

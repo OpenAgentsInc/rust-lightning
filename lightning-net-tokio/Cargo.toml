@@ -16,6 +16,11 @@ rust-version = "1.75"
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
+[features]
+default = []
+simple_close = ["lightning/simple_close"]
+simple_taproot_musig2 = ["simple_close", "lightning/simple_taproot_musig2"]
+
 [dependencies]
 bitcoin = "0.32.2"
 lightning = { version = "0.3.0", path = "../lightning" }
