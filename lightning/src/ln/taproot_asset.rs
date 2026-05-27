@@ -598,10 +598,8 @@ pub fn derive_no_split_taproot_asset_aux_leaf_script(
 	let asset_leaf = taproot_asset_mssmt_leaf(&asset_bytes, asset_amount);
 	let asset_commitment_key = no_split_asset_commitment_key(template, output_xonly_key);
 	let asset_root = taproot_asset_mssmt_single_leaf_root(asset_commitment_key, asset_leaf)?;
-	let asset_commitment_root =
-		fold_single_asset_commitment_root(template.tap_commitment_key, &asset_root)?;
 	let asset_commitment_leaf =
-		taproot_asset_asset_commitment_leaf(asset_commitment_root.root_hash, asset_amount);
+		taproot_asset_asset_commitment_leaf(asset_root.root_hash, asset_root.root_sum);
 	let tap_commitment_leaf = taproot_asset_mssmt_leaf(&asset_commitment_leaf, asset_amount);
 	let tap_root =
 		taproot_asset_mssmt_single_leaf_root(template.tap_commitment_key, tap_commitment_leaf)?;
@@ -809,22 +807,6 @@ fn taproot_asset_mssmt_single_leaf_root(
 		root_sum: current.sum,
 		left_hash: root_left,
 		right_hash: root_right,
-	})
-}
-
-fn fold_single_asset_commitment_root(
-	tap_commitment_key: [u8; 32], root: &TaprootAssetMssmtRootParts,
-) -> Result<TaprootAssetMssmtRootParts, TaprootAssetChannelAssetTemplateError> {
-	let mut engine = Sha256::engine();
-	engine.input(&tap_commitment_key);
-	engine.input(&root.left_hash);
-	engine.input(&root.right_hash);
-	engine.input(&root.root_sum.to_be_bytes());
-	Ok(TaprootAssetMssmtRootParts {
-		root_hash: Sha256::from_engine(engine).to_byte_array(),
-		root_sum: root.root_sum,
-		left_hash: [0; 32],
-		right_hash: [0; 32],
 	})
 }
 
