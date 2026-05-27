@@ -1871,6 +1871,11 @@ where
 
 		let holder_pubkeys = &parameters.holder_pubkeys;
 		let counterparty_pubkeys = &counterparty_parameters.pubkeys;
+		// Lightning Labs' Taproot Asset channel funding controller derives asset-bearing
+		// to-local aux leaves from an AuxChanState with a zero CSV delay. Keep the ordinary
+		// channel contest delays for non-asset simple-taproot outputs, but use this zero delay
+		// when computing the base output keys that Taproot Asset commitments bind to.
+		let taproot_asset_to_local_contest_delay = 0;
 
 		let holder_commitment_keys = TxCreationKeys::from_channel_static_keys(
 			&holder_commitment_point.next_point(),
@@ -1882,7 +1887,7 @@ where
 			&context.secp_ctx,
 			&holder_commitment_keys.broadcaster_delayed_payment_key.to_public_key(),
 			&holder_commitment_keys.revocation_key.to_public_key(),
-			parameters.holder_selected_contest_delay,
+			taproot_asset_to_local_contest_delay,
 		)
 		.map_err(|_| {
 			ChannelError::close("Failed to derive holder Taproot Asset output key".to_owned())
@@ -1919,7 +1924,7 @@ where
 			&context.secp_ctx,
 			&counterparty_commitment_keys.broadcaster_delayed_payment_key.to_public_key(),
 			&counterparty_commitment_keys.revocation_key.to_public_key(),
-			counterparty_parameters.selected_contest_delay,
+			taproot_asset_to_local_contest_delay,
 		)
 		.map_err(|_| {
 			ChannelError::close("Failed to derive counterparty Taproot Asset output key".to_owned())

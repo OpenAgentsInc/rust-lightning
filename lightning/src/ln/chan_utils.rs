@@ -1436,6 +1436,19 @@ impl<'a> DirectedChannelTransactionParameters<'a> {
 		if self.holder_is_broadcaster { counterparty_parameters.selected_contest_delay } else { self.inner.holder_selected_contest_delay }
 	}
 
+	#[cfg(feature = "simple_taproot_musig2")]
+	fn simple_taproot_to_broadcaster_contest_delay(&self) -> u16 {
+		if self.inner.channel_type_features.requires_taproot_asset_channel()
+			&& self.simple_taproot_to_broadcaster_aux_leaf_script().is_some()
+		{
+			// Lightning Labs' Taproot Asset channel controller derives asset-bearing
+			// to-local aux leaves from an AuxChanState with a zero CSV delay.
+			0
+		} else {
+			self.contest_delay()
+		}
+	}
+
 	/// Whether the channel is outbound from the broadcaster.
 	///
 	/// The boolean representing the side that initiated the channel is
@@ -2106,7 +2119,7 @@ impl CommitmentTransaction {
 					&secp_ctx,
 					&keys.broadcaster_delayed_payment_key.to_public_key(),
 					&keys.revocation_key.to_public_key(),
-					contest_delay,
+					channel_parameters.simple_taproot_to_broadcaster_contest_delay(),
 					channel_parameters.simple_taproot_to_broadcaster_aux_leaf_script(),
 				)
 				.expect("valid simple-taproot to_local output")
@@ -2923,6 +2936,125 @@ mod tests {
 			&<Vec<u8>>::from_hex("51207b49ec6082e5fe6cd59ab23ab3030a918928dab1e3ea202b5c0faba770a830bf").unwrap()[..]
 		);
 		assert!(builder.verify(&tx).is_ok());
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	#[test]
+	#[rustfmt::skip]
+	fn test_taproot_asset_to_broadcaster_aux_leaf_uses_zero_csv() {
+		let mut builder = simple_taproot_vector_builder();
+		builder.channel_parameters.channel_type_features = ChannelTypeFeatures::taproot_asset_single_asset();
+		let aux_leaf = ScriptBuf::new_op_return(&[7; 32]);
+		builder.channel_parameters.simple_taproot_holder_commitment_to_holder_aux_leaf_script =
+			Some(aux_leaf.clone());
+		builder.channel_parameters.simple_taproot_holder_commitment_to_counterparty_aux_leaf_script =
+			Some(aux_leaf.clone());
+
+		let tx = builder.build(6_984_820, 3_000_000, Vec::new());
+		let trusted = tx.trust();
+		let keys = trusted.keys();
+		let to_broadcaster_idx = tx.built.transaction.output.iter()
+			.position(|output| output.value.to_sat() == 6_984_820)
+			.unwrap();
+		let expected_to_broadcaster = simple_taproot_to_local_spend_info_with_aux_leaf(
+			&builder.secp_ctx,
+			&keys.broadcaster_delayed_payment_key.to_public_key(),
+			&keys.revocation_key.to_public_key(),
+			0,
+			Some(aux_leaf.as_script()),
+		)
+		.unwrap()
+		.script_pubkey;
+
+		assert_eq!(tx.built.transaction.output[to_broadcaster_idx].script_pubkey, expected_to_broadcaster);
+		assert!(builder.verify(&tx).is_ok());
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	#[test]
+	fn taproot_asset_to_local_zero_csv_matches_lightning_labs_overlay() {
+		let secp_ctx = Secp256k1::new();
+		let lnd_first_commitment_point = PublicKey::from_slice(
+			&Vec::<u8>::from_hex(
+				"02c6658deecb43509117effbcad908fb91dc916dce4431fe5c7bd218f59a931f77",
+			)
+			.unwrap(),
+		)
+		.unwrap();
+
+		let lnd_pubkeys = ChannelPublicKeys {
+			funding_pubkey: vector_pubkey(
+				"03040e04212debc5a2afff54a38af683f489fa799c1b2d91c2707097c4a43e6156",
+			),
+			revocation_basepoint: RevocationBasepoint(vector_pubkey(
+				"035109a4082f1cd2251efff9a3cb5aa6f51f239290a580d9ef7f99dfa8378b0649",
+			)),
+			payment_point: vector_pubkey(
+				"02eddef6fbf0d6a82e7140a52d4b68448207acb4df677fed25f5993922f86aca87",
+			),
+			delayed_payment_basepoint: DelayedPaymentBasepoint(vector_pubkey(
+				"03478ff1ffd68004c4f700294793bfebecc7a7ad57c0eb89add1916c494e613305",
+			)),
+			htlc_basepoint: HtlcBasepoint(vector_pubkey(
+				"035e5de34eb7b5e040d0d43909d1e3718a06d3a640519862aeb9392239aae1342f",
+			)),
+		};
+		let ldk_pubkeys = ChannelPublicKeys {
+			funding_pubkey: vector_pubkey(
+				"037fee8c1cac7a70cc7d8dc347b2e1d17ab8ceb0046ccb429d502bc1f8948717a0",
+			),
+			revocation_basepoint: RevocationBasepoint(vector_pubkey(
+				"030192949f43dff6803cf64d4cd716f5dd512f1bcd2e25dac58269fca6e26b3ece",
+			)),
+			payment_point: vector_pubkey(
+				"03f9528eeff0682024564e17ebcf7c3c1b8b8b644d73536c7dcd6cb6c974f1eb93",
+			),
+			delayed_payment_basepoint: DelayedPaymentBasepoint(vector_pubkey(
+				"0329d9d14769d266dd043cabcc172db7f03c1a6af57b695a45fb234286f46029ff",
+			)),
+			htlc_basepoint: HtlcBasepoint(vector_pubkey(
+				"03e41c500c5d1ba2a1c75fbd25e90dc14f643912247a67b326ef21afaf95ece762",
+			)),
+		};
+
+		let keys = super::TxCreationKeys::from_channel_static_keys(
+			&lnd_first_commitment_point,
+			&lnd_pubkeys,
+			&ldk_pubkeys,
+			&secp_ctx,
+		);
+		assert_eq!(
+			keys.broadcaster_delayed_payment_key.to_public_key().serialize(),
+			vector_pubkey("03df93f83ee4509e7c27ca3934c8efdd82ae8e8f61118839bc3572250ef7867b7d")
+				.serialize()
+		);
+		assert_eq!(
+			keys.revocation_key.to_public_key().serialize(),
+			vector_pubkey("0263bd520179fa129b356977e6b9bfba5f66610145d4dd765b97c5aaa93e3e73e2")
+				.serialize()
+		);
+
+		let csv_144 = crate::ln::simple_taproot::simple_taproot_to_local_spend_info(
+			&secp_ctx,
+			&keys.broadcaster_delayed_payment_key.to_public_key(),
+			&keys.revocation_key.to_public_key(),
+			144,
+		)
+		.unwrap()
+		.script_pubkey;
+		let csv_zero = crate::ln::simple_taproot::simple_taproot_to_local_spend_info(
+			&secp_ctx,
+			&keys.broadcaster_delayed_payment_key.to_public_key(),
+			&keys.revocation_key.to_public_key(),
+			0,
+		)
+		.unwrap()
+		.script_pubkey;
+		assert_eq!(
+			csv_zero.to_hex_string(),
+			"51209e45094e8d8ac34c025f3f477f42fa6dfd5b03e37d204fc4577de1285bbe616b"
+		);
+		assert_ne!(csv_144, csv_zero);
 	}
 
 	#[cfg(feature = "simple_taproot_musig2")]

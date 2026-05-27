@@ -450,23 +450,23 @@ fn test_taproot_asset_pending_output_keys_public_api() {
 		&secp_ctx,
 		&acceptor_commitment_keys.broadcaster_delayed_payment_key.to_public_key(),
 		&acceptor_commitment_keys.revocation_key.to_public_key(),
-		accept_channel_msg.common_fields.to_self_delay,
+		0,
 	)
 	.unwrap();
 	assert_eq!(
 		output_keys.holder_commitment_to_holder,
 		p2tr_xonly(&expected_acceptor_to_local.script_pubkey)
 	);
-	let swapped_acceptor_to_local = simple_taproot_to_local_spend_info(
+	let delayed_acceptor_to_local = simple_taproot_to_local_spend_info(
 		&secp_ctx,
 		&acceptor_commitment_keys.broadcaster_delayed_payment_key.to_public_key(),
 		&acceptor_commitment_keys.revocation_key.to_public_key(),
-		open_channel_msg.common_fields.to_self_delay,
+		accept_channel_msg.common_fields.to_self_delay,
 	)
 	.unwrap();
 	assert_ne!(
 		output_keys.holder_commitment_to_holder,
-		p2tr_xonly(&swapped_acceptor_to_local.script_pubkey)
+		p2tr_xonly(&delayed_acceptor_to_local.script_pubkey)
 	);
 
 	let initiator_commitment_keys = TxCreationKeys::from_channel_static_keys(
@@ -479,23 +479,23 @@ fn test_taproot_asset_pending_output_keys_public_api() {
 		&secp_ctx,
 		&initiator_commitment_keys.broadcaster_delayed_payment_key.to_public_key(),
 		&initiator_commitment_keys.revocation_key.to_public_key(),
-		open_channel_msg.common_fields.to_self_delay,
+		0,
 	)
 	.unwrap();
 	assert_eq!(
 		output_keys.counterparty_commitment_to_counterparty,
 		p2tr_xonly(&expected_initiator_to_local.script_pubkey)
 	);
-	let swapped_initiator_to_local = simple_taproot_to_local_spend_info(
+	let delayed_initiator_to_local = simple_taproot_to_local_spend_info(
 		&secp_ctx,
 		&initiator_commitment_keys.broadcaster_delayed_payment_key.to_public_key(),
 		&initiator_commitment_keys.revocation_key.to_public_key(),
-		accept_channel_msg.common_fields.to_self_delay,
+		open_channel_msg.common_fields.to_self_delay,
 	)
 	.unwrap();
 	assert_ne!(
 		output_keys.counterparty_commitment_to_counterparty,
-		p2tr_xonly(&swapped_initiator_to_local.script_pubkey)
+		p2tr_xonly(&delayed_initiator_to_local.script_pubkey)
 	);
 }
 
