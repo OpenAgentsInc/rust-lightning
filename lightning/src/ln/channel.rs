@@ -1175,6 +1175,7 @@ pub enum AnnouncementSigsState {
 /// A struct gathering data on a commitment, either local or remote.
 struct CommitmentData<'a> {
 	tx: CommitmentTransaction,
+	commitment_stats: CommitmentStats,
 	htlcs_included: Vec<(HTLCOutputInCommitment, Option<&'a HTLCSource>)>, // the list of HTLCs (dust HTLCs *included*) which were not ignored when building the transaction
 	outbound_htlc_preimages: Vec<PaymentPreimage>, // preimages for successful offered HTLCs since last commitment
 	inbound_htlc_preimages: Vec<PaymentPreimage>, // preimages for successful received HTLCs since last commitment
@@ -4012,6 +4013,7 @@ trait InitialRemoteCommitmentReceiver<SP: SignerProvider> {
 			holder_commitment_point.next_transaction_number(),
 			&initial_commitment_bitcoin_tx.transaction,
 			simple_taproot_partial_signature_with_nonce,
+			None,
 		)?;
 		if ChannelContext::<SP>::is_simple_taproot_funding(self.funding()) {
 			return Ok(initial_commitment_tx);
@@ -6625,6 +6627,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 	fn simple_taproot_validate_commitment_partial(
 		&self, funding: &FundingScope, nonce_index: u64, transaction: &Transaction,
 		partial_signature_with_nonce: Option<&SimpleTaprootPartialSignatureWithNonce>,
+		commitment_debug: Option<&str>,
 	) -> Result<(), ChannelError> {
 		if !Self::is_simple_taproot_funding(funding) {
 			return Ok(());
@@ -6691,7 +6694,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 				};
 				ChannelError::close(
 					format!(
-						"Invalid simple-taproot commitment partial signature: funding_txid={}, nonce_index={}, counterparty_funding_pubkey={}, local_nonce={}, counterparty_nonce={}, partial_sig={}, sighash={}, tapscript_root={}, tx={}",
+						"Invalid simple-taproot commitment partial signature: funding_txid={}, nonce_index={}, counterparty_funding_pubkey={}, local_nonce={}, counterparty_nonce={}, partial_sig={}, sighash={}, tapscript_root={}, tx={}, commitment_debug={}",
 						funding_txid,
 						nonce_index,
 						log_bytes!(funding.counterparty_funding_pubkey().serialize()),
@@ -6701,6 +6704,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 						log_bytes!(message[..]),
 						tapscript_root_debug,
 						encode::serialize_hex(transaction),
+						commitment_debug.unwrap_or("none"),
 					)
 				)
 			})
@@ -6710,6 +6714,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 	fn simple_taproot_validate_commitment_partial(
 		&self, funding: &FundingScope, _nonce_index: u64, _transaction: &Transaction,
 		_partial_signature_with_nonce: Option<&SimpleTaprootPartialSignatureWithNonce>,
+		_commitment_debug: Option<&str>,
 	) -> Result<(), ChannelError> {
 		if Self::is_simple_taproot_funding(funding) {
 			return Err(ChannelError::close(
@@ -6718,6 +6723,44 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 			));
 		}
 		Ok(())
+	}
+
+	fn simple_taproot_commitment_debug(
+		&self, funding: &FundingScope, commitment_data: &CommitmentData<'_>,
+	) -> String {
+		let htlcs = commitment_data
+			.tx
+			.nondust_htlcs()
+			.iter()
+			.map(|htlc| {
+				format!(
+					"offered={},amount_msat={},cltv={},output_index={:?},has_asset_aux={}",
+					htlc.offered,
+					htlc.amount_msat,
+					htlc.cltv_expiry,
+					htlc.transaction_output_index,
+					htlc.simple_taproot_aux_leaf_script.is_some()
+				)
+			})
+			.collect::<Vec<_>>()
+			.join(";");
+		format!(
+			"funding_value_sat={},channel_value_sat={},value_to_self_msat={},holder_dust_limit_sat={},counterparty_dust_limit_sat={},context_feerate_per_kw={},selected_feerate_per_kw={},to_broadcaster_value_sat={},to_countersignatory_value_sat={},commit_tx_fee_sat={},local_balance_before_fee_msat={},remote_balance_before_fee_msat={},nondust_htlc_count={},htlcs=[{}]",
+			funding.get_value_satoshis(),
+			funding.channel_transaction_parameters.channel_value_satoshis,
+			funding.value_to_self_msat,
+			self.holder_dust_limit_satoshis,
+			self.counterparty_dust_limit_satoshis,
+			self.feerate_per_kw,
+			commitment_data.tx.negotiated_feerate_per_kw(),
+			commitment_data.tx.to_broadcaster_value_sat(),
+			commitment_data.tx.to_countersignatory_value_sat(),
+			commitment_data.commitment_stats.commit_tx_fee_sat,
+			commitment_data.commitment_stats.local_balance_before_fee_msat,
+			commitment_data.commitment_stats.remote_balance_before_fee_msat,
+			commitment_data.tx.nondust_htlcs().len(),
+			htlcs,
+		)
 	}
 
 	fn validate_commitment_signed<F: FeeEstimator, L: Logger>(
@@ -6745,11 +6788,18 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 					"Commitment tx from peer has 0 outputs".to_owned(),
 				));
 			}
+			let simple_taproot_commitment_debug =
+				if ChannelContext::<SP>::is_simple_taproot_funding(funding) {
+					Some(self.simple_taproot_commitment_debug(funding, &commitment_data))
+				} else {
+					None
+				};
 			self.simple_taproot_validate_commitment_partial(
 				funding,
 				transaction_number,
 				&bitcoin_tx.transaction,
 				msg.simple_taproot_partial_signature_with_nonce.as_ref(),
+				simple_taproot_commitment_debug.as_deref(),
 			)?;
 			if funding.get_channel_type().requires_taproot_asset_channel() {
 				let nondust_htlc_count = commitment_data.tx.nondust_htlcs().len();
@@ -7223,7 +7273,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 		#[cfg(not(feature = "simple_taproot_musig2"))]
 		let channel_transaction_parameters = funding.channel_transaction_parameters.clone();
 
-		let (tx, _stats) = SpecTxBuilder {}.build_commitment_transaction(
+		let (tx, stats) = SpecTxBuilder {}.build_commitment_transaction(
 			local,
 			commitment_number,
 			per_commitment_point,
@@ -7239,7 +7289,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 		{
 			let PredictedNextFee { predicted_feerate, predicted_nondust_htlc_count, predicted_fee_sat } = if local { *funding.next_local_fee.lock().unwrap() } else { *funding.next_remote_fee.lock().unwrap() };
 			if predicted_feerate == tx.negotiated_feerate_per_kw() && predicted_nondust_htlc_count == tx.nondust_htlcs().len() {
-				assert_eq!(predicted_fee_sat, _stats.commit_tx_fee_sat);
+				assert_eq!(predicted_fee_sat, stats.commit_tx_fee_sat);
 			}
 		}
 		#[cfg(debug_assertions)]
@@ -7257,19 +7307,19 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 			// push us under our reserve when we are the funder and they add a HTLC, as
 			// this is really their problem. Hence, we only run this assert in tests.
 			#[cfg(test)]
-			if _stats.local_balance_before_fee_msat / 1000 < funding.counterparty_selected_channel_reserve_satoshis.unwrap() {
+			if stats.local_balance_before_fee_msat / 1000 < funding.counterparty_selected_channel_reserve_satoshis.unwrap() {
 				// If the local balance is below the reserve on this new commitment, it MUST be
 				// greater than or equal to the one on the previous commitment.
-				debug_assert!(broadcaster_prev_commitment_balance.0 <= _stats.local_balance_before_fee_msat);
+				debug_assert!(broadcaster_prev_commitment_balance.0 <= stats.local_balance_before_fee_msat);
 			}
-			broadcaster_prev_commitment_balance.0 = _stats.local_balance_before_fee_msat;
+			broadcaster_prev_commitment_balance.0 = stats.local_balance_before_fee_msat;
 
-			if _stats.remote_balance_before_fee_msat / 1000 < funding.holder_selected_channel_reserve_satoshis {
+			if stats.remote_balance_before_fee_msat / 1000 < funding.holder_selected_channel_reserve_satoshis {
 				// If the remote balance is below the reserve on this new commitment, it MUST be
 				// greater than or equal to the one on the previous commitment.
-				debug_assert!(broadcaster_prev_commitment_balance.1 <= _stats.remote_balance_before_fee_msat);
+				debug_assert!(broadcaster_prev_commitment_balance.1 <= stats.remote_balance_before_fee_msat);
 			}
-			broadcaster_prev_commitment_balance.1 = _stats.remote_balance_before_fee_msat;
+			broadcaster_prev_commitment_balance.1 = stats.remote_balance_before_fee_msat;
 		}
 
 		// This populates the HTLC-source table with the indices from the HTLCs in the commitment
@@ -7305,6 +7355,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 
 		CommitmentData {
 			tx,
+			commitment_stats: stats,
 			htlcs_included,
 			inbound_htlc_preimages,
 			outbound_htlc_preimages,

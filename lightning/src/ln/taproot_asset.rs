@@ -261,6 +261,7 @@ pub struct TaprootAssetChannelAssetTemplate {
 	previous_outpoint_txid: [u8; 32],
 	previous_outpoint_vout: u32,
 	previous_script_key: [u8; 33],
+	previous_tx_witness: Option<Vec<u8>>,
 }
 
 impl TaprootAssetChannelAssetTemplate {
@@ -272,6 +273,33 @@ impl TaprootAssetChannelAssetTemplate {
 		genesis_output_index: u32, asset_type: u8, tap_commitment_key: [u8; 32],
 		group_key: Option<[u8; 33]>, previous_outpoint_txid: [u8; 32], previous_outpoint_vout: u32,
 		previous_script_key: [u8; 33],
+	) -> Result<Self, TaprootAssetChannelAssetTemplateError> {
+		Self::new_with_previous_tx_witness(
+			asset_id,
+			total_amount,
+			genesis_outpoint_txid,
+			genesis_outpoint_vout,
+			genesis_tag,
+			genesis_meta_hash,
+			genesis_output_index,
+			asset_type,
+			tap_commitment_key,
+			group_key,
+			previous_outpoint_txid,
+			previous_outpoint_vout,
+			previous_script_key,
+			None,
+		)
+	}
+
+	/// Builds a bounded single-asset channel template and preserves the previous
+	/// Taproot Asset transaction witness used in live Taproot Assets proofs.
+	pub fn new_with_previous_tx_witness(
+		asset_id: [u8; TAPROOT_ASSET_ID_LEN], total_amount: u64, genesis_outpoint_txid: [u8; 32],
+		genesis_outpoint_vout: u32, genesis_tag: Vec<u8>, genesis_meta_hash: [u8; 32],
+		genesis_output_index: u32, asset_type: u8, tap_commitment_key: [u8; 32],
+		group_key: Option<[u8; 33]>, previous_outpoint_txid: [u8; 32], previous_outpoint_vout: u32,
+		previous_script_key: [u8; 33], previous_tx_witness: Option<Vec<u8>>,
 	) -> Result<Self, TaprootAssetChannelAssetTemplateError> {
 		let template = Self {
 			asset_id,
@@ -287,6 +315,7 @@ impl TaprootAssetChannelAssetTemplate {
 			previous_outpoint_txid,
 			previous_outpoint_vout,
 			previous_script_key,
+			previous_tx_witness: previous_tx_witness.filter(|witness| !witness.is_empty()),
 		};
 		template.validate()?;
 		Ok(template)
@@ -324,6 +353,11 @@ impl TaprootAssetChannelAssetTemplate {
 			PublicKey::from_slice(&group_key)
 				.map_err(|_| TaprootAssetChannelAssetTemplateError::MalformedGroupKey)?;
 		}
+		if self.previous_tx_witness.as_ref().map(|witness| witness.len()).unwrap_or(0)
+			> u16::MAX as usize
+		{
+			return Err(TaprootAssetChannelAssetTemplateError::TooLongEncoding);
+		}
 		Ok(())
 	}
 }
@@ -342,6 +376,7 @@ impl_writeable_tlv_based!(TaprootAssetChannelAssetTemplate, {
 	(20, previous_outpoint_txid, required),
 	(22, previous_outpoint_vout, required),
 	(24, previous_script_key, required),
+	(26, previous_tx_witness, option),
 });
 
 /// Lightning Labs Taproot Asset commitment signature blob carried on
@@ -598,8 +633,9 @@ pub fn derive_no_split_taproot_asset_aux_leaf_script(
 	let asset_leaf = taproot_asset_mssmt_leaf(&asset_bytes, asset_amount);
 	let asset_commitment_key = no_split_asset_commitment_key(template, output_xonly_key);
 	let asset_root = taproot_asset_mssmt_single_leaf_root(asset_commitment_key, asset_leaf)?;
+	let asset_commitment_root = taproot_asset_asset_commitment_root(template, &asset_root);
 	let asset_commitment_leaf =
-		taproot_asset_asset_commitment_leaf(asset_root.root_hash, asset_root.root_sum);
+		taproot_asset_asset_commitment_leaf(asset_commitment_root, asset_root.root_sum);
 	let tap_commitment_leaf = taproot_asset_mssmt_leaf(&asset_commitment_leaf, asset_amount);
 	let tap_root =
 		taproot_asset_mssmt_single_leaf_root(template.tap_commitment_key, tap_commitment_leaf)?;
@@ -634,7 +670,9 @@ fn encode_no_split_channel_asset(
 	encode_taproot_asset_record(4, &[template.asset_type], &mut out)?;
 	let amount_bytes = encode_taproot_asset_bigsize_to_vec(amount)?;
 	encode_taproot_asset_record(6, &amount_bytes, &mut out)?;
-	let prev_witnesses = encode_taproot_asset_prev_witnesses(template)?;
+	// Version 1 Taproot Asset leaves use the segwit-style leaf encoding, which
+	// preserves the previous asset ID but omits the previous transaction witness.
+	let prev_witnesses = encode_taproot_asset_prev_witnesses(template, false)?;
 	encode_taproot_asset_record(11, &prev_witnesses, &mut out)?;
 	encode_taproot_asset_record(14, &0u16.to_be_bytes(), &mut out)?;
 	encode_taproot_asset_record(16, &script_key, &mut out)?;
@@ -658,7 +696,7 @@ fn encode_taproot_asset_genesis_info(
 }
 
 fn encode_taproot_asset_prev_witnesses(
-	template: &TaprootAssetChannelAssetTemplate,
+	template: &TaprootAssetChannelAssetTemplate, include_tx_witness: bool,
 ) -> Result<Vec<u8>, TaprootAssetChannelAssetTemplateError> {
 	let mut out = Vec::new();
 	push_taproot_asset_bigsize(1, &mut out);
@@ -669,6 +707,11 @@ fn encode_taproot_asset_prev_witnesses(
 	prev_id.extend_from_slice(&template.asset_id);
 	prev_id.extend_from_slice(&template.previous_script_key);
 	encode_taproot_asset_record(1, &prev_id, &mut prev_witness)?;
+	if include_tx_witness {
+		if let Some(previous_tx_witness) = template.previous_tx_witness.as_ref() {
+			encode_taproot_asset_record(3, previous_tx_witness, &mut prev_witness)?;
+		}
+	}
 	encode_taproot_asset_inline_var_bytes(&prev_witness, &mut out)?;
 	Ok(out)
 }
@@ -816,6 +859,17 @@ fn taproot_asset_asset_commitment_leaf(root_hash: [u8; 32], sum: u64) -> Vec<u8>
 	leaf.extend_from_slice(&root_hash);
 	leaf.extend_from_slice(&sum.to_be_bytes());
 	leaf
+}
+
+fn taproot_asset_asset_commitment_root(
+	template: &TaprootAssetChannelAssetTemplate, asset_root: &TaprootAssetMssmtRootParts,
+) -> [u8; 32] {
+	let mut engine = Sha256::engine();
+	engine.input(&template.tap_commitment_key);
+	engine.input(&asset_root.left_hash);
+	engine.input(&asset_root.right_hash);
+	engine.input(&asset_root.root_sum.to_be_bytes());
+	Sha256::from_engine(engine).to_byte_array()
 }
 
 fn taproot_asset_v2_leaf_script(root_hash: [u8; 32], sum: u64) -> Vec<u8> {
@@ -2560,6 +2614,8 @@ mod tests {
 	use bitcoin::hashes::Hash;
 	use bitcoin::hex::FromHex;
 	use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+	use bitcoin::taproot::{LeafVersion, TapLeafHash};
+	use bitcoin::Script;
 
 	fn asset_id() -> [u8; TAPROOT_ASSET_ID_LEN] {
 		[42; TAPROOT_ASSET_ID_LEN]
@@ -2734,6 +2790,47 @@ mod tests {
 		.unwrap()
 	}
 
+	fn hex_bytes(bytes: &str) -> Vec<u8> {
+		Vec::<u8>::from_hex(bytes).unwrap()
+	}
+
+	fn hex_32(bytes: &str) -> [u8; 32] {
+		let bytes = hex_bytes(bytes);
+		let mut out = [0u8; 32];
+		out.copy_from_slice(&bytes);
+		out
+	}
+
+	fn hex_33(bytes: &str) -> [u8; 33] {
+		let bytes = hex_bytes(bytes);
+		let mut out = [0u8; 33];
+		out.copy_from_slice(&bytes);
+		out
+	}
+
+	fn live_litd_payment_template_with_previous_witness() -> TaprootAssetChannelAssetTemplate {
+		let asset_id = hex_32("5e87032040d404d176e8ef042b9121f3146ce703cdcb60c70eb340b2f2921d7d");
+		TaprootAssetChannelAssetTemplate::new_with_previous_tx_witness(
+			asset_id,
+			125,
+			hex_32("2c77a9c9345b1da48902e25f25b9e7fc9d8aee808c3f10c82b64cf964433dd20"),
+			2,
+			b"OPENUSD-LITD-1779874164".to_vec(),
+			hex_32("9b0ed3d6cbb012df6efffee2999c3aba4d8023d6557e18ec035ef23fa3dede1e"),
+			0,
+			0,
+			asset_id,
+			None,
+			hex_32("2fcf5c84eed016518f34f2a11c1f5bd297d7540c230b76589430d865d6ce1098"),
+			0,
+			hex_33("0250aaeb166f4234650d84a2d8a130987aeaf6950206e0905401ee74ff3f8d18e6"),
+			Some(hex_bytes(
+				"02015121c1dca094751109d0bd055d03565874e8276dd53e926b44e3bd1bb6bf4bc130a279",
+			)),
+		)
+		.unwrap()
+	}
+
 	#[test]
 	fn decodes_live_litd_taproot_asset_htlc_blob() {
 		let decoded = decode_taproot_asset_htlc_blob(&live_litd_htlc_blob()).unwrap();
@@ -2761,6 +2858,32 @@ mod tests {
 		assert_eq!(
 			derive_no_split_taproot_asset_aux_leaf_script(&template, 1, [4; 32]),
 			Err(TaprootAssetChannelAssetTemplateError::UnsupportedSplitAmount)
+		);
+	}
+
+	#[test]
+	fn derives_live_litd_payment_htlc_tapleaf_with_segwit_leaf_encoding() {
+		let template = live_litd_payment_template_with_previous_witness();
+		let output_xonly_key =
+			hex_32("0aa44968760bd219f961bae3e4796ace67a5cb81e615d338f9397f1313ad9123");
+		let script =
+			derive_no_split_taproot_asset_aux_leaf_script(&template, 125, output_xonly_key)
+				.unwrap()
+				.unwrap();
+		let script = script.as_bytes();
+
+		assert_eq!(script.len(), 73);
+		assert_eq!(&script[..32], &Sha256::hash(b"taproot-assets:194243").to_byte_array());
+		assert_eq!(script[32], 2);
+		assert_eq!(
+			&script[33..65],
+			&hex_32("3a8c9dd319ab4bdeef833b3723644d36dc2576ef4218543709b7057f47f601da")
+		);
+		assert_eq!(&script[65..], &125u64.to_be_bytes());
+		assert_eq!(
+			TapLeafHash::from_script(Script::from_bytes(script), LeafVersion::TapScript)
+				.to_byte_array(),
+			hex_32("c16883462240be3a21602150d41b4c01b08f180cdc930de88213c5c89e9f8bdf")
 		);
 	}
 
