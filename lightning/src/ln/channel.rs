@@ -11459,6 +11459,7 @@ where
 					blinding_point: htlc.blinding_point,
 					hold_htlc: htlc.hold_htlc,
 					accountable: Some(htlc.accountable),
+					taproot_asset_htlc_blob: None,
 				});
 			}
 		}

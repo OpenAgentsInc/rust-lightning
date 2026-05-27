@@ -5395,6 +5395,7 @@ fn peel_payment_onion_custom_tlvs() {
 		blinding_point: None,
 		hold_htlc: None,
 		accountable: None,
+		taproot_asset_htlc_blob: None,
 	};
 	let peeled_onion = crate::ln::onion_payment::peel_payment_onion(
 		&update_add,

@@ -1600,6 +1600,7 @@ fn update_add_msg(
 		blinding_point,
 		hold_htlc: None,
 		accountable: None,
+		taproot_asset_htlc_blob: None,
 	}
 }
 

@@ -866,6 +866,7 @@ mod tests {
 			blinding_point: None,
 			hold_htlc: None,
 			accountable: None,
+			taproot_asset_htlc_blob: None,
 		}
 	}
 
