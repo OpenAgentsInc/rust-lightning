@@ -416,6 +416,7 @@ struct InboundHTLCOutput {
 	amount_msat: u64,
 	cltv_expiry: u32,
 	payment_hash: PaymentHash,
+	taproot_asset_htlc_blob: Option<Vec<u8>>,
 	state: InboundHTLCState,
 }
 
@@ -547,6 +548,7 @@ struct OutboundHTLCOutput {
 	amount_msat: u64,
 	cltv_expiry: u32,
 	payment_hash: PaymentHash,
+	taproot_asset_htlc_blob: Option<Vec<u8>>,
 	state: OutboundHTLCState,
 	source: HTLCSource,
 	blinding_point: Option<PublicKey>,
@@ -571,6 +573,7 @@ enum HTLCUpdateAwaitingACK {
 		// The extra fee we're skimming off the top of this HTLC.
 		skimmed_fee_msat: Option<u64>,
 		blinding_point: Option<PublicKey>,
+		taproot_asset_htlc_blob: Option<Vec<u8>>,
 		hold_htlc: Option<()>,
 		accountable: bool,
 	},
@@ -9179,6 +9182,7 @@ where
 			amount_msat: msg.amount_msat,
 			payment_hash: msg.payment_hash,
 			cltv_expiry: msg.cltv_expiry,
+			taproot_asset_htlc_blob: msg.taproot_asset_htlc_blob.clone(),
 			state: InboundHTLCState::RemoteAnnounced(InboundHTLCResolution::Pending {
 				update_add_htlc: msg.clone(),
 			}),
@@ -10007,6 +10011,7 @@ where
 						ref onion_routing_packet,
 						skimmed_fee_msat,
 						blinding_point,
+						ref taproot_asset_htlc_blob,
 						hold_htlc,
 						accountable,
 					} => {
@@ -10019,6 +10024,7 @@ where
 							false,
 							skimmed_fee_msat,
 							blinding_point,
+							taproot_asset_htlc_blob.clone(),
 							hold_htlc.is_some(),
 							accountable,
 							fee_estimator,
@@ -11482,7 +11488,7 @@ where
 					blinding_point: htlc.blinding_point,
 					hold_htlc: htlc.hold_htlc,
 					accountable: Some(htlc.accountable),
-					taproot_asset_htlc_blob: None,
+					taproot_asset_htlc_blob: htlc.taproot_asset_htlc_blob.clone(),
 				});
 			}
 		}
@@ -15566,6 +15572,7 @@ where
 			true,
 			skimmed_fee_msat,
 			blinding_point,
+			None,
 			// This method is only called for forwarded HTLCs, which are never held at the next hop
 			false,
 			accountable,
@@ -15599,9 +15606,25 @@ where
 	fn send_htlc<F: FeeEstimator, L: Logger>(
 		&mut self, amount_msat: u64, payment_hash: PaymentHash, cltv_expiry: u32,
 		source: HTLCSource, onion_routing_packet: msgs::OnionPacket, mut force_holding_cell: bool,
-		skimmed_fee_msat: Option<u64>, blinding_point: Option<PublicKey>, hold_htlc: bool,
-		accountable: bool, fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L,
+		skimmed_fee_msat: Option<u64>, blinding_point: Option<PublicKey>,
+		taproot_asset_htlc_blob: Option<Vec<u8>>, hold_htlc: bool, accountable: bool,
+		fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L,
 	) -> Result<bool, (LocalHTLCFailureReason, String)> {
+		if let Some(blob) = taproot_asset_htlc_blob.as_deref() {
+			if !self.funding.get_channel_type().requires_taproot_asset_channel() {
+				return Err((
+					LocalHTLCFailureReason::IncorrectPaymentDetails,
+					"Cannot send Taproot Asset HTLC blob over a non-asset channel".to_owned(),
+				));
+			}
+			decode_taproot_asset_htlc_blob(blob).map_err(|_| {
+				(
+					LocalHTLCFailureReason::IncorrectPaymentDetails,
+					"Cannot send malformed Taproot Asset HTLC blob".to_owned(),
+				)
+			})?;
+		}
+
 		if !matches!(self.context.channel_state, ChannelState::ChannelReady(_))
 			|| self.context.channel_state.is_local_shutdown_sent()
 			|| self.context.channel_state.is_remote_shutdown_sent()
@@ -15682,6 +15705,7 @@ where
 				onion_routing_packet,
 				skimmed_fee_msat,
 				blinding_point,
+				taproot_asset_htlc_blob,
 				hold_htlc: hold_htlc.then(|| ()),
 				accountable,
 			});
@@ -15704,6 +15728,7 @@ where
 			source,
 			blinding_point,
 			skimmed_fee_msat,
+			taproot_asset_htlc_blob,
 			send_timestamp,
 			hold_htlc: hold_htlc.then(|| ()),
 			accountable,
@@ -15979,6 +16004,7 @@ where
 			onion_routing_packet,
 			false,
 			skimmed_fee_msat,
+			None,
 			None,
 			hold_htlc,
 			accountable,
@@ -17772,11 +17798,13 @@ impl<SP: SignerProvider> Writeable for FundedChannel<SP> {
 		let mut removed_htlc_attribution_data: Vec<&Option<AttributionData>> = Vec::new();
 		#[cfg_attr(not(test), allow(unused_mut))]
 		let mut inbound_committed_update_adds: Vec<&InboundUpdateAdd> = Vec::new();
+		let mut pending_inbound_taproot_asset_htlc_blobs: Vec<Option<Vec<u8>>> = Vec::new();
 		(self.context.pending_inbound_htlcs.len() as u64 - dropped_inbound_htlcs).write(writer)?;
 		for htlc in self.context.pending_inbound_htlcs.iter() {
 			if let &InboundHTLCState::RemoteAnnounced(_) = &htlc.state {
 				continue; // Drop
 			}
+			pending_inbound_taproot_asset_htlc_blobs.push(htlc.taproot_asset_htlc_blob.clone());
 			htlc.htlc_id.write(writer)?;
 			htlc.amount_msat.write(writer)?;
 			htlc.cltv_expiry.write(writer)?;
@@ -17832,6 +17860,7 @@ impl<SP: SignerProvider> Writeable for FundedChannel<SP> {
 		let mut pending_outbound_blinding_points: Vec<Option<PublicKey>> = Vec::new();
 		let mut pending_outbound_held_htlc_flags: Vec<Option<()>> = Vec::new();
 		let mut pending_outbound_accountable: Vec<bool> = Vec::new();
+		let mut pending_outbound_taproot_asset_htlc_blobs: Vec<Option<Vec<u8>>> = Vec::new();
 
 		(self.context.pending_outbound_htlcs.len() as u64).write(writer)?;
 		for htlc in self.context.pending_outbound_htlcs.iter() {
@@ -17876,6 +17905,7 @@ impl<SP: SignerProvider> Writeable for FundedChannel<SP> {
 			pending_outbound_blinding_points.push(htlc.blinding_point);
 			pending_outbound_held_htlc_flags.push(htlc.hold_htlc);
 			pending_outbound_accountable.push(htlc.accountable);
+			pending_outbound_taproot_asset_htlc_blobs.push(htlc.taproot_asset_htlc_blob.clone());
 		}
 
 		let holding_cell_htlc_update_count = self.context.holding_cell_htlc_updates.len();
@@ -17889,6 +17919,8 @@ impl<SP: SignerProvider> Writeable for FundedChannel<SP> {
 			Vec::with_capacity(holding_cell_htlc_update_count);
 		let mut holding_cell_accountable_flags: Vec<bool> =
 			Vec::with_capacity(holding_cell_htlc_update_count);
+		let mut holding_cell_taproot_asset_htlc_blobs: Vec<Option<Vec<u8>>> =
+			Vec::with_capacity(holding_cell_htlc_update_count);
 		// Vec of (htlc_id, failure_code, sha256_of_onion)
 		let mut malformed_htlcs: Vec<(u64, u16, [u8; 32])> = Vec::new();
 		(holding_cell_htlc_update_count as u64).write(writer)?;
@@ -17901,6 +17933,7 @@ impl<SP: SignerProvider> Writeable for FundedChannel<SP> {
 					ref source,
 					ref onion_routing_packet,
 					blinding_point,
+					ref taproot_asset_htlc_blob,
 					skimmed_fee_msat,
 					hold_htlc,
 					accountable,
@@ -17916,6 +17949,7 @@ impl<SP: SignerProvider> Writeable for FundedChannel<SP> {
 					holding_cell_blinding_points.push(blinding_point);
 					holding_cell_held_htlc_flags.push(hold_htlc);
 					holding_cell_accountable_flags.push(accountable);
+					holding_cell_taproot_asset_htlc_blobs.push(taproot_asset_htlc_blob.clone());
 				},
 				&HTLCUpdateAwaitingACK::ClaimHTLC {
 					ref payment_preimage,
@@ -18206,6 +18240,9 @@ impl<SP: SignerProvider> Writeable for FundedChannel<SP> {
 			(89, self.context.simple_taproot_counterparty_closee_nonce, option),
 			(91, self.context.simple_taproot_sent_closing_complete, option),
 			(93, simple_taproot_counterparty_initial_local_nonce, option),
+			(95, pending_inbound_taproot_asset_htlc_blobs, optional_vec),
+			(97, pending_outbound_taproot_asset_htlc_blobs, optional_vec),
+			(99, holding_cell_taproot_asset_htlc_blobs, optional_vec),
 		});
 
 		Ok(())
@@ -18265,6 +18302,7 @@ impl<'a, 'b, 'c, ES: EntropySource, SP: SignerProvider>
 				amount_msat: Readable::read(reader)?,
 				cltv_expiry: Readable::read(reader)?,
 				payment_hash: Readable::read(reader)?,
+				taproot_asset_htlc_blob: None,
 				state: match <u8 as Readable>::read(reader)? {
 					1 => {
 						let resolution = if ver <= 3 {
@@ -18369,6 +18407,7 @@ impl<'a, 'b, 'c, ES: EntropySource, SP: SignerProvider>
 				skimmed_fee_msat: None,
 				blinding_point: None,
 				send_timestamp: None,
+				taproot_asset_htlc_blob: None,
 				hold_htlc: None,
 				accountable: false,
 			});
@@ -18389,6 +18428,7 @@ impl<'a, 'b, 'c, ES: EntropySource, SP: SignerProvider>
 					onion_routing_packet: Readable::read(reader)?,
 					skimmed_fee_msat: None,
 					blinding_point: None,
+					taproot_asset_htlc_blob: None,
 					hold_htlc: None,
 					accountable: false,
 				},
@@ -18593,6 +18633,9 @@ impl<'a, 'b, 'c, ES: EntropySource, SP: SignerProvider>
 		let mut inbound_committed_update_adds_opt: Option<Vec<InboundUpdateAdd>> = None;
 		let mut holding_cell_accountable: Option<Vec<bool>> = None;
 		let mut pending_outbound_accountable: Option<Vec<bool>> = None;
+		let mut pending_inbound_taproot_asset_htlc_blobs_opt: Option<Vec<Option<Vec<u8>>>> = None;
+		let mut pending_outbound_taproot_asset_htlc_blobs_opt: Option<Vec<Option<Vec<u8>>>> = None;
+		let mut holding_cell_taproot_asset_htlc_blobs_opt: Option<Vec<Option<Vec<u8>>>> = None;
 
 		let mut monitor_pending_tx_signatures: Option<()> = None;
 		let mut simple_taproot_nonce_state: Option<SimpleTaprootNonceState> = None;
@@ -18668,6 +18711,9 @@ impl<'a, 'b, 'c, ES: EntropySource, SP: SignerProvider>
 			(89, simple_taproot_counterparty_closee_nonce, option),
 			(91, simple_taproot_sent_closing_complete, option),
 			(93, simple_taproot_counterparty_initial_local_nonce, option),
+			(95, pending_inbound_taproot_asset_htlc_blobs_opt, optional_vec),
+			(97, pending_outbound_taproot_asset_htlc_blobs_opt, optional_vec),
+			(99, holding_cell_taproot_asset_htlc_blobs_opt, optional_vec),
 		});
 
 		let holder_signer = signer_provider.derive_channel_signer(channel_keys_id);
@@ -18787,6 +18833,36 @@ impl<'a, 'b, 'c, ES: EntropySource, SP: SignerProvider>
 				}
 			}
 			// We expect all held HTLC flags to be consumed above
+			if iter.next().is_some() {
+				return Err(DecodeError::InvalidValue);
+			}
+		}
+		if let Some(taproot_asset_blobs) = pending_inbound_taproot_asset_htlc_blobs_opt {
+			let mut iter = taproot_asset_blobs.into_iter();
+			for htlc in pending_inbound_htlcs.iter_mut() {
+				htlc.taproot_asset_htlc_blob = iter.next().ok_or(DecodeError::InvalidValue)?;
+			}
+			if iter.next().is_some() {
+				return Err(DecodeError::InvalidValue);
+			}
+		}
+		if let Some(taproot_asset_blobs) = pending_outbound_taproot_asset_htlc_blobs_opt {
+			let mut iter = taproot_asset_blobs.into_iter();
+			for htlc in pending_outbound_htlcs.iter_mut() {
+				htlc.taproot_asset_htlc_blob = iter.next().ok_or(DecodeError::InvalidValue)?;
+			}
+			if iter.next().is_some() {
+				return Err(DecodeError::InvalidValue);
+			}
+		}
+		if let Some(taproot_asset_blobs) = holding_cell_taproot_asset_htlc_blobs_opt {
+			let mut iter = taproot_asset_blobs.into_iter();
+			for htlc in holding_cell_htlc_updates.iter_mut() {
+				if let HTLCUpdateAwaitingACK::AddHTLC { ref mut taproot_asset_htlc_blob, .. } = htlc
+				{
+					*taproot_asset_htlc_blob = iter.next().ok_or(DecodeError::InvalidValue)?;
+				}
+			}
 			if iter.next().is_some() {
 				return Err(DecodeError::InvalidValue);
 			}
@@ -19413,6 +19489,7 @@ mod tests {
 			amount_msat: htlc_amount_msat,
 			payment_hash: PaymentHash(Sha256::hash(&[42; 32]).to_byte_array()),
 			cltv_expiry: 300000000,
+			taproot_asset_htlc_blob: None,
 			state: InboundHTLCState::Committed { update_add_htlc: dummy_inbound_update_add()  },
 		});
 
@@ -19421,6 +19498,7 @@ mod tests {
 			amount_msat: htlc_amount_msat, // put an amount below A's dust amount but above B's.
 			payment_hash: PaymentHash(Sha256::hash(&[43; 32]).to_byte_array()),
 			cltv_expiry: 200000000,
+			taproot_asset_htlc_blob: None,
 			state: OutboundHTLCState::Committed,
 			source: HTLCSource::OutboundRoute {
 				path: Path { hops: Vec::new(), blinded_tail: None },
@@ -19838,8 +19916,8 @@ mod tests {
 
 	#[test]
 	fn blinding_point_skimmed_fee_malformed_ser() {
-		// Ensure that channel blinding points, skimmed fees, and malformed HTLCs are (de)serialized
-		// properly.
+		// Ensure that channel blinding points, skimmed fees, Taproot Asset HTLC blobs, and
+		// malformed HTLCs are (de)serialized properly.
 		let logger = TestLogger::new();
 		let test_est = TestFeeEstimator::new(15000);
 		let feeest = LowerBoundedFeeEstimator::new(&test_est);
@@ -19938,11 +20016,25 @@ mod tests {
 			payment_id: PaymentId([42; 32]),
 			bolt12_invoice: None,
 		};
+		let taproot_asset_htlc_blob = vec![
+			1, 44, 0, 32, 8, 126, 72, 111, 196, 6, 91, 164, 83, 39, 252, 20, 99, 146, 93, 241, 11,
+			66, 138, 211, 2, 71, 54, 118, 93, 160, 16, 26, 67, 197, 190, 60, 1, 8, 0, 0, 0, 0, 0,
+			0, 0, 1,
+		];
+		chan.context.pending_inbound_htlcs.push(InboundHTLCOutput {
+			htlc_id: 42,
+			amount_msat: 1_000,
+			payment_hash: PaymentHash([44; 32]),
+			cltv_expiry: 144,
+			taproot_asset_htlc_blob: Some(taproot_asset_htlc_blob.clone()),
+			state: InboundHTLCState::Committed { update_add_htlc: dummy_inbound_update_add() },
+		});
 		let dummy_outbound_output = OutboundHTLCOutput {
 			htlc_id: 0,
 			amount_msat: 0,
 			payment_hash: PaymentHash([43; 32]),
 			cltv_expiry: 0,
+			taproot_asset_htlc_blob: None,
 			state: OutboundHTLCState::Committed,
 			source: dummy_htlc_source.clone(),
 			skimmed_fee_msat: None,
@@ -19958,6 +20050,9 @@ mod tests {
 			}
 			if idx % 3 == 0 {
 				htlc.skimmed_fee_msat = Some(1);
+			}
+			if idx % 5 == 0 {
+				htlc.taproot_asset_htlc_blob = Some(taproot_asset_htlc_blob.clone());
 			}
 		}
 		chan.context.pending_outbound_htlcs = pending_outbound_htlcs.clone();
@@ -19975,6 +20070,7 @@ mod tests {
 			},
 			skimmed_fee_msat: None,
 			blinding_point: None,
+			taproot_asset_htlc_blob: Some(taproot_asset_htlc_blob.clone()),
 			hold_htlc: None,
 			accountable: false,
 		};
@@ -20047,6 +20143,10 @@ mod tests {
 		let decoded_chan =
 			FundedChannel::read(&mut reader, (&&keys_provider, &&keys_provider, &features))
 				.unwrap();
+		assert_eq!(
+			decoded_chan.context.pending_inbound_htlcs[0].taproot_asset_htlc_blob,
+			Some(taproot_asset_htlc_blob)
+		);
 		assert_eq!(decoded_chan.context.pending_outbound_htlcs, pending_outbound_htlcs);
 		assert_eq!(decoded_chan.context.holding_cell_htlc_updates, holding_cell_htlc_updates);
 	}
