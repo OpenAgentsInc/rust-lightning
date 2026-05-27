@@ -90,10 +90,6 @@ pub(crate) fn weight_received_htlc(channel_type_features: &ChannelTypeFeatures) 
 #[rustfmt::skip]
 pub(crate) fn verify_channel_type_features(channel_type_features: &Option<ChannelTypeFeatures>, additional_permitted_features: Option<&ChannelTypeFeatures>) -> Result<(), DecodeError> {
 	if let Some(features) = channel_type_features.as_ref() {
-		if features.requires_unknown_bits() {
-			return Err(DecodeError::UnknownRequiredFeature);
-		}
-
 		let mut supported_feature_set = ChannelTypeFeatures::anchors_zero_htlc_fee_and_dependencies();
 		supported_feature_set.set_scid_privacy_required();
 		supported_feature_set.set_zero_conf_required();
@@ -102,6 +98,7 @@ pub(crate) fn verify_channel_type_features(channel_type_features: &Option<Channe
 		{
 			supported_feature_set.set_simple_taproot_required();
 			supported_feature_set.set_simple_taproot_staging_required();
+			supported_feature_set.set_taproot_asset_channel_required();
 		}
 
 		// allow the passing of an additional necessary permitted flag
@@ -1779,6 +1776,7 @@ mod tests {
 	use crate::ln::chan_utils::{
 		ChannelTransactionParameters, HTLCOutputInCommitment, HolderCommitmentTransaction,
 	};
+	use crate::ln::msgs::DecodeError;
 	use crate::sign::{ChannelDerivationParameters, HTLCDescriptor};
 	use crate::types::payment::{PaymentHash, PaymentPreimage};
 
@@ -1800,6 +1798,20 @@ mod tests {
 	use crate::util::test_utils::TestLogger;
 	use bitcoin::secp256k1::Secp256k1;
 	use bitcoin::secp256k1::{PublicKey, SecretKey};
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	#[test]
+	fn taproot_asset_channel_type_is_deserializable_for_monitor_packages() {
+		let features = Some(ChannelTypeFeatures::taproot_asset_single_asset());
+		assert!(super::verify_channel_type_features(&features, None).is_ok());
+
+		let mut unknown_required = ChannelTypeFeatures::empty();
+		unknown_required.set_required_feature_bit(250).unwrap();
+		assert_eq!(
+			super::verify_channel_type_features(&Some(unknown_required), None),
+			Err(DecodeError::UnknownRequiredFeature)
+		);
+	}
 
 	#[rustfmt::skip]
 	fn fake_txid(n: u64) -> Txid {
