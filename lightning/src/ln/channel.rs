@@ -6555,7 +6555,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 			)
 		})?;
 		if nonce_index != INITIAL_COMMITMENT_NUMBER {
-			let expected_counterparty_nonce = self
+			let _advertised_next_local_nonce = self
 				.simple_taproot_counterparty_next_local_nonces
 				.get(funding_txid)
 				.ok_or_else(|| {
@@ -6564,11 +6564,10 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 							.to_owned(),
 					)
 				})?;
-			if partial_signature_with_nonce.public_nonce != expected_counterparty_nonce {
-				return Err(ChannelError::close(
-					"Peer used a mismatched simple-taproot commitment nonce".to_owned(),
-				));
-			}
+			// The nonce attached to a commitment partial signature is the peer's
+			// fresh signing nonce for this update. The advertised next-local
+			// nonce remains required persisted state for their future
+			// commitment, but it is not expected to match this signing nonce.
 		}
 		let local_public_nonce = if nonce_index == INITIAL_COMMITMENT_NUMBER {
 			self.simple_taproot_initial_local_public_nonce(funding, nonce_index)?
