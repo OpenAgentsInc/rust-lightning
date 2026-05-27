@@ -930,6 +930,13 @@ pub struct CommitmentSigned {
 	pub funding_txid: Option<Txid>,
 	/// The simple-taproot MuSig2 partial signature and signing nonce.
 	pub simple_taproot_partial_signature_with_nonce: Option<SimpleTaprootPartialSignatureWithNonce>,
+	/// Opaque Taproot Assets HTLC signature data carried by Lightning Labs'
+	/// experimental asset-channel implementation.
+	///
+	/// This is an optional odd TLV on the wire. Taproot Asset channels must
+	/// preserve it so the asset-layer HTLC signatures remain available to
+	/// the native asset commitment verifier and second-level HTLC signer.
+	pub taproot_asset_commitment_sig_blob: Option<Vec<u8>>,
 }
 
 /// A [`revoke_and_ack`] message to be sent to or received from a peer.
@@ -3281,6 +3288,7 @@ impl_writeable_msg!(CommitmentSigned, {
 }, {
 	(1, funding_txid, option),
 	(2, simple_taproot_partial_signature_with_nonce, option),
+	(65537, taproot_asset_commitment_sig_blob, (option, encoding: (Vec<u8>, WithoutLength))),
 });
 
 impl_writeable!(DecodedOnionErrorPacket, {
@@ -5214,6 +5222,7 @@ mod tests {
 			htlc_signatures: Vec::new(),
 			funding_txid: Some(funding_txid),
 			simple_taproot_partial_signature_with_nonce: Some(partial_sig_with_nonce),
+			taproot_asset_commitment_sig_blob: None,
 		};
 		assert_eq!(
 			round_trip_message(&commitment_signed).simple_taproot_partial_signature_with_nonce,
@@ -6788,6 +6797,7 @@ mod tests {
 					.unwrap(),
 			),
 			simple_taproot_partial_signature_with_nonce: None,
+			taproot_asset_commitment_sig_blob: None,
 		};
 		let encoded_value = commitment_signed.encode();
 		let mut target_value = "0202020202020202020202020202020202020202020202020202020202020202d977cb9b53d93a6ff64bb5f1e158b4094b66e798fb12911168a3ccdf80a83096340a6a95da0ae8d9f776528eecdbb747eb6b545495a4319ed5378e35b21e073a".to_string();
@@ -6806,6 +6816,37 @@ mod tests {
 	fn encoding_commitment_signed() {
 		do_encoding_commitment_signed(true);
 		do_encoding_commitment_signed(false);
+	}
+
+	#[test]
+	fn commitment_signed_taproot_asset_sig_blob_round_trips_odd_tlv() {
+		let secp_ctx = Secp256k1::new();
+		let (privkey, _) = get_keys_from!(
+			"0101010101010101010101010101010101010101010101010101010101010101",
+			secp_ctx
+		);
+		let sig = get_sig_on!(privkey, secp_ctx, String::from("01010101010101010101010101010101"));
+		let blob = <Vec<u8>>::from_hex(
+			"016e006c016a002047395f31d459f3e4137dc88ddaa6a2c363c6114160a4a82d65863bf401b1d14c014091778f0a6f36e5f5c77f3dccbd5a86be9e40edee21ad92e6446ac68cfdca593adf1baf8249071bec2024a993376800cea46ab788e5a0c50f325df223970b6572020400000083",
+		)
+		.unwrap();
+		let commitment_signed = msgs::CommitmentSigned {
+			channel_id: ChannelId::from_bytes([2; 32]),
+			signature: sig,
+			htlc_signatures: Vec::new(),
+			funding_txid: None,
+			simple_taproot_partial_signature_with_nonce: None,
+			taproot_asset_commitment_sig_blob: Some(blob.clone()),
+		};
+
+		let encoded = commitment_signed.encode();
+		let mut expected_suffix = Vec::new();
+		append_tlv(&mut expected_suffix, 65537, &blob);
+		assert!(encoded.ends_with(&expected_suffix));
+
+		let decoded: msgs::CommitmentSigned =
+			LengthReadable::read_from_fixed_length_buffer(&mut &encoded[..]).unwrap();
+		assert_eq!(decoded.taproot_asset_commitment_sig_blob, Some(blob));
 	}
 
 	#[test]

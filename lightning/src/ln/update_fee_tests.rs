@@ -509,6 +509,7 @@ pub fn do_test_update_fee_that_funder_cannot_afford(channel_type_features: Chann
 		htlc_signatures: res.1,
 		funding_txid: None,
 		simple_taproot_partial_signature_with_nonce: None,
+		taproot_asset_commitment_sig_blob: None,
 	};
 
 	let update_fee = msgs::UpdateFee { channel_id: chan.2, feerate_per_kw: non_buffer_feerate + 4 };
@@ -606,6 +607,7 @@ pub fn test_update_fee_that_saturates_subs() {
 		htlc_signatures: res.1,
 		funding_txid: None,
 		simple_taproot_partial_signature_with_nonce: None,
+		taproot_asset_commitment_sig_blob: None,
 	};
 
 	let update_fee = msgs::UpdateFee { channel_id: chan_id, feerate_per_kw: FEERATE };

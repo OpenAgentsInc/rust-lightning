@@ -48,6 +48,13 @@ pub const TAPROOT_ASSET_RECOVERY_SPEND_FINAL_SWEEP: u8 = 3;
 const TAPROOT_ASSET_HTLC_BLOB_ASSET_ID_RECORD_TYPE: u64 = 0;
 const TAPROOT_ASSET_HTLC_BLOB_AMOUNT_RECORD_TYPE: u64 = 1;
 const TAPROOT_ASSET_HTLC_BLOB_OUTER_RECORD_TYPE: u64 = 1;
+const TAPROOT_ASSET_COMMITMENT_SIG_ASSET_SIG_LIST_RECORD_TYPE: u64 = 0;
+const TAPROOT_ASSET_ASSET_SIG_ASSET_ID_RECORD_TYPE: u64 = 0;
+const TAPROOT_ASSET_ASSET_SIG_SIGNATURE_RECORD_TYPE: u64 = 1;
+const TAPROOT_ASSET_ASSET_SIG_SIGHASH_RECORD_TYPE: u64 = 2;
+const MAX_TAPROOT_ASSET_COMMITMENT_SIG_HTLCS: u64 = 483;
+const MAX_TAPROOT_ASSET_COMMITMENT_ASSET_SIGS: u64 = 2048;
+const TAPROOT_ASSET_SIGNATURE_LEN: usize = 64;
 
 /// Describes the single asset that an experimental Taproot Asset channel is
 /// allowed to carry.
@@ -221,6 +228,32 @@ pub struct TaprootAssetHtlcBlob {
 	pub asset_id: [u8; TAPROOT_ASSET_ID_LEN],
 	/// Asset amount being transferred.
 	pub asset_amount: u64,
+}
+
+/// Lightning Labs Taproot Asset commitment signature blob carried on
+/// `commitment_signed` TLV 65537.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaprootAssetCommitmentSigBlob {
+	/// Asset-layer signatures, grouped by non-dust HTLC order.
+	pub htlc_sigs: Vec<TaprootAssetHtlcAssetSigList>,
+}
+
+/// Asset-layer signatures for one HTLC.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaprootAssetHtlcAssetSigList {
+	/// One signature per asset ID committed to this HTLC.
+	pub asset_sigs: Vec<TaprootAssetAssetSig>,
+}
+
+/// A signature for spending one Taproot Asset output.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct TaprootAssetAssetSig {
+	/// Asset ID this signature spends.
+	pub asset_id: [u8; TAPROOT_ASSET_ID_LEN],
+	/// Raw 64-byte Schnorr signature.
+	pub signature: [u8; TAPROOT_ASSET_SIGNATURE_LEN],
+	/// Bitcoin sighash type used by the asset signature.
+	pub sighash_type: u32,
 }
 
 impl TaprootAssetHtlcMetadata {
@@ -400,6 +433,196 @@ pub fn decode_taproot_asset_htlc_blob(
 		return decode_taproot_asset_htlc_blob_records(inner_payload);
 	}
 	decode_taproot_asset_htlc_blob_records(payload)
+}
+
+fn read_taproot_asset_commitment_sig_bigsize(
+	payload: &[u8], offset: &mut usize,
+) -> Result<u64, TaprootAssetCommitmentSigBlobError> {
+	let mut cursor = Cursor::new(&payload[*offset..]);
+	let value = BigSize::read(&mut cursor)
+		.map(|big_size| big_size.0)
+		.map_err(|_| TaprootAssetCommitmentSigBlobError::MalformedTlv)?;
+	*offset = (*offset)
+		.checked_add(cursor.position() as usize)
+		.ok_or(TaprootAssetCommitmentSigBlobError::MalformedTlv)?;
+	Ok(value)
+}
+
+fn read_taproot_asset_commitment_sig_inline_bytes<'a>(
+	payload: &'a [u8], offset: &mut usize,
+) -> Result<&'a [u8], TaprootAssetCommitmentSigBlobError> {
+	let len = read_taproot_asset_commitment_sig_bigsize(payload, offset)?;
+	let len = usize::try_from(len).map_err(|_| TaprootAssetCommitmentSigBlobError::MalformedTlv)?;
+	let end = (*offset).checked_add(len).ok_or(TaprootAssetCommitmentSigBlobError::MalformedTlv)?;
+	if end > payload.len() {
+		return Err(TaprootAssetCommitmentSigBlobError::MalformedTlv);
+	}
+	let value = &payload[*offset..end];
+	*offset = end;
+	Ok(value)
+}
+
+fn read_taproot_asset_commitment_sig_record<'a>(
+	payload: &'a [u8], offset: &mut usize, previous_record_type: &mut Option<u64>,
+) -> Result<(u64, &'a [u8]), TaprootAssetCommitmentSigBlobError> {
+	let record_type = read_taproot_asset_commitment_sig_bigsize(payload, offset)?;
+	if previous_record_type.map(|previous| record_type <= previous).unwrap_or(false) {
+		return Err(TaprootAssetCommitmentSigBlobError::MalformedTlv);
+	}
+	*previous_record_type = Some(record_type);
+	let record_len = read_taproot_asset_commitment_sig_bigsize(payload, offset)?;
+	let record_len = usize::try_from(record_len)
+		.map_err(|_| TaprootAssetCommitmentSigBlobError::MalformedTlv)?;
+	let end = (*offset)
+		.checked_add(record_len)
+		.ok_or(TaprootAssetCommitmentSigBlobError::MalformedTlv)?;
+	if end > payload.len() {
+		return Err(TaprootAssetCommitmentSigBlobError::MalformedTlv);
+	}
+	let record_value = &payload[*offset..end];
+	*offset = end;
+	Ok((record_type, record_value))
+}
+
+fn decode_taproot_asset_asset_sig(
+	payload: &[u8],
+) -> Result<TaprootAssetAssetSig, TaprootAssetCommitmentSigBlobError> {
+	let mut offset = 0usize;
+	let mut previous_record_type = None;
+	let mut asset_id = None;
+	let mut signature = None;
+	let mut sighash_type = None;
+
+	while offset < payload.len() {
+		let (record_type, record_value) = read_taproot_asset_commitment_sig_record(
+			payload,
+			&mut offset,
+			&mut previous_record_type,
+		)?;
+		match record_type {
+			TAPROOT_ASSET_ASSET_SIG_ASSET_ID_RECORD_TYPE => {
+				if asset_id.is_some() {
+					return Err(TaprootAssetCommitmentSigBlobError::DuplicateField);
+				}
+				if record_value.len() != TAPROOT_ASSET_ID_LEN {
+					return Err(TaprootAssetCommitmentSigBlobError::MalformedAssetId);
+				}
+				let mut decoded_asset_id = [0; TAPROOT_ASSET_ID_LEN];
+				decoded_asset_id.copy_from_slice(record_value);
+				asset_id = Some(decoded_asset_id);
+			},
+			TAPROOT_ASSET_ASSET_SIG_SIGNATURE_RECORD_TYPE => {
+				if signature.is_some() {
+					return Err(TaprootAssetCommitmentSigBlobError::DuplicateField);
+				}
+				if record_value.len() != TAPROOT_ASSET_SIGNATURE_LEN {
+					return Err(TaprootAssetCommitmentSigBlobError::MalformedSignature);
+				}
+				let mut decoded_signature = [0; TAPROOT_ASSET_SIGNATURE_LEN];
+				decoded_signature.copy_from_slice(record_value);
+				signature = Some(decoded_signature);
+			},
+			TAPROOT_ASSET_ASSET_SIG_SIGHASH_RECORD_TYPE => {
+				if sighash_type.is_some() {
+					return Err(TaprootAssetCommitmentSigBlobError::DuplicateField);
+				}
+				if record_value.len() != 4 {
+					return Err(TaprootAssetCommitmentSigBlobError::MalformedSighashType);
+				}
+				let mut decoded_sighash = [0; 4];
+				decoded_sighash.copy_from_slice(record_value);
+				sighash_type = Some(u32::from_be_bytes(decoded_sighash));
+			},
+			unknown if unknown % 2 == 0 => {
+				return Err(TaprootAssetCommitmentSigBlobError::UnknownRequiredTlv);
+			},
+			_ => {},
+		}
+	}
+
+	let asset_id = asset_id.ok_or(TaprootAssetCommitmentSigBlobError::MissingAssetId)?;
+	if asset_id == [0; TAPROOT_ASSET_ID_LEN] {
+		return Err(TaprootAssetCommitmentSigBlobError::ZeroAssetId);
+	}
+	Ok(TaprootAssetAssetSig {
+		asset_id,
+		signature: signature.ok_or(TaprootAssetCommitmentSigBlobError::MissingSignature)?,
+		sighash_type: sighash_type.ok_or(TaprootAssetCommitmentSigBlobError::MissingSighashType)?,
+	})
+}
+
+fn decode_taproot_asset_asset_sig_list_value(
+	payload: &[u8],
+) -> Result<Vec<TaprootAssetAssetSig>, TaprootAssetCommitmentSigBlobError> {
+	let mut offset = 0usize;
+	let sig_count = read_taproot_asset_commitment_sig_bigsize(payload, &mut offset)?;
+	if sig_count > MAX_TAPROOT_ASSET_COMMITMENT_ASSET_SIGS {
+		return Err(TaprootAssetCommitmentSigBlobError::TooManyAssetSigs);
+	}
+	let mut asset_sigs = Vec::with_capacity(sig_count as usize);
+	for _ in 0..sig_count {
+		let sig_payload = read_taproot_asset_commitment_sig_inline_bytes(payload, &mut offset)?;
+		asset_sigs.push(decode_taproot_asset_asset_sig(sig_payload)?);
+	}
+	if offset != payload.len() {
+		return Err(TaprootAssetCommitmentSigBlobError::MalformedTlv);
+	}
+	Ok(asset_sigs)
+}
+
+fn decode_taproot_asset_asset_sig_list(
+	payload: &[u8],
+) -> Result<TaprootAssetHtlcAssetSigList, TaprootAssetCommitmentSigBlobError> {
+	let mut offset = 0usize;
+	let mut previous_record_type = None;
+	let mut asset_sigs = None;
+	while offset < payload.len() {
+		let (record_type, record_value) = read_taproot_asset_commitment_sig_record(
+			payload,
+			&mut offset,
+			&mut previous_record_type,
+		)?;
+		match record_type {
+			TAPROOT_ASSET_COMMITMENT_SIG_ASSET_SIG_LIST_RECORD_TYPE => {
+				if asset_sigs.is_some() {
+					return Err(TaprootAssetCommitmentSigBlobError::DuplicateField);
+				}
+				asset_sigs = Some(decode_taproot_asset_asset_sig_list_value(record_value)?);
+			},
+			unknown if unknown % 2 == 0 => {
+				return Err(TaprootAssetCommitmentSigBlobError::UnknownRequiredTlv);
+			},
+			_ => {},
+		}
+	}
+	Ok(TaprootAssetHtlcAssetSigList {
+		asset_sigs: asset_sigs.ok_or(TaprootAssetCommitmentSigBlobError::MissingAssetSigList)?,
+	})
+}
+
+/// Decodes the Lightning Labs Taproot Asset commitment signature blob carried
+/// on `commitment_signed` TLV 65537.
+pub fn decode_taproot_asset_commitment_sig_blob(
+	payload: &[u8],
+) -> Result<TaprootAssetCommitmentSigBlob, TaprootAssetCommitmentSigBlobError> {
+	if payload.is_empty() {
+		return Err(TaprootAssetCommitmentSigBlobError::Empty);
+	}
+
+	let mut offset = 0usize;
+	let htlc_count = read_taproot_asset_commitment_sig_bigsize(payload, &mut offset)?;
+	if htlc_count > MAX_TAPROOT_ASSET_COMMITMENT_SIG_HTLCS {
+		return Err(TaprootAssetCommitmentSigBlobError::TooManyHtlcs);
+	}
+	let mut htlc_sigs = Vec::with_capacity(htlc_count as usize);
+	for _ in 0..htlc_count {
+		let htlc_payload = read_taproot_asset_commitment_sig_inline_bytes(payload, &mut offset)?;
+		htlc_sigs.push(decode_taproot_asset_asset_sig_list(htlc_payload)?);
+	}
+	if offset != payload.len() {
+		return Err(TaprootAssetCommitmentSigBlobError::MalformedTlv);
+	}
+	Ok(TaprootAssetCommitmentSigBlob { htlc_sigs })
 }
 
 /// Expected final-hop metadata for an asset-channel HTLC.
@@ -1120,6 +1343,39 @@ pub enum TaprootAssetHtlcBlobError {
 	ZeroAmount,
 }
 
+/// Errors returned while decoding a `commitment_signed` Taproot Asset signature blob.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum TaprootAssetCommitmentSigBlobError {
+	/// The blob was empty.
+	Empty,
+	/// The TLV stream was not canonical or its length fields were malformed.
+	MalformedTlv,
+	/// An unknown even TLV record was present.
+	UnknownRequiredTlv,
+	/// A known TLV field appeared more than once.
+	DuplicateField,
+	/// Too many HTLC signature groups were encoded.
+	TooManyHtlcs,
+	/// Too many per-asset signatures were encoded for one HTLC.
+	TooManyAssetSigs,
+	/// The required HTLC asset signature list was missing.
+	MissingAssetSigList,
+	/// The required asset ID field was missing.
+	MissingAssetId,
+	/// The required signature field was missing.
+	MissingSignature,
+	/// The required sighash type field was missing.
+	MissingSighashType,
+	/// The asset ID field had an invalid length.
+	MalformedAssetId,
+	/// The signature field had an invalid length.
+	MalformedSignature,
+	/// The sighash type field had an invalid length.
+	MalformedSighashType,
+	/// The asset ID was all zeros.
+	ZeroAssetId,
+}
+
 /// Errors returned by cooperative asset-channel close allocation validation.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum TaprootAssetCloseAllocationError {
@@ -1613,6 +1869,7 @@ mod tests {
 
 	use bitcoin::hash_types::Txid;
 	use bitcoin::hashes::Hash;
+	use bitcoin::hex::FromHex;
 	use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
 
 	fn asset_id() -> [u8; TAPROOT_ASSET_ID_LEN] {
@@ -1631,6 +1888,20 @@ mod tests {
 		[
 			8, 126, 72, 111, 196, 6, 91, 164, 83, 39, 252, 20, 99, 146, 93, 241, 11, 66, 138, 211,
 			2, 71, 54, 118, 93, 160, 16, 26, 67, 197, 190, 60,
+		]
+	}
+
+	fn live_litd_commitment_sig_blob() -> Vec<u8> {
+		Vec::<u8>::from_hex(
+			"016e006c016a002047395f31d459f3e4137dc88ddaa6a2c363c6114160a4a82d65863bf401b1d14c014091778f0a6f36e5f5c77f3dccbd5a86be9e40edee21ad92e6446ac68cfdca593adf1baf8249071bec2024a993376800cea46ab788e5a0c50f325df223970b6572020400000083",
+		)
+		.unwrap()
+	}
+
+	fn live_litd_commitment_sig_asset_id() -> [u8; TAPROOT_ASSET_ID_LEN] {
+		[
+			71, 57, 95, 49, 212, 89, 243, 228, 19, 125, 200, 141, 218, 166, 162, 195, 99, 198, 17,
+			65, 96, 164, 168, 45, 101, 134, 59, 244, 1, 177, 209, 76,
 		]
 	}
 
@@ -1698,6 +1969,42 @@ mod tests {
 		assert_eq!(
 			decode_taproot_asset_htlc_blob(&bad_asset_id_len),
 			Err(TaprootAssetHtlcBlobError::MalformedAssetId)
+		);
+	}
+
+	#[test]
+	fn decodes_live_litd_taproot_asset_commitment_sig_blob() {
+		let decoded =
+			decode_taproot_asset_commitment_sig_blob(&live_litd_commitment_sig_blob()).unwrap();
+
+		assert_eq!(decoded.htlc_sigs.len(), 1);
+		assert_eq!(decoded.htlc_sigs[0].asset_sigs.len(), 1);
+		let sig = decoded.htlc_sigs[0].asset_sigs[0];
+		assert_eq!(sig.asset_id, live_litd_commitment_sig_asset_id());
+		assert_eq!(sig.signature[0], 0x91);
+		assert_eq!(sig.signature[63], 0x72);
+		assert_eq!(sig.sighash_type, 131);
+	}
+
+	#[test]
+	fn rejects_malformed_taproot_asset_commitment_sig_blobs() {
+		assert_eq!(
+			decode_taproot_asset_commitment_sig_blob(&[]),
+			Err(TaprootAssetCommitmentSigBlobError::Empty)
+		);
+
+		let mut bad_sig_len = live_litd_commitment_sig_blob();
+		bad_sig_len[41] = 63;
+		assert_eq!(
+			decode_taproot_asset_commitment_sig_blob(&bad_sig_len),
+			Err(TaprootAssetCommitmentSigBlobError::MalformedSignature)
+		);
+
+		let mut unknown_required = live_litd_commitment_sig_blob();
+		unknown_required[2] = 0x02;
+		assert_eq!(
+			decode_taproot_asset_commitment_sig_blob(&unknown_required),
+			Err(TaprootAssetCommitmentSigBlobError::UnknownRequiredTlv)
 		);
 	}
 

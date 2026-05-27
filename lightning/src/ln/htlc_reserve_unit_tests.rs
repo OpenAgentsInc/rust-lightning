@@ -930,6 +930,7 @@ pub fn do_test_fee_spike_buffer(cfg: Option<UserConfig>, htlc_fails: bool) {
 		htlc_signatures: res.1,
 		funding_txid: None,
 		simple_taproot_partial_signature_with_nonce: None,
+		taproot_asset_commitment_sig_blob: None,
 	};
 
 	// Send the commitment_signed message to the nodes[1].
@@ -2315,6 +2316,7 @@ pub fn do_test_dust_limit_fee_accounting(can_afford: bool) {
 			htlc_signatures: res.1,
 			funding_txid: None,
 			simple_taproot_partial_signature_with_nonce: None,
+			taproot_asset_commitment_sig_blob: None,
 		};
 
 		// Send the commitment_signed message to the nodes[1].
@@ -2730,6 +2732,7 @@ fn manually_trigger_update_fail_htlc<'a, 'b, 'c, 'd>(
 		htlc_signatures: res.1,
 		funding_txid: None,
 		simple_taproot_partial_signature_with_nonce: None,
+		taproot_asset_commitment_sig_blob: None,
 	};
 
 	// Send the commitment_signed message to the nodes[1].

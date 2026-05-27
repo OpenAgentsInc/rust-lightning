@@ -88,7 +88,9 @@ use crate::ln::simple_taproot::{
 };
 #[cfg(simple_close)]
 use crate::ln::simple_taproot::{SimpleTaprootClosingOutputSet, SimpleTaprootPartialSignature};
-use crate::ln::taproot_asset::decode_taproot_asset_htlc_blob;
+use crate::ln::taproot_asset::{
+	decode_taproot_asset_commitment_sig_blob, decode_taproot_asset_htlc_blob,
+};
 use crate::ln::types::ChannelId;
 use crate::offers::static_invoice::StaticInvoice;
 use crate::routing::gossip::NodeId;
@@ -6696,6 +6698,33 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 				&bitcoin_tx.transaction,
 				msg.simple_taproot_partial_signature_with_nonce.as_ref(),
 			)?;
+			if funding.get_channel_type().requires_taproot_asset_channel() {
+				let nondust_htlc_count = commitment_data.tx.nondust_htlcs().len();
+				match msg.taproot_asset_commitment_sig_blob.as_deref() {
+					Some(blob) => {
+						let commitment_sig_blob =
+							decode_taproot_asset_commitment_sig_blob(blob).map_err(|_| {
+								ChannelError::close(
+									"Remote sent malformed Taproot Asset commitment signature blob"
+										.to_owned(),
+								)
+							})?;
+						if commitment_sig_blob.htlc_sigs.len() != nondust_htlc_count {
+							return Err(ChannelError::close(format!(
+								"Remote sent {} Taproot Asset HTLC signature groups for {} non-dust HTLCs",
+								commitment_sig_blob.htlc_sigs.len(), nondust_htlc_count
+							)));
+						}
+					},
+					None if nondust_htlc_count > 0 => {
+						return Err(ChannelError::close(
+							"Remote omitted Taproot Asset commitment signature blob for Taproot Asset HTLCs"
+								.to_owned(),
+						))
+					},
+					None => {},
+				}
+			}
 
 			if !ChannelContext::<SP>::is_simple_taproot_funding(funding) {
 				let sighash =
@@ -7709,6 +7738,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 				signature,
 				funding_txid: funding.get_funding_txo().map(|funding_txo| funding_txo.txid),
 				simple_taproot_partial_signature_with_nonce: None,
+				taproot_asset_commitment_sig_blob: None,
 			})
 		} else {
 			log_debug!(
@@ -15982,6 +16012,7 @@ where
 			htlc_signatures,
 			funding_txid: funding.get_funding_txo().map(|funding_txo| funding_txo.txid),
 			simple_taproot_partial_signature_with_nonce,
+			taproot_asset_commitment_sig_blob: None,
 		})
 	}
 
