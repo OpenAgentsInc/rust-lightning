@@ -6870,11 +6870,15 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 			)));
 		}
 
-		let holder_keys = commitment_data.tx.trust().keys();
+		let trusted_commitment_tx = commitment_data.tx.trust();
+		let built_commitment_tx = trusted_commitment_tx.built_transaction();
+		let holder_keys = trusted_commitment_tx.keys();
 		for (htlc, counterparty_sig) in
 			commitment_data.tx.nondust_htlcs().iter().zip(msg.htlc_signatures.iter())
 		{
-			assert!(htlc.transaction_output_index.is_some());
+			let htlc_output_index = htlc
+				.transaction_output_index
+				.expect("nondust HTLCs always have a transaction output index");
 			let htlc_tx = chan_utils::build_htlc_transaction(
 				&commitment_txid,
 				commitment_data.tx.negotiated_feerate_per_kw(),
@@ -6897,9 +6901,18 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 					ChannelError::close("Failed to build simple-taproot HTLC spend info".to_owned())
 				})?;
 				let leaf = if htlc.offered { &spend_info.timeout } else { &spend_info.success };
+				let actual_htlc_output = built_commitment_tx
+					.transaction
+					.output
+					.get(htlc_output_index as usize)
+					.ok_or_else(|| {
+						ChannelError::close(
+							"Failed to locate simple-taproot HTLC commitment output".to_owned(),
+						)
+					})?;
 				let previous_output = TxOut {
 					value: htlc.to_bitcoin_amount(),
-					script_pubkey: spend_info.script_pubkey,
+					script_pubkey: actual_htlc_output.script_pubkey.clone(),
 				};
 				let schnorr_sig =
 					simple_taproot_schnorr_signature_from_htlc_wire_signature(counterparty_sig)

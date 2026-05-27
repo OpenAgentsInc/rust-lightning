@@ -1906,9 +1906,16 @@ impl EcdsaChannelSigner for InMemorySigner {
 				)
 				.map_err(|_| ())?;
 				let leaf = if htlc.offered { &spend_info.timeout } else { &spend_info.success };
+				let htlc_output_index = htlc.transaction_output_index.ok_or(())? as usize;
 				let previous_output = TxOut {
 					value: htlc.to_bitcoin_amount(),
-					script_pubkey: spend_info.script_pubkey,
+					script_pubkey: built_tx
+						.transaction
+						.output
+						.get(htlc_output_index)
+						.ok_or(())?
+						.script_pubkey
+						.clone(),
 				};
 				let taproot_signature = simple_taproot_sign_htlc_tapscript(
 					secp_ctx,
