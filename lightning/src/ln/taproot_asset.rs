@@ -22,6 +22,7 @@ use crate::util::ser::{BigSize, Readable};
 
 use bitcoin::hashes::{sha256::Hash as Sha256, Hash as _, HashEngine as _};
 use bitcoin::secp256k1::PublicKey;
+use bitcoin::ScriptBuf;
 use lightning_types::features::{ChannelTypeFeatures, InitFeatures};
 
 /// The only Taproot Asset channel protocol version accepted by this
@@ -52,9 +53,18 @@ const TAPROOT_ASSET_COMMITMENT_SIG_ASSET_SIG_LIST_RECORD_TYPE: u64 = 0;
 const TAPROOT_ASSET_ASSET_SIG_ASSET_ID_RECORD_TYPE: u64 = 0;
 const TAPROOT_ASSET_ASSET_SIG_SIGNATURE_RECORD_TYPE: u64 = 1;
 const TAPROOT_ASSET_ASSET_SIG_SIGHASH_RECORD_TYPE: u64 = 2;
+const TAPROOT_ASSET_COMMITMENT_AUX_LEAVES_RECORD_TYPE: u64 = 4;
+const TAPROOT_ASSET_AUX_LEAVES_LOCAL_RECORD_TYPE: u64 = 0;
+const TAPROOT_ASSET_AUX_LEAVES_REMOTE_RECORD_TYPE: u64 = 1;
+const TAPROOT_ASSET_AUX_LEAVES_OUTGOING_HTLCS_RECORD_TYPE: u64 = 2;
+const TAPROOT_ASSET_AUX_LEAVES_INCOMING_HTLCS_RECORD_TYPE: u64 = 3;
+const TAPROOT_ASSET_HTLC_AUX_LEAF_RECORD_TYPE: u64 = 0;
+const TAPROOT_ASSET_HTLC_SECOND_LEVEL_LEAF_RECORD_TYPE: u64 = 1;
 const MAX_TAPROOT_ASSET_COMMITMENT_SIG_HTLCS: u64 = 483;
 const MAX_TAPROOT_ASSET_COMMITMENT_ASSET_SIGS: u64 = 2048;
+const MAX_TAPROOT_ASSET_AUX_LEAF_SCRIPT_LEN: u64 = 65_535;
 const TAPROOT_ASSET_SIGNATURE_LEN: usize = 64;
+const TAPROOT_ASSET_TAPSCRIPT_LEAF_VERSION: u8 = 0xc0;
 
 /// Describes the single asset that an experimental Taproot Asset channel is
 /// allowed to carry.
@@ -236,6 +246,34 @@ pub struct TaprootAssetHtlcBlob {
 pub struct TaprootAssetCommitmentSigBlob {
 	/// Asset-layer signatures, grouped by non-dust HTLC order.
 	pub htlc_sigs: Vec<TaprootAssetHtlcAssetSigList>,
+}
+
+/// Lightning Labs Taproot Asset commitment aux leaves.
+///
+/// These leaves are stored in the Lightning Labs `Commitment` custom blob and
+/// are the scripts that must be paired with the Bitcoin commitment outputs
+/// when asset balances or asset HTLCs are present.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaprootAssetCommitmentAuxLeaves {
+	/// Asset aux leaf for the local balance output, when present.
+	pub local_aux_leaf_script: Option<ScriptBuf>,
+	/// Asset aux leaf for the remote balance output, when present.
+	pub remote_aux_leaf_script: Option<ScriptBuf>,
+	/// Asset aux leaves keyed by Lightning Labs outgoing HTLC index.
+	pub outgoing_htlc_aux_leaves: Vec<TaprootAssetHtlcAuxLeaf>,
+	/// Asset aux leaves keyed by Lightning Labs incoming HTLC index.
+	pub incoming_htlc_aux_leaves: Vec<TaprootAssetHtlcAuxLeaf>,
+}
+
+/// Lightning Labs Taproot Asset aux leaves for one HTLC.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaprootAssetHtlcAuxLeaf {
+	/// Lightning Labs HTLC index carried in the commitment blob.
+	pub htlc_index: u64,
+	/// Asset aux leaf for the commitment HTLC output.
+	pub aux_leaf_script: Option<ScriptBuf>,
+	/// Asset aux leaf for the second-level HTLC output, when present.
+	pub second_level_leaf_script: Option<ScriptBuf>,
 }
 
 /// Asset-layer signatures for one HTLC.
@@ -623,6 +661,250 @@ pub fn decode_taproot_asset_commitment_sig_blob(
 		return Err(TaprootAssetCommitmentSigBlobError::MalformedTlv);
 	}
 	Ok(TaprootAssetCommitmentSigBlob { htlc_sigs })
+}
+
+fn read_taproot_asset_commitment_aux_bigsize(
+	payload: &[u8], offset: &mut usize,
+) -> Result<u64, TaprootAssetCommitmentAuxLeavesError> {
+	let mut cursor = Cursor::new(&payload[*offset..]);
+	let value = BigSize::read(&mut cursor)
+		.map(|big_size| big_size.0)
+		.map_err(|_| TaprootAssetCommitmentAuxLeavesError::MalformedTlv)?;
+	*offset = (*offset)
+		.checked_add(cursor.position() as usize)
+		.ok_or(TaprootAssetCommitmentAuxLeavesError::MalformedTlv)?;
+	Ok(value)
+}
+
+fn read_taproot_asset_commitment_aux_inline_bytes<'a>(
+	payload: &'a [u8], offset: &mut usize,
+) -> Result<&'a [u8], TaprootAssetCommitmentAuxLeavesError> {
+	let len = read_taproot_asset_commitment_aux_bigsize(payload, offset)?;
+	let len =
+		usize::try_from(len).map_err(|_| TaprootAssetCommitmentAuxLeavesError::MalformedTlv)?;
+	let end =
+		(*offset).checked_add(len).ok_or(TaprootAssetCommitmentAuxLeavesError::MalformedTlv)?;
+	if end > payload.len() {
+		return Err(TaprootAssetCommitmentAuxLeavesError::MalformedTlv);
+	}
+	let value = &payload[*offset..end];
+	*offset = end;
+	Ok(value)
+}
+
+fn read_taproot_asset_commitment_aux_record<'a>(
+	payload: &'a [u8], offset: &mut usize, previous_record_type: &mut Option<u64>,
+) -> Result<(u64, &'a [u8]), TaprootAssetCommitmentAuxLeavesError> {
+	let record_type = read_taproot_asset_commitment_aux_bigsize(payload, offset)?;
+	if previous_record_type.map(|previous| record_type <= previous).unwrap_or(false) {
+		return Err(TaprootAssetCommitmentAuxLeavesError::MalformedTlv);
+	}
+	*previous_record_type = Some(record_type);
+	let record_len = read_taproot_asset_commitment_aux_bigsize(payload, offset)?;
+	let record_len = usize::try_from(record_len)
+		.map_err(|_| TaprootAssetCommitmentAuxLeavesError::MalformedTlv)?;
+	let end = (*offset)
+		.checked_add(record_len)
+		.ok_or(TaprootAssetCommitmentAuxLeavesError::MalformedTlv)?;
+	if end > payload.len() {
+		return Err(TaprootAssetCommitmentAuxLeavesError::MalformedTlv);
+	}
+	let record_value = &payload[*offset..end];
+	*offset = end;
+	Ok((record_type, record_value))
+}
+
+fn decode_taproot_asset_tap_leaf_script(
+	payload: &[u8],
+) -> Result<ScriptBuf, TaprootAssetCommitmentAuxLeavesError> {
+	if payload.is_empty() {
+		return Err(TaprootAssetCommitmentAuxLeavesError::MalformedTlv);
+	}
+	let leaf_version = payload[0];
+	if leaf_version != TAPROOT_ASSET_TAPSCRIPT_LEAF_VERSION {
+		return Err(TaprootAssetCommitmentAuxLeavesError::UnsupportedLeafVersion);
+	}
+
+	let mut offset = 1usize;
+	let declared_script_len = read_taproot_asset_commitment_aux_bigsize(payload, &mut offset)?;
+	if declared_script_len > MAX_TAPROOT_ASSET_AUX_LEAF_SCRIPT_LEN {
+		return Err(TaprootAssetCommitmentAuxLeavesError::TooLongScript);
+	}
+	let script = read_taproot_asset_commitment_aux_inline_bytes(payload, &mut offset)?;
+	if script.len() as u64 != declared_script_len {
+		return Err(TaprootAssetCommitmentAuxLeavesError::ScriptLengthMismatch);
+	}
+	if offset != payload.len() {
+		return Err(TaprootAssetCommitmentAuxLeavesError::MalformedTlv);
+	}
+
+	Ok(ScriptBuf::from(script.to_vec()))
+}
+
+fn decode_taproot_asset_htlc_aux_leaf(
+	htlc_index: u64, payload: &[u8],
+) -> Result<TaprootAssetHtlcAuxLeaf, TaprootAssetCommitmentAuxLeavesError> {
+	let mut offset = 0usize;
+	let mut previous_record_type = None;
+	let mut aux_leaf_script = None;
+	let mut second_level_leaf_script = None;
+
+	while offset < payload.len() {
+		let (record_type, record_value) = read_taproot_asset_commitment_aux_record(
+			payload,
+			&mut offset,
+			&mut previous_record_type,
+		)?;
+		match record_type {
+			TAPROOT_ASSET_HTLC_AUX_LEAF_RECORD_TYPE => {
+				if aux_leaf_script.is_some() {
+					return Err(TaprootAssetCommitmentAuxLeavesError::DuplicateField);
+				}
+				aux_leaf_script = Some(decode_taproot_asset_tap_leaf_script(record_value)?);
+			},
+			TAPROOT_ASSET_HTLC_SECOND_LEVEL_LEAF_RECORD_TYPE => {
+				if second_level_leaf_script.is_some() {
+					return Err(TaprootAssetCommitmentAuxLeavesError::DuplicateField);
+				}
+				second_level_leaf_script =
+					Some(decode_taproot_asset_tap_leaf_script(record_value)?);
+			},
+			unknown if unknown % 2 == 0 => {
+				return Err(TaprootAssetCommitmentAuxLeavesError::UnknownRequiredTlv);
+			},
+			_ => {},
+		}
+	}
+
+	if aux_leaf_script.is_none() && second_level_leaf_script.is_none() {
+		return Err(TaprootAssetCommitmentAuxLeavesError::MissingHtlcAuxLeaf);
+	}
+
+	Ok(TaprootAssetHtlcAuxLeaf { htlc_index, aux_leaf_script, second_level_leaf_script })
+}
+
+fn decode_taproot_asset_htlc_aux_leaf_map(
+	payload: &[u8],
+) -> Result<Vec<TaprootAssetHtlcAuxLeaf>, TaprootAssetCommitmentAuxLeavesError> {
+	let mut offset = 0usize;
+	let htlc_count = read_taproot_asset_commitment_aux_bigsize(payload, &mut offset)?;
+	if htlc_count > MAX_TAPROOT_ASSET_COMMITMENT_SIG_HTLCS {
+		return Err(TaprootAssetCommitmentAuxLeavesError::TooManyHtlcs);
+	}
+
+	let mut htlc_aux_leaves: Vec<TaprootAssetHtlcAuxLeaf> = Vec::with_capacity(htlc_count as usize);
+	for _ in 0..htlc_count {
+		let htlc_index = read_taproot_asset_commitment_aux_bigsize(payload, &mut offset)?;
+		if htlc_aux_leaves.iter().any(|leaf| leaf.htlc_index == htlc_index) {
+			return Err(TaprootAssetCommitmentAuxLeavesError::DuplicateHtlcIndex);
+		}
+		let htlc_aux_leaf_payload =
+			read_taproot_asset_commitment_aux_inline_bytes(payload, &mut offset)?;
+		htlc_aux_leaves
+			.push(decode_taproot_asset_htlc_aux_leaf(htlc_index, htlc_aux_leaf_payload)?);
+	}
+	if offset != payload.len() {
+		return Err(TaprootAssetCommitmentAuxLeavesError::MalformedTlv);
+	}
+
+	Ok(htlc_aux_leaves)
+}
+
+fn decode_taproot_asset_aux_leaves_value(
+	payload: &[u8],
+) -> Result<TaprootAssetCommitmentAuxLeaves, TaprootAssetCommitmentAuxLeavesError> {
+	let mut outer_offset = 0usize;
+	let aux_leaves_payload =
+		read_taproot_asset_commitment_aux_inline_bytes(payload, &mut outer_offset)?;
+	if outer_offset != payload.len() {
+		return Err(TaprootAssetCommitmentAuxLeavesError::MalformedTlv);
+	}
+
+	let mut offset = 0usize;
+	let mut previous_record_type = None;
+	let mut local_aux_leaf_script = None;
+	let mut remote_aux_leaf_script = None;
+	let mut outgoing_htlc_aux_leaves = Vec::new();
+	let mut incoming_htlc_aux_leaves = Vec::new();
+
+	while offset < aux_leaves_payload.len() {
+		let (record_type, record_value) = read_taproot_asset_commitment_aux_record(
+			aux_leaves_payload,
+			&mut offset,
+			&mut previous_record_type,
+		)?;
+		match record_type {
+			TAPROOT_ASSET_AUX_LEAVES_LOCAL_RECORD_TYPE => {
+				if local_aux_leaf_script.is_some() {
+					return Err(TaprootAssetCommitmentAuxLeavesError::DuplicateField);
+				}
+				local_aux_leaf_script = Some(decode_taproot_asset_tap_leaf_script(record_value)?);
+			},
+			TAPROOT_ASSET_AUX_LEAVES_REMOTE_RECORD_TYPE => {
+				if remote_aux_leaf_script.is_some() {
+					return Err(TaprootAssetCommitmentAuxLeavesError::DuplicateField);
+				}
+				remote_aux_leaf_script = Some(decode_taproot_asset_tap_leaf_script(record_value)?);
+			},
+			TAPROOT_ASSET_AUX_LEAVES_OUTGOING_HTLCS_RECORD_TYPE => {
+				outgoing_htlc_aux_leaves = decode_taproot_asset_htlc_aux_leaf_map(record_value)?;
+			},
+			TAPROOT_ASSET_AUX_LEAVES_INCOMING_HTLCS_RECORD_TYPE => {
+				incoming_htlc_aux_leaves = decode_taproot_asset_htlc_aux_leaf_map(record_value)?;
+			},
+			unknown if unknown % 2 == 0 => {
+				return Err(TaprootAssetCommitmentAuxLeavesError::UnknownRequiredTlv);
+			},
+			_ => {},
+		}
+	}
+
+	Ok(TaprootAssetCommitmentAuxLeaves {
+		local_aux_leaf_script,
+		remote_aux_leaf_script,
+		outgoing_htlc_aux_leaves,
+		incoming_htlc_aux_leaves,
+	})
+}
+
+/// Decodes Lightning Labs Taproot Asset commitment aux leaves from a full
+/// `tapchannelmsg.Commitment` blob.
+///
+/// The function extracts record type 4 (`AuxLeaves`), unwraps the nested
+/// inline-varbytes payload, and returns the actual tapleaf scripts needed by
+/// commitment-output construction.
+pub fn decode_taproot_asset_commitment_aux_leaves(
+	payload: &[u8],
+) -> Result<TaprootAssetCommitmentAuxLeaves, TaprootAssetCommitmentAuxLeavesError> {
+	if payload.is_empty() {
+		return Err(TaprootAssetCommitmentAuxLeavesError::Empty);
+	}
+
+	let mut offset = 0usize;
+	let mut previous_record_type = None;
+	let mut aux_leaves = None;
+	while offset < payload.len() {
+		let (record_type, record_value) = read_taproot_asset_commitment_aux_record(
+			payload,
+			&mut offset,
+			&mut previous_record_type,
+		)?;
+		match record_type {
+			TAPROOT_ASSET_COMMITMENT_AUX_LEAVES_RECORD_TYPE => {
+				if aux_leaves.is_some() {
+					return Err(TaprootAssetCommitmentAuxLeavesError::DuplicateField);
+				}
+				aux_leaves = Some(decode_taproot_asset_aux_leaves_value(record_value)?);
+			},
+			0 | 1 | 2 | 3 | 5 => {},
+			unknown if unknown % 2 == 0 => {
+				return Err(TaprootAssetCommitmentAuxLeavesError::UnknownRequiredTlv);
+			},
+			_ => {},
+		}
+	}
+
+	aux_leaves.ok_or(TaprootAssetCommitmentAuxLeavesError::MissingAuxLeaves)
 }
 
 /// Expected final-hop metadata for an asset-channel HTLC.
@@ -1376,6 +1658,34 @@ pub enum TaprootAssetCommitmentSigBlobError {
 	ZeroAssetId,
 }
 
+/// Errors returned while decoding Lightning Labs Taproot Asset commitment aux
+/// leaves.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum TaprootAssetCommitmentAuxLeavesError {
+	/// The commitment blob was empty.
+	Empty,
+	/// The TLV stream was not canonical or its length fields were malformed.
+	MalformedTlv,
+	/// An unknown even TLV record was present.
+	UnknownRequiredTlv,
+	/// A known TLV field appeared more than once.
+	DuplicateField,
+	/// The full commitment blob did not contain record type 4.
+	MissingAuxLeaves,
+	/// Too many HTLC aux leaf entries were encoded.
+	TooManyHtlcs,
+	/// A HTLC aux leaf map encoded the same HTLC index more than once.
+	DuplicateHtlcIndex,
+	/// A HTLC aux leaf entry did not contain either known leaf field.
+	MissingHtlcAuxLeaf,
+	/// The tapleaf used a non-tapscript leaf version.
+	UnsupportedLeafVersion,
+	/// The tapleaf script was larger than the accepted bounded size.
+	TooLongScript,
+	/// The declared script length did not match the inline script length.
+	ScriptLengthMismatch,
+}
+
 /// Errors returned by cooperative asset-channel close allocation validation.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum TaprootAssetCloseAllocationError {
@@ -1905,6 +2215,104 @@ mod tests {
 		]
 	}
 
+	fn push_big_size(value: u64, out: &mut Vec<u8>) {
+		match value {
+			0..=0xfc => out.push(value as u8),
+			0xfd..=0xffff => {
+				out.push(0xfd);
+				out.extend_from_slice(&(value as u16).to_be_bytes());
+			},
+			0x1_0000..=0xffff_ffff => {
+				out.push(0xfe);
+				out.extend_from_slice(&(value as u32).to_be_bytes());
+			},
+			_ => {
+				out.push(0xff);
+				out.extend_from_slice(&value.to_be_bytes());
+			},
+		}
+	}
+
+	fn push_tlv_record(record_type: u64, value: &[u8], out: &mut Vec<u8>) {
+		push_big_size(record_type, out);
+		push_big_size(value.len() as u64, out);
+		out.extend_from_slice(value);
+	}
+
+	fn inline_bytes(bytes: &[u8]) -> Vec<u8> {
+		let mut encoded = Vec::new();
+		push_big_size(bytes.len() as u64, &mut encoded);
+		encoded.extend_from_slice(bytes);
+		encoded
+	}
+
+	fn tap_leaf(script: &[u8]) -> Vec<u8> {
+		let mut leaf = vec![TAPROOT_ASSET_TAPSCRIPT_LEAF_VERSION];
+		push_big_size(script.len() as u64, &mut leaf);
+		leaf.extend_from_slice(&inline_bytes(script));
+		leaf
+	}
+
+	fn htlc_aux_leaf(aux_script: &[u8], second_level_script: &[u8]) -> Vec<u8> {
+		let mut encoded = Vec::new();
+		push_tlv_record(
+			TAPROOT_ASSET_HTLC_AUX_LEAF_RECORD_TYPE,
+			&tap_leaf(aux_script),
+			&mut encoded,
+		);
+		push_tlv_record(
+			TAPROOT_ASSET_HTLC_SECOND_LEVEL_LEAF_RECORD_TYPE,
+			&tap_leaf(second_level_script),
+			&mut encoded,
+		);
+		encoded
+	}
+
+	fn htlc_aux_leaf_map(
+		htlc_index: u64, aux_script: &[u8], second_level_script: &[u8],
+	) -> Vec<u8> {
+		let leaf = htlc_aux_leaf(aux_script, second_level_script);
+		let mut encoded = Vec::new();
+		push_big_size(1, &mut encoded);
+		push_big_size(htlc_index, &mut encoded);
+		encoded.extend_from_slice(&inline_bytes(&leaf));
+		encoded
+	}
+
+	fn commitment_blob_with_aux_leaves() -> Vec<u8> {
+		let local = tap_leaf(&[0x51]);
+		let remote = tap_leaf(&[0x52]);
+		let outgoing = htlc_aux_leaf_map(7, &[0x53], &[0x54]);
+		let incoming = htlc_aux_leaf_map(8, &[0x55], &[0x56]);
+
+		let mut nested_aux_leaves = Vec::new();
+		push_tlv_record(TAPROOT_ASSET_AUX_LEAVES_LOCAL_RECORD_TYPE, &local, &mut nested_aux_leaves);
+		push_tlv_record(
+			TAPROOT_ASSET_AUX_LEAVES_REMOTE_RECORD_TYPE,
+			&remote,
+			&mut nested_aux_leaves,
+		);
+		push_tlv_record(
+			TAPROOT_ASSET_AUX_LEAVES_OUTGOING_HTLCS_RECORD_TYPE,
+			&outgoing,
+			&mut nested_aux_leaves,
+		);
+		push_tlv_record(
+			TAPROOT_ASSET_AUX_LEAVES_INCOMING_HTLCS_RECORD_TYPE,
+			&incoming,
+			&mut nested_aux_leaves,
+		);
+
+		let mut commitment = Vec::new();
+		let aux_record_value = inline_bytes(&nested_aux_leaves);
+		push_tlv_record(
+			TAPROOT_ASSET_COMMITMENT_AUX_LEAVES_RECORD_TYPE,
+			&aux_record_value,
+			&mut commitment,
+		);
+		commitment
+	}
+
 	fn descriptor() -> TaprootAssetChannelDescriptor {
 		TaprootAssetChannelDescriptor::new(
 			asset_id(),
@@ -2005,6 +2413,64 @@ mod tests {
 		assert_eq!(
 			decode_taproot_asset_commitment_sig_blob(&unknown_required),
 			Err(TaprootAssetCommitmentSigBlobError::UnknownRequiredTlv)
+		);
+	}
+
+	#[test]
+	fn decodes_lightning_labs_commitment_aux_leaves() {
+		let decoded =
+			decode_taproot_asset_commitment_aux_leaves(&commitment_blob_with_aux_leaves()).unwrap();
+
+		assert_eq!(decoded.local_aux_leaf_script, Some(ScriptBuf::from(vec![0x51])));
+		assert_eq!(decoded.remote_aux_leaf_script, Some(ScriptBuf::from(vec![0x52])));
+		assert_eq!(decoded.outgoing_htlc_aux_leaves.len(), 1);
+		assert_eq!(decoded.outgoing_htlc_aux_leaves[0].htlc_index, 7);
+		assert_eq!(
+			decoded.outgoing_htlc_aux_leaves[0].aux_leaf_script,
+			Some(ScriptBuf::from(vec![0x53]))
+		);
+		assert_eq!(
+			decoded.outgoing_htlc_aux_leaves[0].second_level_leaf_script,
+			Some(ScriptBuf::from(vec![0x54]))
+		);
+		assert_eq!(decoded.incoming_htlc_aux_leaves.len(), 1);
+		assert_eq!(decoded.incoming_htlc_aux_leaves[0].htlc_index, 8);
+		assert_eq!(
+			decoded.incoming_htlc_aux_leaves[0].aux_leaf_script,
+			Some(ScriptBuf::from(vec![0x55]))
+		);
+		assert_eq!(
+			decoded.incoming_htlc_aux_leaves[0].second_level_leaf_script,
+			Some(ScriptBuf::from(vec![0x56]))
+		);
+	}
+
+	#[test]
+	fn rejects_malformed_lightning_labs_commitment_aux_leaves() {
+		assert_eq!(
+			decode_taproot_asset_commitment_aux_leaves(&[]),
+			Err(TaprootAssetCommitmentAuxLeavesError::Empty)
+		);
+
+		let mut missing_aux = Vec::new();
+		push_tlv_record(5, &[1], &mut missing_aux);
+		assert_eq!(
+			decode_taproot_asset_commitment_aux_leaves(&missing_aux),
+			Err(TaprootAssetCommitmentAuxLeavesError::MissingAuxLeaves)
+		);
+
+		let mut unknown_required = commitment_blob_with_aux_leaves();
+		unknown_required.extend_from_slice(&[6, 1, 1]);
+		assert_eq!(
+			decode_taproot_asset_commitment_aux_leaves(&unknown_required),
+			Err(TaprootAssetCommitmentAuxLeavesError::UnknownRequiredTlv)
+		);
+
+		let mut bad_leaf_version = commitment_blob_with_aux_leaves();
+		bad_leaf_version[5] = 0xc1;
+		assert_eq!(
+			decode_taproot_asset_commitment_aux_leaves(&bad_leaf_version),
+			Err(TaprootAssetCommitmentAuxLeavesError::UnsupportedLeafVersion)
 		);
 	}
 
