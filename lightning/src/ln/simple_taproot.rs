@@ -175,6 +175,17 @@ pub struct SimpleTaprootHtlcSpendInfo {
 	pub success: SimpleTaprootLeafSpendInfo,
 }
 
+/// Selects the HTLC script variant used for a simple-taproot channel.
+#[cfg(feature = "simple_taproot_musig2")]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SimpleTaprootHtlcScriptVariant {
+	/// The staging script variant used by the current draft deployment and
+	/// Lightning Labs' `taproot-overlay-chans` implementation.
+	Staging,
+	/// The final script variant using the assigned simple-taproot feature bits.
+	Final,
+}
+
 /// A fully specified tapscript spend for a simple-taproot second-level HTLC transaction.
 #[cfg(feature = "simple_taproot_musig2")]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1341,19 +1352,45 @@ pub fn simple_taproot_offered_htlc_timeout_script(
 pub fn simple_taproot_offered_htlc_success_script(
 	remote_htlc_pubkey: &PublicKey, payment_hash: &PaymentHash,
 ) -> ScriptBuf {
+	simple_taproot_offered_htlc_success_script_for_variant(
+		remote_htlc_pubkey,
+		payment_hash,
+		SimpleTaprootHtlcScriptVariant::Final,
+	)
+}
+
+/// Returns the simple-taproot offered-HTLC success tapscript for a script variant.
+#[cfg(feature = "simple_taproot_musig2")]
+pub fn simple_taproot_offered_htlc_success_script_for_variant(
+	remote_htlc_pubkey: &PublicKey, payment_hash: &PaymentHash,
+	variant: SimpleTaprootHtlcScriptVariant,
+) -> ScriptBuf {
 	let payment_hash160 = Ripemd160::hash(&payment_hash.0[..]).to_byte_array();
-	Builder::new()
+	let mut builder = Builder::new()
 		.push_opcode(opcodes::all::OP_SIZE)
 		.push_int(32)
 		.push_opcode(opcodes::all::OP_EQUALVERIFY)
 		.push_opcode(opcodes::all::OP_HASH160)
 		.push_slice(&payment_hash160)
 		.push_opcode(opcodes::all::OP_EQUALVERIFY)
-		.push_x_only_key(&xonly_key(remote_htlc_pubkey))
-		.push_opcode(opcodes::all::OP_CHECKSIGVERIFY)
-		.push_opcode(opcodes::all::OP_PUSHNUM_1)
-		.push_opcode(opcodes::all::OP_CSV)
-		.into_script()
+		.push_x_only_key(&xonly_key(remote_htlc_pubkey));
+
+	match variant {
+		SimpleTaprootHtlcScriptVariant::Staging => {
+			builder = builder.push_opcode(opcodes::all::OP_CHECKSIG);
+			builder = builder
+				.push_opcode(opcodes::all::OP_PUSHNUM_1)
+				.push_opcode(opcodes::all::OP_CSV)
+				.push_opcode(opcodes::all::OP_DROP);
+		},
+		SimpleTaprootHtlcScriptVariant::Final => {
+			builder = builder.push_opcode(opcodes::all::OP_CHECKSIGVERIFY);
+			builder =
+				builder.push_opcode(opcodes::all::OP_PUSHNUM_1).push_opcode(opcodes::all::OP_CSV);
+		},
+	}
+
+	builder.into_script()
 }
 
 /// Returns the BOLT simple-taproot accepted-HTLC timeout tapscript.
@@ -1361,15 +1398,36 @@ pub fn simple_taproot_offered_htlc_success_script(
 pub fn simple_taproot_accepted_htlc_timeout_script(
 	remote_htlc_pubkey: &PublicKey, cltv_expiry: u32,
 ) -> ScriptBuf {
-	Builder::new()
+	simple_taproot_accepted_htlc_timeout_script_for_variant(
+		remote_htlc_pubkey,
+		cltv_expiry,
+		SimpleTaprootHtlcScriptVariant::Final,
+	)
+}
+
+/// Returns the simple-taproot accepted-HTLC timeout tapscript for a script variant.
+#[cfg(feature = "simple_taproot_musig2")]
+pub fn simple_taproot_accepted_htlc_timeout_script_for_variant(
+	remote_htlc_pubkey: &PublicKey, cltv_expiry: u32, variant: SimpleTaprootHtlcScriptVariant,
+) -> ScriptBuf {
+	let mut builder = Builder::new()
 		.push_x_only_key(&xonly_key(remote_htlc_pubkey))
-		.push_opcode(opcodes::all::OP_CHECKSIGVERIFY)
+		.push_opcode(match variant {
+			SimpleTaprootHtlcScriptVariant::Staging => opcodes::all::OP_CHECKSIG,
+			SimpleTaprootHtlcScriptVariant::Final => opcodes::all::OP_CHECKSIGVERIFY,
+		})
 		.push_opcode(opcodes::all::OP_PUSHNUM_1)
 		.push_opcode(opcodes::all::OP_CSV)
-		.push_opcode(opcodes::all::OP_VERIFY)
+		.push_opcode(match variant {
+			SimpleTaprootHtlcScriptVariant::Staging => opcodes::all::OP_DROP,
+			SimpleTaprootHtlcScriptVariant::Final => opcodes::all::OP_VERIFY,
+		})
 		.push_int(cltv_expiry as i64)
-		.push_opcode(opcodes::all::OP_CLTV)
-		.into_script()
+		.push_opcode(opcodes::all::OP_CLTV);
+	if variant == SimpleTaprootHtlcScriptVariant::Staging {
+		builder = builder.push_opcode(opcodes::all::OP_DROP);
+	}
+	builder.into_script()
 }
 
 /// Returns the BOLT simple-taproot accepted-HTLC success tapscript.
@@ -1418,14 +1476,43 @@ pub fn simple_taproot_htlc_spend_info_with_aux_leaf<C: Verification>(
 	local_htlc_pubkey: &PublicKey, remote_htlc_pubkey: &PublicKey, revocation_pubkey: &PublicKey,
 	auxiliary_leaf_script: Option<&Script>,
 ) -> Result<SimpleTaprootHtlcSpendInfo, SimpleTaprootMusigError> {
+	simple_taproot_htlc_spend_info_with_aux_leaf_for_variant(
+		secp_ctx,
+		offered,
+		payment_hash,
+		cltv_expiry,
+		local_htlc_pubkey,
+		remote_htlc_pubkey,
+		revocation_pubkey,
+		auxiliary_leaf_script,
+		SimpleTaprootHtlcScriptVariant::Final,
+	)
+}
+
+/// Returns script-path spend data for a simple-taproot HTLC output using the requested
+/// staging/final script variant.
+#[cfg(feature = "simple_taproot_musig2")]
+pub fn simple_taproot_htlc_spend_info_with_aux_leaf_for_variant<C: Verification>(
+	secp_ctx: &Secp256k1<C>, offered: bool, payment_hash: &PaymentHash, cltv_expiry: u32,
+	local_htlc_pubkey: &PublicKey, remote_htlc_pubkey: &PublicKey, revocation_pubkey: &PublicKey,
+	auxiliary_leaf_script: Option<&Script>, variant: SimpleTaprootHtlcScriptVariant,
+) -> Result<SimpleTaprootHtlcSpendInfo, SimpleTaprootMusigError> {
 	let (timeout_script, success_script) = if offered {
 		(
 			simple_taproot_offered_htlc_timeout_script(local_htlc_pubkey, remote_htlc_pubkey),
-			simple_taproot_offered_htlc_success_script(remote_htlc_pubkey, payment_hash),
+			simple_taproot_offered_htlc_success_script_for_variant(
+				remote_htlc_pubkey,
+				payment_hash,
+				variant,
+			),
 		)
 	} else {
 		(
-			simple_taproot_accepted_htlc_timeout_script(local_htlc_pubkey, cltv_expiry),
+			simple_taproot_accepted_htlc_timeout_script_for_variant(
+				local_htlc_pubkey,
+				cltv_expiry,
+				variant,
+			),
 			simple_taproot_accepted_htlc_success_script(
 				local_htlc_pubkey,
 				remote_htlc_pubkey,

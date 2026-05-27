@@ -48,10 +48,10 @@ use super::channel_keys::{
 };
 #[cfg(feature = "simple_taproot_musig2")]
 use super::simple_taproot::{
-	simple_taproot_anchor_spend_info, simple_taproot_htlc_spend_info,
-	simple_taproot_htlc_spend_info_with_aux_leaf, simple_taproot_second_level_htlc_spend_info,
-	simple_taproot_to_local_spend_info, simple_taproot_to_local_spend_info_with_aux_leaf,
-	simple_taproot_to_remote_spend_info, simple_taproot_to_remote_spend_info_with_aux_leaf,
+	simple_taproot_anchor_spend_info, simple_taproot_htlc_spend_info_with_aux_leaf_for_variant,
+	simple_taproot_second_level_htlc_spend_info, simple_taproot_to_local_spend_info,
+	simple_taproot_to_local_spend_info_with_aux_leaf, simple_taproot_to_remote_spend_info,
+	simple_taproot_to_remote_spend_info_with_aux_leaf, SimpleTaprootHtlcScriptVariant,
 	SimpleTaprootKeyAggContext,
 };
 use crate::chain;
@@ -916,6 +916,20 @@ pub(crate) fn requires_simple_taproot_outputs(channel_type_features: &ChannelTyp
 	channel_type_features.requires_simple_taproot()
 		|| channel_type_features.requires_simple_taproot_staging()
 		|| channel_type_features.requires_taproot_asset_channel()
+}
+
+#[cfg(feature = "simple_taproot_musig2")]
+pub(crate) fn simple_taproot_htlc_script_variant(
+	channel_type_features: &ChannelTypeFeatures,
+) -> SimpleTaprootHtlcScriptVariant {
+	if channel_type_features.requires_simple_taproot()
+		&& !channel_type_features.requires_simple_taproot_staging()
+		&& !channel_type_features.requires_taproot_asset_channel()
+	{
+		SimpleTaprootHtlcScriptVariant::Final
+	} else {
+		SimpleTaprootHtlcScriptVariant::Staging
+	}
 }
 
 #[cfg(not(feature = "simple_taproot_musig2"))]
@@ -2296,7 +2310,8 @@ impl CommitmentTransaction {
 					#[cfg(feature = "simple_taproot_musig2")]
 					if requires_simple_taproot_outputs(channel_type) {
 						let secp_ctx = Secp256k1::verification_only();
-						let script_pubkey = simple_taproot_htlc_spend_info_with_aux_leaf(
+						let script_variant = simple_taproot_htlc_script_variant(channel_type);
+						let script_pubkey = simple_taproot_htlc_spend_info_with_aux_leaf_for_variant(
 							&secp_ctx,
 							htlc.offered,
 							&htlc.payment_hash,
@@ -2305,10 +2320,11 @@ impl CommitmentTransaction {
 							&keys.countersignatory_htlc_key.to_public_key(),
 							&keys.revocation_key.to_public_key(),
 							htlc.simple_taproot_aux_leaf_script.as_deref(),
+							script_variant,
 						)
 						.expect("valid simple-taproot HTLC output")
 						.script_pubkey;
-						let sort_script_pubkey = simple_taproot_htlc_spend_info(
+						let sort_script_pubkey = simple_taproot_htlc_spend_info_with_aux_leaf_for_variant(
 							&secp_ctx,
 							htlc.offered,
 							&htlc.payment_hash,
@@ -2316,6 +2332,8 @@ impl CommitmentTransaction {
 							&keys.broadcaster_htlc_key.to_public_key(),
 							&keys.countersignatory_htlc_key.to_public_key(),
 							&keys.revocation_key.to_public_key(),
+							None,
+							script_variant,
 						)
 						.expect("valid simple-taproot HTLC sort output")
 						.script_pubkey;
@@ -2661,8 +2679,6 @@ pub fn get_commitment_transaction_number_obscure_factor(
 mod tests {
 	use super::{ChannelPublicKeys, CounterpartyCommitmentSecrets};
 	use crate::chain;
-	#[cfg(feature = "simple_taproot_musig2")]
-	use crate::ln::chan_utils::simple_taproot_to_remote_payment_key;
 	use crate::ln::chan_utils::{
 		build_htlc_transaction, commit_tx_fee_sat, get_htlc_redeemscript,
 		get_keyed_anchor_redeemscript, get_to_countersigner_keyed_anchor_redeemscript,
@@ -2671,12 +2687,17 @@ mod tests {
 		TrustedCommitmentTransaction,
 	};
 	#[cfg(feature = "simple_taproot_musig2")]
+	use crate::ln::chan_utils::{
+		simple_taproot_htlc_script_variant, simple_taproot_to_remote_payment_key,
+	};
+	#[cfg(feature = "simple_taproot_musig2")]
 	use crate::ln::channel_keys::{DelayedPaymentBasepoint, HtlcBasepoint, RevocationBasepoint};
 	#[cfg(feature = "simple_taproot_musig2")]
 	use crate::ln::simple_taproot::{
-		simple_taproot_htlc_spend_info_with_aux_leaf, simple_taproot_to_local_spend_info,
-		simple_taproot_to_local_spend_info_with_aux_leaf, simple_taproot_to_remote_spend_info,
-		simple_taproot_to_remote_spend_info_with_aux_leaf,
+		simple_taproot_htlc_spend_info_with_aux_leaf_for_variant,
+		simple_taproot_to_local_spend_info, simple_taproot_to_local_spend_info_with_aux_leaf,
+		simple_taproot_to_remote_spend_info, simple_taproot_to_remote_spend_info_with_aux_leaf,
+		SimpleTaprootHtlcScriptVariant,
 	};
 	use crate::sign::{ChannelSigner, SignerProvider};
 	use crate::types::features::ChannelTypeFeatures;
@@ -3254,8 +3275,51 @@ mod tests {
 		};
 		let tx = builder.build(6_988_000, 3_000_000, vec![accepted_htlc.clone(), offered_htlc.clone()]);
 		let outputs = &tx.built.transaction.output;
-		assert!(outputs.iter().any(|out| out.value.to_sat() == 1_000 && out.script_pubkey.as_bytes() == &<Vec<u8>>::from_hex("51209aadbdd9aff986e5ea086cf53ae062972d33d0a5c7f5fb986dafec7fa6d7e6ea").unwrap()[..]));
-		assert!(outputs.iter().any(|out| out.value.to_sat() == 2_000 && out.script_pubkey.as_bytes() == &<Vec<u8>>::from_hex("51203e5c3be9f4ce7ae07c28ad5e0eb0ab617c06eeb82b8d6ef10a5bf561848df5f0").unwrap()[..]));
+		let keys = tx.trust().keys();
+		let script_variant = simple_taproot_htlc_script_variant(&builder.channel_parameters.channel_type_features);
+		assert_eq!(script_variant, SimpleTaprootHtlcScriptVariant::Staging);
+		let expected_accepted = simple_taproot_htlc_spend_info_with_aux_leaf_for_variant(
+			&builder.secp_ctx,
+			accepted_htlc.offered,
+			&accepted_htlc.payment_hash,
+			accepted_htlc.cltv_expiry,
+			&keys.broadcaster_htlc_key.to_public_key(),
+			&keys.countersignatory_htlc_key.to_public_key(),
+			&keys.revocation_key.to_public_key(),
+			None,
+			script_variant,
+		)
+		.unwrap()
+		.script_pubkey;
+		let expected_offered = simple_taproot_htlc_spend_info_with_aux_leaf_for_variant(
+			&builder.secp_ctx,
+			offered_htlc.offered,
+			&offered_htlc.payment_hash,
+			offered_htlc.cltv_expiry,
+			&keys.broadcaster_htlc_key.to_public_key(),
+			&keys.countersignatory_htlc_key.to_public_key(),
+			&keys.revocation_key.to_public_key(),
+			None,
+			script_variant,
+		)
+		.unwrap()
+		.script_pubkey;
+		let final_accepted = simple_taproot_htlc_spend_info_with_aux_leaf_for_variant(
+			&builder.secp_ctx,
+			accepted_htlc.offered,
+			&accepted_htlc.payment_hash,
+			accepted_htlc.cltv_expiry,
+			&keys.broadcaster_htlc_key.to_public_key(),
+			&keys.countersignatory_htlc_key.to_public_key(),
+			&keys.revocation_key.to_public_key(),
+			None,
+			SimpleTaprootHtlcScriptVariant::Final,
+		)
+		.unwrap()
+		.script_pubkey;
+		assert_ne!(expected_accepted, final_accepted);
+		assert!(outputs.iter().any(|out| out.value.to_sat() == 1_000 && out.script_pubkey == expected_accepted));
+		assert!(outputs.iter().any(|out| out.value.to_sat() == 2_000 && out.script_pubkey == expected_offered));
 
 		let htlc_success = build_htlc_transaction(
 			&tx.trust().txid(),
@@ -3287,7 +3351,7 @@ mod tests {
 		let plain_tx = builder.build(6_988_000, 3_000_000, vec![plain_htlc]);
 		let asset_tx = builder.build(6_988_000, 3_000_000, vec![asset_htlc.clone()]);
 		let keys = asset_tx.trust().keys();
-		let expected_asset_htlc_script = simple_taproot_htlc_spend_info_with_aux_leaf(
+		let expected_asset_htlc_script = simple_taproot_htlc_spend_info_with_aux_leaf_for_variant(
 			&builder.secp_ctx,
 			asset_htlc.offered,
 			&asset_htlc.payment_hash,
@@ -3296,6 +3360,7 @@ mod tests {
 			&keys.countersignatory_htlc_key.to_public_key(),
 			&keys.revocation_key.to_public_key(),
 			Some(aux_leaf.as_script()),
+			simple_taproot_htlc_script_variant(&builder.channel_parameters.channel_type_features),
 		)
 		.unwrap()
 		.script_pubkey;

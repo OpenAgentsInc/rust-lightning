@@ -54,7 +54,8 @@ use crate::ln::chan_utils::{
 };
 #[cfg(feature = "simple_taproot_musig2")]
 use crate::ln::chan_utils::{
-	simple_taproot_to_remote_payment_key, SimpleTaprootAssetCommitmentOutputKeys, TxCreationKeys,
+	simple_taproot_htlc_script_variant, simple_taproot_to_remote_payment_key,
+	SimpleTaprootAssetCommitmentOutputKeys, TxCreationKeys,
 };
 use crate::ln::channel_state::{
 	ChannelShutdownState, CounterpartyForwardingInfo, InboundHTLCDetails, InboundHTLCStateDetails,
@@ -79,7 +80,7 @@ use crate::ln::onion_utils::{
 use crate::ln::script::{self, ShutdownScript};
 #[cfg(feature = "simple_taproot_musig2")]
 use crate::ln::simple_taproot::{
-	simple_taproot_htlc_spend_info, simple_taproot_to_local_spend_info,
+	simple_taproot_htlc_spend_info_with_aux_leaf_for_variant, simple_taproot_to_local_spend_info,
 	simple_taproot_to_remote_spend_info, SimpleTaprootNoncePair, SimpleTaprootNonceScope,
 	SimpleTaprootSentCommitmentSignature, SIMPLE_TAPROOT_COMMITMENT_NONCE_PREIMAGE,
 	SIMPLE_TAPROOT_COOPERATIVE_CLOSE_NONCE_PREIMAGE,
@@ -7375,7 +7376,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 			directed_parameters.countersignatory_pubkeys(),
 			&self.secp_ctx,
 		);
-		let htlc_spend_info = simple_taproot_htlc_spend_info(
+		let htlc_spend_info = simple_taproot_htlc_spend_info_with_aux_leaf_for_variant(
 			&self.secp_ctx,
 			offered,
 			payment_hash,
@@ -7383,6 +7384,8 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 			&keys.broadcaster_htlc_key.to_public_key(),
 			&keys.countersignatory_htlc_key.to_public_key(),
 			&keys.revocation_key.to_public_key(),
+			None,
+			simple_taproot_htlc_script_variant(funding.get_channel_type()),
 		)
 		.ok()?;
 
