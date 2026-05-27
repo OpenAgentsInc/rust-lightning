@@ -58,6 +58,7 @@ use crate::chain;
 use crate::crypto::utils::{sign, sign_with_aux_rand};
 use crate::io;
 use crate::ln::channel::{ANCHOR_OUTPUT_VALUE_SATOSHI, INITIAL_COMMITMENT_NUMBER};
+use crate::ln::taproot_asset::TaprootAssetChannelAssetTemplate;
 use crate::types::features::ChannelTypeFeatures;
 use core::cmp;
 use core::ops::Deref;
@@ -1177,6 +1178,8 @@ pub struct ChannelTransactionParameters {
 	pub simple_taproot_counterparty_commitment_to_holder_aux_leaf_script: Option<ScriptBuf>,
 	/// Optional Taproot Asset aux leaf for the counterparty commitment output paying the counterparty.
 	pub simple_taproot_counterparty_commitment_to_counterparty_aux_leaf_script: Option<ScriptBuf>,
+	/// Optional single-asset template used to derive dynamic Taproot Asset HTLC aux leaves.
+	pub simple_taproot_asset_channel_template: Option<TaprootAssetChannelAssetTemplate>,
 	/// The value locked in the channel, denominated in satoshis.
 	pub channel_value_satoshis: u64,
 }
@@ -1303,6 +1306,7 @@ impl ChannelTransactionParameters {
 			simple_taproot_holder_commitment_to_counterparty_aux_leaf_script: None,
 			simple_taproot_counterparty_commitment_to_holder_aux_leaf_script: None,
 			simple_taproot_counterparty_commitment_to_counterparty_aux_leaf_script: None,
+			simple_taproot_asset_channel_template: None,
 			channel_value_satoshis,
 		}
 	}
@@ -1332,6 +1336,7 @@ impl Writeable for ChannelTransactionParameters {
 			(18, self.simple_taproot_holder_commitment_to_counterparty_aux_leaf_script, option),
 			(20, self.simple_taproot_counterparty_commitment_to_holder_aux_leaf_script, option),
 			(22, self.simple_taproot_counterparty_commitment_to_counterparty_aux_leaf_script, option),
+			(24, self.simple_taproot_asset_channel_template, option),
 		});
 		Ok(())
 	}
@@ -1354,6 +1359,7 @@ impl ReadableArgs<Option<u64>> for ChannelTransactionParameters {
 		let mut simple_taproot_holder_commitment_to_counterparty_aux_leaf_script = None;
 		let mut simple_taproot_counterparty_commitment_to_holder_aux_leaf_script = None;
 		let mut simple_taproot_counterparty_commitment_to_counterparty_aux_leaf_script = None;
+		let mut simple_taproot_asset_channel_template = None;
 
 		read_tlv_fields!(reader, {
 			(0, holder_pubkeys, required),
@@ -1370,6 +1376,7 @@ impl ReadableArgs<Option<u64>> for ChannelTransactionParameters {
 			(18, simple_taproot_holder_commitment_to_counterparty_aux_leaf_script, option),
 			(20, simple_taproot_counterparty_commitment_to_holder_aux_leaf_script, option),
 			(22, simple_taproot_counterparty_commitment_to_counterparty_aux_leaf_script, option),
+			(24, simple_taproot_asset_channel_template, option),
 		});
 
 		let channel_value_satoshis = match read_args {
@@ -1401,6 +1408,7 @@ impl ReadableArgs<Option<u64>> for ChannelTransactionParameters {
 			simple_taproot_holder_commitment_to_counterparty_aux_leaf_script,
 			simple_taproot_counterparty_commitment_to_holder_aux_leaf_script,
 			simple_taproot_counterparty_commitment_to_counterparty_aux_leaf_script,
+			simple_taproot_asset_channel_template,
 			channel_value_satoshis,
 		})
 	}
@@ -1560,6 +1568,7 @@ impl HolderCommitmentTransaction {
 			simple_taproot_holder_commitment_to_counterparty_aux_leaf_script: None,
 			simple_taproot_counterparty_commitment_to_holder_aux_leaf_script: None,
 			simple_taproot_counterparty_commitment_to_counterparty_aux_leaf_script: None,
+			simple_taproot_asset_channel_template: None,
 			channel_value_satoshis,
 		};
 		let mut counterparty_htlc_sigs = Vec::new();
@@ -2721,6 +2730,7 @@ mod tests {
 				simple_taproot_holder_commitment_to_counterparty_aux_leaf_script: None,
 				simple_taproot_counterparty_commitment_to_holder_aux_leaf_script: None,
 				simple_taproot_counterparty_commitment_to_counterparty_aux_leaf_script: None,
+				simple_taproot_asset_channel_template: None,
 				channel_value_satoshis: 4000,
 			};
 
@@ -2789,6 +2799,7 @@ mod tests {
 			simple_taproot_holder_commitment_to_counterparty_aux_leaf_script: None,
 			simple_taproot_counterparty_commitment_to_holder_aux_leaf_script: None,
 			simple_taproot_counterparty_commitment_to_counterparty_aux_leaf_script: None,
+			simple_taproot_asset_channel_template: None,
 			channel_value_satoshis: 10_000_000,
 		};
 

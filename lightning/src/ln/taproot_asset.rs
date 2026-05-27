@@ -240,6 +240,110 @@ pub struct TaprootAssetHtlcBlob {
 	pub asset_amount: u64,
 }
 
+/// Proof-derived Taproot Asset identity and ancestry needed to rebuild the
+/// asset aux leaf for the next commitment state.
+///
+/// This intentionally covers the current one-asset, no-split interop path.
+/// Partial asset splits and multiple script keys require a fuller Taproot
+/// Assets commitment view and are tracked outside this bounded template.
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
+pub struct TaprootAssetChannelAssetTemplate {
+	asset_id: [u8; TAPROOT_ASSET_ID_LEN],
+	total_amount: u64,
+	genesis_outpoint_txid: [u8; 32],
+	genesis_outpoint_vout: u32,
+	genesis_tag: Vec<u8>,
+	genesis_meta_hash: [u8; 32],
+	genesis_output_index: u32,
+	asset_type: u8,
+	tap_commitment_key: [u8; 32],
+	group_key: Option<[u8; 33]>,
+	previous_outpoint_txid: [u8; 32],
+	previous_outpoint_vout: u32,
+	previous_script_key: [u8; 33],
+}
+
+impl TaprootAssetChannelAssetTemplate {
+	/// Builds a bounded single-asset channel template from a validated Taproot
+	/// Asset funding proof.
+	pub fn new(
+		asset_id: [u8; TAPROOT_ASSET_ID_LEN], total_amount: u64, genesis_outpoint_txid: [u8; 32],
+		genesis_outpoint_vout: u32, genesis_tag: Vec<u8>, genesis_meta_hash: [u8; 32],
+		genesis_output_index: u32, asset_type: u8, tap_commitment_key: [u8; 32],
+		group_key: Option<[u8; 33]>, previous_outpoint_txid: [u8; 32], previous_outpoint_vout: u32,
+		previous_script_key: [u8; 33],
+	) -> Result<Self, TaprootAssetChannelAssetTemplateError> {
+		let template = Self {
+			asset_id,
+			total_amount,
+			genesis_outpoint_txid,
+			genesis_outpoint_vout,
+			genesis_tag,
+			genesis_meta_hash,
+			genesis_output_index,
+			asset_type,
+			tap_commitment_key,
+			group_key,
+			previous_outpoint_txid,
+			previous_outpoint_vout,
+			previous_script_key,
+		};
+		template.validate()?;
+		Ok(template)
+	}
+
+	/// Returns the asset ID this template may commit.
+	pub fn asset_id(&self) -> &[u8; TAPROOT_ASSET_ID_LEN] {
+		&self.asset_id
+	}
+
+	/// Returns the total asset amount supported by the no-split template.
+	pub fn total_amount(&self) -> u64 {
+		self.total_amount
+	}
+
+	fn validate(&self) -> Result<(), TaprootAssetChannelAssetTemplateError> {
+		if self.asset_id == [0; TAPROOT_ASSET_ID_LEN] {
+			return Err(TaprootAssetChannelAssetTemplateError::ZeroAssetId);
+		}
+		if self.total_amount == 0 {
+			return Err(TaprootAssetChannelAssetTemplateError::ZeroAmount);
+		}
+		if self.genesis_tag.len() > u16::MAX as usize {
+			return Err(TaprootAssetChannelAssetTemplateError::TooLongGenesisTag);
+		}
+		if self.asset_type > 1 {
+			return Err(TaprootAssetChannelAssetTemplateError::MalformedAssetType);
+		}
+		if self.tap_commitment_key == [0; 32] {
+			return Err(TaprootAssetChannelAssetTemplateError::MalformedTapCommitmentKey);
+		}
+		PublicKey::from_slice(&self.previous_script_key)
+			.map_err(|_| TaprootAssetChannelAssetTemplateError::MalformedPreviousScriptKey)?;
+		if let Some(group_key) = self.group_key {
+			PublicKey::from_slice(&group_key)
+				.map_err(|_| TaprootAssetChannelAssetTemplateError::MalformedGroupKey)?;
+		}
+		Ok(())
+	}
+}
+
+impl_writeable_tlv_based!(TaprootAssetChannelAssetTemplate, {
+	(0, asset_id, required),
+	(2, total_amount, required),
+	(4, genesis_outpoint_txid, required),
+	(6, genesis_outpoint_vout, required),
+	(8, genesis_tag, required),
+	(10, genesis_meta_hash, required),
+	(12, genesis_output_index, required),
+	(14, asset_type, required),
+	(16, tap_commitment_key, required),
+	(18, group_key, option),
+	(20, previous_outpoint_txid, required),
+	(22, previous_outpoint_vout, required),
+	(24, previous_script_key, required),
+});
+
 /// Lightning Labs Taproot Asset commitment signature blob carried on
 /// `commitment_signed` TLV 65537.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -471,6 +575,274 @@ pub fn decode_taproot_asset_htlc_blob(
 		return decode_taproot_asset_htlc_blob_records(inner_payload);
 	}
 	decode_taproot_asset_htlc_blob_records(payload)
+}
+
+/// Derives the Taproot Asset aux leaf script for a full-amount HTLC output.
+///
+/// This is intentionally a no-split helper: the asset amount must equal the
+/// template's full channel amount. Change outputs and partial asset transfers
+/// require a full Taproot Assets commitment view and are rejected here.
+pub fn derive_no_split_taproot_asset_aux_leaf_script(
+	template: &TaprootAssetChannelAssetTemplate, asset_amount: u64, output_xonly_key: [u8; 32],
+) -> Result<Option<ScriptBuf>, TaprootAssetChannelAssetTemplateError> {
+	if asset_amount == 0 {
+		return Ok(None);
+	}
+	template.validate()?;
+	if asset_amount != template.total_amount {
+		return Err(TaprootAssetChannelAssetTemplateError::UnsupportedSplitAmount);
+	}
+
+	let script_key = compressed_even_key_from_xonly(output_xonly_key);
+	let asset_bytes = encode_no_split_channel_asset(template, asset_amount, script_key)?;
+	let asset_leaf = taproot_asset_mssmt_leaf(&asset_bytes, asset_amount);
+	let asset_commitment_key = no_split_asset_commitment_key(template, output_xonly_key);
+	let asset_root = taproot_asset_mssmt_single_leaf_root(asset_commitment_key, asset_leaf)?;
+	let asset_commitment_root =
+		fold_single_asset_commitment_root(template.tap_commitment_key, &asset_root)?;
+	let asset_commitment_leaf =
+		taproot_asset_asset_commitment_leaf(asset_commitment_root.root_hash, asset_amount);
+	let tap_commitment_leaf = taproot_asset_mssmt_leaf(&asset_commitment_leaf, asset_amount);
+	let tap_root =
+		taproot_asset_mssmt_single_leaf_root(template.tap_commitment_key, tap_commitment_leaf)?;
+	Ok(Some(ScriptBuf::from(taproot_asset_v2_leaf_script(tap_root.root_hash, tap_root.root_sum))))
+}
+
+fn compressed_even_key_from_xonly(xonly_key: [u8; 32]) -> [u8; 33] {
+	let mut script_key = [0u8; 33];
+	script_key[0] = 0x02;
+	script_key[1..].copy_from_slice(&xonly_key);
+	script_key
+}
+
+fn no_split_asset_commitment_key(
+	template: &TaprootAssetChannelAssetTemplate, output_xonly_key: [u8; 32],
+) -> [u8; 32] {
+	if template.group_key.is_none() {
+		return Sha256::hash(&output_xonly_key).to_byte_array();
+	}
+	let mut engine = Sha256::engine();
+	engine.input(&template.asset_id);
+	engine.input(&output_xonly_key);
+	Sha256::from_engine(engine).to_byte_array()
+}
+
+fn encode_no_split_channel_asset(
+	template: &TaprootAssetChannelAssetTemplate, amount: u64, script_key: [u8; 33],
+) -> Result<Vec<u8>, TaprootAssetChannelAssetTemplateError> {
+	let mut out = Vec::new();
+	encode_taproot_asset_record(0, &[1], &mut out)?;
+	encode_taproot_asset_record(2, &encode_taproot_asset_genesis_info(template)?, &mut out)?;
+	encode_taproot_asset_record(4, &[template.asset_type], &mut out)?;
+	let amount_bytes = encode_taproot_asset_bigsize_to_vec(amount)?;
+	encode_taproot_asset_record(6, &amount_bytes, &mut out)?;
+	let prev_witnesses = encode_taproot_asset_prev_witnesses(template)?;
+	encode_taproot_asset_record(11, &prev_witnesses, &mut out)?;
+	encode_taproot_asset_record(14, &0u16.to_be_bytes(), &mut out)?;
+	encode_taproot_asset_record(16, &script_key, &mut out)?;
+	if let Some(group_key) = template.group_key {
+		encode_taproot_asset_record(17, &group_key, &mut out)?;
+	}
+	Ok(out)
+}
+
+fn encode_taproot_asset_genesis_info(
+	template: &TaprootAssetChannelAssetTemplate,
+) -> Result<Vec<u8>, TaprootAssetChannelAssetTemplateError> {
+	let mut out = Vec::new();
+	out.extend_from_slice(&template.genesis_outpoint_txid);
+	out.extend_from_slice(&template.genesis_outpoint_vout.to_be_bytes());
+	encode_taproot_asset_inline_var_bytes(&template.genesis_tag, &mut out)?;
+	out.extend_from_slice(&template.genesis_meta_hash);
+	out.extend_from_slice(&template.genesis_output_index.to_be_bytes());
+	out.push(template.asset_type);
+	Ok(out)
+}
+
+fn encode_taproot_asset_prev_witnesses(
+	template: &TaprootAssetChannelAssetTemplate,
+) -> Result<Vec<u8>, TaprootAssetChannelAssetTemplateError> {
+	let mut out = Vec::new();
+	push_taproot_asset_bigsize(1, &mut out);
+	let mut prev_witness = Vec::new();
+	let mut prev_id = Vec::new();
+	prev_id.extend_from_slice(&template.previous_outpoint_txid);
+	prev_id.extend_from_slice(&template.previous_outpoint_vout.to_be_bytes());
+	prev_id.extend_from_slice(&template.asset_id);
+	prev_id.extend_from_slice(&template.previous_script_key);
+	encode_taproot_asset_record(1, &prev_id, &mut prev_witness)?;
+	encode_taproot_asset_inline_var_bytes(&prev_witness, &mut out)?;
+	Ok(out)
+}
+
+fn encode_taproot_asset_record(
+	record_type: u64, value: &[u8], out: &mut Vec<u8>,
+) -> Result<(), TaprootAssetChannelAssetTemplateError> {
+	push_taproot_asset_bigsize(record_type, out);
+	push_taproot_asset_bigsize(
+		value
+			.len()
+			.try_into()
+			.map_err(|_| TaprootAssetChannelAssetTemplateError::TooLongEncoding)?,
+		out,
+	);
+	out.extend_from_slice(value);
+	Ok(())
+}
+
+fn encode_taproot_asset_bigsize_to_vec(
+	value: u64,
+) -> Result<Vec<u8>, TaprootAssetChannelAssetTemplateError> {
+	let mut out = Vec::new();
+	push_taproot_asset_bigsize(value, &mut out);
+	Ok(out)
+}
+
+fn encode_taproot_asset_inline_var_bytes(
+	bytes: &[u8], out: &mut Vec<u8>,
+) -> Result<(), TaprootAssetChannelAssetTemplateError> {
+	push_taproot_asset_bigsize(
+		bytes
+			.len()
+			.try_into()
+			.map_err(|_| TaprootAssetChannelAssetTemplateError::TooLongEncoding)?,
+		out,
+	);
+	out.extend_from_slice(bytes);
+	Ok(())
+}
+
+fn push_taproot_asset_bigsize(value: u64, out: &mut Vec<u8>) {
+	match value {
+		0x00..=0xfc => out.push(value as u8),
+		0xfd..=0xffff => {
+			out.push(0xfd);
+			out.extend_from_slice(&(value as u16).to_be_bytes());
+		},
+		0x1_0000..=0xffff_ffff => {
+			out.push(0xfe);
+			out.extend_from_slice(&(value as u32).to_be_bytes());
+		},
+		_ => {
+			out.push(0xff);
+			out.extend_from_slice(&value.to_be_bytes());
+		},
+	}
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TaprootAssetMssmtNode {
+	hash: [u8; 32],
+	sum: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TaprootAssetMssmtRootParts {
+	root_hash: [u8; 32],
+	root_sum: u64,
+	left_hash: [u8; 32],
+	right_hash: [u8; 32],
+}
+
+fn taproot_asset_mssmt_leaf(value: &[u8], sum: u64) -> TaprootAssetMssmtNode {
+	let mut engine = Sha256::engine();
+	engine.input(value);
+	engine.input(&sum.to_be_bytes());
+	TaprootAssetMssmtNode { hash: Sha256::from_engine(engine).to_byte_array(), sum }
+}
+
+fn taproot_asset_mssmt_branch(
+	left: &TaprootAssetMssmtNode, right: &TaprootAssetMssmtNode,
+) -> Result<TaprootAssetMssmtNode, TaprootAssetChannelAssetTemplateError> {
+	let sum = left
+		.sum
+		.checked_add(right.sum)
+		.ok_or(TaprootAssetChannelAssetTemplateError::MssmtSumOverflow)?;
+	let mut engine = Sha256::engine();
+	engine.input(&left.hash);
+	engine.input(&right.hash);
+	engine.input(&sum.to_be_bytes());
+	Ok(TaprootAssetMssmtNode { hash: Sha256::from_engine(engine).to_byte_array(), sum })
+}
+
+fn taproot_asset_mssmt_empty_nodes(
+) -> Result<Vec<TaprootAssetMssmtNode>, TaprootAssetChannelAssetTemplateError> {
+	const MSSMT_TREE_LEVELS: usize = 256;
+	let mut nodes = Vec::with_capacity(MSSMT_TREE_LEVELS + 1);
+	nodes.resize_with(MSSMT_TREE_LEVELS + 1, || TaprootAssetMssmtNode { hash: [0; 32], sum: 0 });
+
+	let leaf = taproot_asset_mssmt_leaf(&[], 0);
+	nodes[MSSMT_TREE_LEVELS] = leaf;
+	for i in (0..MSSMT_TREE_LEVELS).rev() {
+		nodes[i] = taproot_asset_mssmt_branch(&nodes[i + 1], &nodes[i + 1])?;
+	}
+	Ok(nodes)
+}
+
+fn taproot_asset_mssmt_bit_index(idx: u8, key: &[u8; 32]) -> u8 {
+	let byte_val = key[(idx / 8) as usize];
+	(byte_val >> (idx % 8)) & 1
+}
+
+fn taproot_asset_mssmt_single_leaf_root(
+	key: [u8; 32], leaf: TaprootAssetMssmtNode,
+) -> Result<TaprootAssetMssmtRootParts, TaprootAssetChannelAssetTemplateError> {
+	const MSSMT_TREE_LEVELS: usize = 256;
+	let empty_nodes = taproot_asset_mssmt_empty_nodes()?;
+	let mut current = leaf;
+	let mut root_left = [0u8; 32];
+	let mut root_right = [0u8; 32];
+
+	for i in (0..MSSMT_TREE_LEVELS).rev() {
+		let sibling = &empty_nodes[i + 1];
+		let bit = taproot_asset_mssmt_bit_index(i as u8, &key);
+		let (left, right) = if bit == 0 { (&current, sibling) } else { (sibling, &current) };
+		if i == 0 {
+			root_left = left.hash;
+			root_right = right.hash;
+		}
+		current = taproot_asset_mssmt_branch(left, right)?;
+	}
+
+	Ok(TaprootAssetMssmtRootParts {
+		root_hash: current.hash,
+		root_sum: current.sum,
+		left_hash: root_left,
+		right_hash: root_right,
+	})
+}
+
+fn fold_single_asset_commitment_root(
+	tap_commitment_key: [u8; 32], root: &TaprootAssetMssmtRootParts,
+) -> Result<TaprootAssetMssmtRootParts, TaprootAssetChannelAssetTemplateError> {
+	let mut engine = Sha256::engine();
+	engine.input(&tap_commitment_key);
+	engine.input(&root.left_hash);
+	engine.input(&root.right_hash);
+	engine.input(&root.root_sum.to_be_bytes());
+	Ok(TaprootAssetMssmtRootParts {
+		root_hash: Sha256::from_engine(engine).to_byte_array(),
+		root_sum: root.root_sum,
+		left_hash: [0; 32],
+		right_hash: [0; 32],
+	})
+}
+
+fn taproot_asset_asset_commitment_leaf(root_hash: [u8; 32], sum: u64) -> Vec<u8> {
+	let mut leaf = Vec::with_capacity(41);
+	leaf.push(1);
+	leaf.extend_from_slice(&root_hash);
+	leaf.extend_from_slice(&sum.to_be_bytes());
+	leaf
+}
+
+fn taproot_asset_v2_leaf_script(root_hash: [u8; 32], sum: u64) -> Vec<u8> {
+	let mut script = Vec::with_capacity(73);
+	script.extend_from_slice(&Sha256::hash(b"taproot-assets:194243").to_byte_array());
+	script.push(2);
+	script.extend_from_slice(&root_hash);
+	script.extend_from_slice(&sum.to_be_bytes());
+	script
 }
 
 fn read_taproot_asset_commitment_sig_bigsize(
@@ -1625,6 +1997,31 @@ pub enum TaprootAssetHtlcBlobError {
 	ZeroAmount,
 }
 
+/// Errors returned while preparing a bounded Taproot Asset channel template.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum TaprootAssetChannelAssetTemplateError {
+	/// The asset ID was all zeros.
+	ZeroAssetId,
+	/// The channel asset amount was zero.
+	ZeroAmount,
+	/// The genesis tag/name is larger than the bounded encoder accepts.
+	TooLongGenesisTag,
+	/// The asset type is not one of the known Taproot Asset values.
+	MalformedAssetType,
+	/// The Taproot commitment key is malformed.
+	MalformedTapCommitmentKey,
+	/// The previous asset script key is not a valid compressed secp256k1 key.
+	MalformedPreviousScriptKey,
+	/// The group key is not a valid compressed secp256k1 key.
+	MalformedGroupKey,
+	/// The requested HTLC amount would require split-commitment support.
+	UnsupportedSplitAmount,
+	/// A bounded internal encoding length overflowed.
+	TooLongEncoding,
+	/// A Merkle-sum Sparse Merkle Tree branch sum overflowed.
+	MssmtSumOverflow,
+}
+
 /// Errors returned while decoding a `commitment_signed` Taproot Asset signature blob.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum TaprootAssetCommitmentSigBlobError {
@@ -2336,12 +2733,53 @@ mod tests {
 		PublicKey::from_secret_key(&secp_ctx, &secret_key)
 	}
 
+	fn no_split_template(total_amount: u64) -> TaprootAssetChannelAssetTemplate {
+		TaprootAssetChannelAssetTemplate::new(
+			live_litd_asset_id(),
+			total_amount,
+			[7; 32],
+			1,
+			b"demo-usd".to_vec(),
+			[9; 32],
+			0,
+			0,
+			live_litd_asset_id(),
+			None,
+			[8; 32],
+			2,
+			peer(2).serialize(),
+		)
+		.unwrap()
+	}
+
 	#[test]
 	fn decodes_live_litd_taproot_asset_htlc_blob() {
 		let decoded = decode_taproot_asset_htlc_blob(&live_litd_htlc_blob()).unwrap();
 
 		assert_eq!(decoded.asset_id, live_litd_asset_id());
 		assert_eq!(decoded.asset_amount, 1);
+	}
+
+	#[test]
+	fn derives_no_split_taproot_asset_aux_leaf_script() {
+		let template = no_split_template(125);
+		let script = derive_no_split_taproot_asset_aux_leaf_script(&template, 125, [4; 32])
+			.unwrap()
+			.unwrap();
+		let script = script.as_bytes();
+
+		assert_eq!(script.len(), 73);
+		assert_eq!(&script[..32], &Sha256::hash(b"taproot-assets:194243").to_byte_array());
+		assert_eq!(script[32], 2);
+		assert_eq!(&script[65..], &125u64.to_be_bytes());
+		assert_eq!(
+			derive_no_split_taproot_asset_aux_leaf_script(&template, 0, [4; 32]).unwrap(),
+			None
+		);
+		assert_eq!(
+			derive_no_split_taproot_asset_aux_leaf_script(&template, 1, [4; 32]),
+			Err(TaprootAssetChannelAssetTemplateError::UnsupportedSplitAmount)
+		);
 	}
 
 	#[test]

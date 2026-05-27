@@ -96,6 +96,8 @@ use crate::ln::outbound_payment::{
 	ProbeSendFailure, RecipientCustomTlvs, RecipientOnionFields, Retry, RetryableInvoiceRequest,
 	RetryableSendFailure, SendAlongPathArgs, StaleExpiration,
 };
+#[cfg(feature = "simple_taproot_musig2")]
+use crate::ln::taproot_asset::TaprootAssetChannelAssetTemplate;
 use crate::ln::types::ChannelId;
 use crate::offers::async_receive_offer_cache::AsyncReceiveOfferCache;
 use crate::offers::flow::{HeldHtlcReplyPath, InvreqResponseInstructions, OffersMessageFlow};
@@ -3903,6 +3905,33 @@ impl<
 			}
 		})?;
 		chan.set_pending_simple_taproot_tapscript_root(tapscript_root)
+			.map_err(|err| APIError::APIMisuseError { err: err.to_string() })
+	}
+
+	/// Sets the proof-derived single-asset template used to build dynamic Taproot Asset HTLC aux
+	/// leaves on later commitment states.
+	#[cfg(feature = "simple_taproot_musig2")]
+	pub fn set_pending_taproot_asset_channel_template(
+		&self, temporary_channel_id: ChannelId, counterparty_node_id: PublicKey,
+		template: TaprootAssetChannelAssetTemplate,
+	) -> Result<(), APIError> {
+		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
+		debug_assert!(&self.total_consistency_lock.try_write().is_err());
+
+		let per_peer_state = self.per_peer_state.read().unwrap();
+		let peer_state_mutex =
+			per_peer_state.get(&counterparty_node_id).ok_or_else(|| APIError::APIMisuseError {
+				err: format!("Not connected to node: {counterparty_node_id}"),
+			})?;
+		let mut peer_state = peer_state_mutex.lock().unwrap();
+		let chan = peer_state.channel_by_id.get_mut(&temporary_channel_id).ok_or_else(|| {
+			APIError::ChannelUnavailable {
+				err: format!(
+					"Channel {temporary_channel_id} with counterparty {counterparty_node_id} not found"
+				),
+			}
+		})?;
+		chan.set_pending_taproot_asset_channel_template(template)
 			.map_err(|err| APIError::APIMisuseError { err: err.to_string() })
 	}
 

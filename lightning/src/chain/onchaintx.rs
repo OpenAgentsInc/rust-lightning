@@ -1366,6 +1366,7 @@ mod tests {
 			simple_taproot_holder_commitment_to_counterparty_aux_leaf_script: None,
 			simple_taproot_counterparty_commitment_to_holder_aux_leaf_script: None,
 			simple_taproot_counterparty_commitment_to_counterparty_aux_leaf_script: None,
+			simple_taproot_asset_channel_template: None,
 			channel_value_satoshis: 0,
 		};
 
