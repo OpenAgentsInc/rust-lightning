@@ -1443,9 +1443,9 @@ pub fn simple_taproot_accepted_htlc_success_script(
 		.push_opcode(opcodes::all::OP_HASH160)
 		.push_slice(&payment_hash160)
 		.push_opcode(opcodes::all::OP_EQUALVERIFY)
-		.push_x_only_key(&xonly_key(remote_htlc_pubkey))
-		.push_opcode(opcodes::all::OP_CHECKSIGVERIFY)
 		.push_x_only_key(&xonly_key(local_htlc_pubkey))
+		.push_opcode(opcodes::all::OP_CHECKSIGVERIFY)
+		.push_x_only_key(&xonly_key(remote_htlc_pubkey))
 		.push_opcode(opcodes::all::OP_CHECKSIG)
 		.into_script()
 }
@@ -1509,7 +1509,7 @@ pub fn simple_taproot_htlc_spend_info_with_aux_leaf_for_variant<C: Verification>
 	} else {
 		(
 			simple_taproot_accepted_htlc_timeout_script_for_variant(
-				local_htlc_pubkey,
+				remote_htlc_pubkey,
 				cltv_expiry,
 				variant,
 			),
@@ -2454,6 +2454,60 @@ mod tests {
 	}
 
 	#[cfg(feature = "simple_taproot_musig2")]
+	fn xonly_bytes(pubkey: &PublicKey) -> [u8; 32] {
+		let (xonly_key, _) = pubkey.x_only_public_key();
+		xonly_key.serialize()
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	fn find_key_in_script(script: &ScriptBuf, key: [u8; 32]) -> usize {
+		script.as_bytes().windows(32).position(|window| window == key).unwrap()
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	#[test]
+	fn accepted_htlc_scripts_match_lnd_receiver_key_order() {
+		let local_htlc_pubkey =
+			pubkey_from_hex("0315ec0138eb42f1ab4603042123988d53c854e89d1d87aa4dbb97a57482029c05");
+		let remote_htlc_pubkey =
+			pubkey_from_hex("03d4c77088d346bce67c13bbbf82ca112588f4b1c9595a1f8af3be9b2f95a109a0");
+		let payment_hash = PaymentHash([42; 32]);
+
+		let timeout = simple_taproot_htlc_spend_info_with_aux_leaf_for_variant(
+			&Secp256k1::verification_only(),
+			false,
+			&payment_hash,
+			144,
+			&local_htlc_pubkey,
+			&remote_htlc_pubkey,
+			&pubkey_from_hex("03595f2ef2a51d2250a21077dbea4a7fc3ce550f10676996bf63719e2a71d1f4c9"),
+			None,
+			SimpleTaprootHtlcScriptVariant::Staging,
+		)
+		.unwrap()
+		.timeout
+		.script;
+		assert!(timeout
+			.as_bytes()
+			.windows(32)
+			.any(|window| window == xonly_bytes(&remote_htlc_pubkey)));
+		assert!(!timeout
+			.as_bytes()
+			.windows(32)
+			.any(|window| window == xonly_bytes(&local_htlc_pubkey)));
+
+		let success = simple_taproot_accepted_htlc_success_script(
+			&local_htlc_pubkey,
+			&remote_htlc_pubkey,
+			&payment_hash,
+		);
+		assert!(
+			find_key_in_script(&success, xonly_bytes(&local_htlc_pubkey))
+				< find_key_in_script(&success, xonly_bytes(&remote_htlc_pubkey))
+		);
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
 	#[test]
 	fn commitment_output_scripts_match_lnd_staging_overlay_vectors() {
 		let secp_ctx = Secp256k1::new();
@@ -2714,27 +2768,27 @@ mod tests {
 		.unwrap();
 		assert_script_hex(
 			&accepted.success.script,
-			"82012088a914b8bcb07f6344b42ab04250c86a6e8b75d3fdbbc688202deba21cf03c42362c9f912094f62ba045a040a2060882ba1ed3abf1f664a47dad2071e82ef65d5c667159036bfcf662cac2f6c41e38323d148bbbd00fdcd923739eac",
+			"82012088a914b8bcb07f6344b42ab04250c86a6e8b75d3fdbbc6882071e82ef65d5c667159036bfcf662cac2f6c41e38323d148bbbd00fdcd923739ead202deba21cf03c42362c9f912094f62ba045a040a2060882ba1ed3abf1f664a47dac",
 		);
 		assert_leaf_hash(
 			&accepted.success.script,
-			"69192ca730d4480044ade8741b8bd0845a32880aebaf58bc6f9186f8d2be8cbf",
+			"1acb571d56481cd7ea0fdbe601063eec88943ce6f5eb29608599e047f74fc7e9",
 		);
 		assert_script_hex(
 			&accepted.timeout.script,
-			"2071e82ef65d5c667159036bfcf662cac2f6c41e38323d148bbbd00fdcd923739ead51b26902f401b1",
+			"202deba21cf03c42362c9f912094f62ba045a040a2060882ba1ed3abf1f664a47dad51b26902f401b1",
 		);
 		assert_leaf_hash(
 			&accepted.timeout.script,
-			"4da43c795365bf757ed1e9656d12ea744b4cf52b01719a3ea94e6569115623f0",
+			"e5e8fd071b9ade6367122afbd8acacc1a6727ddb6d478612af30827590027e03",
 		);
 		assert_eq!(
 			accepted.tapscript_root,
-			hash_from_hex("1a990caa4bb0ed41ceb19e7466fcea5d9b31e3da968f348f6223201c5831d0a3")
+			hash_from_hex("2a208a0ec3ff8d66e15da435e4b3f2b2921431ef97f646a2fcd5d3a941bae8d4")
 		);
 		assert_script_hex(
 			&accepted.script_pubkey,
-			"51209aadbdd9aff986e5ea086cf53ae062972d33d0a5c7f5fb986dafec7fa6d7e6ea",
+			"51209ce82cd1b1f6f975049d58019a7145a3ec9680079969cf929d7d2c4bc9b30637",
 		);
 		assert_eq!(accepted.success.control_block.len(), 65);
 		assert_eq!(accepted.timeout.control_block.len(), 65);
