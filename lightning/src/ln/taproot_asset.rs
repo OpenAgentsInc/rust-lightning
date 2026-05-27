@@ -16,7 +16,9 @@
 //! behavior.
 
 use crate::chain::transaction::OutPoint;
+use crate::io::{Cursor, Read};
 use crate::ln::types::ChannelId;
+use crate::util::ser::{BigSize, Readable};
 
 use bitcoin::hashes::{sha256::Hash as Sha256, Hash as _, HashEngine as _};
 use bitcoin::secp256k1::PublicKey;
@@ -42,6 +44,10 @@ pub const TAPROOT_ASSET_RECOVERY_SPEND_COMMITMENT: u8 = 1;
 pub const TAPROOT_ASSET_RECOVERY_SPEND_SECOND_LEVEL_HTLC: u8 = 2;
 /// Asset proof ownership is attached to the final wallet sweep output.
 pub const TAPROOT_ASSET_RECOVERY_SPEND_FINAL_SWEEP: u8 = 3;
+
+const TAPROOT_ASSET_HTLC_BLOB_ASSET_ID_RECORD_TYPE: u64 = 0;
+const TAPROOT_ASSET_HTLC_BLOB_AMOUNT_RECORD_TYPE: u64 = 1;
+const TAPROOT_ASSET_HTLC_BLOB_OUTER_RECORD_TYPE: u64 = 1;
 
 /// Describes the single asset that an experimental Taproot Asset channel is
 /// allowed to carry.
@@ -207,6 +213,16 @@ pub struct TaprootAssetHtlcMetadata {
 	pub final_hop_digest: [u8; TAPROOT_ASSET_ID_LEN],
 }
 
+/// The asset identity and amount decoded from a Lightning Labs Taproot Asset
+/// HTLC blob carried on `update_add_htlc`.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct TaprootAssetHtlcBlob {
+	/// Asset ID being transferred.
+	pub asset_id: [u8; TAPROOT_ASSET_ID_LEN],
+	/// Asset amount being transferred.
+	pub asset_amount: u64,
+}
+
 impl TaprootAssetHtlcMetadata {
 	/// Builds protocol-versioned asset HTLC metadata.
 	pub fn new(
@@ -264,6 +280,126 @@ impl TaprootAssetHtlcMetadata {
 		}
 		Ok(())
 	}
+}
+
+fn read_taproot_asset_blob_bigsize(
+	cursor: &mut Cursor<&[u8]>,
+) -> Result<u64, TaprootAssetHtlcBlobError> {
+	BigSize::read(cursor)
+		.map(|big_size| big_size.0)
+		.map_err(|_| TaprootAssetHtlcBlobError::MalformedTlv)
+}
+
+fn taproot_asset_htlc_blob_outer_value<'a>(
+	payload: &'a [u8],
+) -> Result<Option<&'a [u8]>, TaprootAssetHtlcBlobError> {
+	let mut cursor = Cursor::new(payload);
+	let record_type = read_taproot_asset_blob_bigsize(&mut cursor)?;
+	let record_len = read_taproot_asset_blob_bigsize(&mut cursor)?;
+	if record_type != TAPROOT_ASSET_HTLC_BLOB_OUTER_RECORD_TYPE || record_len == 8 {
+		return Ok(None);
+	}
+
+	let start = cursor.position() as usize;
+	let len = usize::try_from(record_len).map_err(|_| TaprootAssetHtlcBlobError::MalformedTlv)?;
+	let end = start.checked_add(len).ok_or(TaprootAssetHtlcBlobError::MalformedTlv)?;
+	if end != payload.len() {
+		return Err(TaprootAssetHtlcBlobError::MalformedTlv);
+	}
+	Ok(Some(&payload[start..end]))
+}
+
+fn decode_taproot_asset_htlc_blob_records(
+	payload: &[u8],
+) -> Result<TaprootAssetHtlcBlob, TaprootAssetHtlcBlobError> {
+	let mut cursor = Cursor::new(payload);
+	let mut previous_record_type = None;
+	let mut asset_id = None;
+	let mut asset_amount = None;
+
+	while (cursor.position() as usize) < payload.len() {
+		let record_type = read_taproot_asset_blob_bigsize(&mut cursor)?;
+		if previous_record_type.map(|previous| record_type <= previous).unwrap_or(false) {
+			return Err(TaprootAssetHtlcBlobError::MalformedTlv);
+		}
+		previous_record_type = Some(record_type);
+
+		let record_len = read_taproot_asset_blob_bigsize(&mut cursor)?;
+		let start = cursor.position() as usize;
+		let len =
+			usize::try_from(record_len).map_err(|_| TaprootAssetHtlcBlobError::MalformedTlv)?;
+		let end = start.checked_add(len).ok_or(TaprootAssetHtlcBlobError::MalformedTlv)?;
+		if end > payload.len() {
+			return Err(TaprootAssetHtlcBlobError::MalformedTlv);
+		}
+
+		match record_type {
+			TAPROOT_ASSET_HTLC_BLOB_ASSET_ID_RECORD_TYPE => {
+				if asset_id.is_some() {
+					return Err(TaprootAssetHtlcBlobError::DuplicateField);
+				}
+				if len != TAPROOT_ASSET_ID_LEN {
+					return Err(TaprootAssetHtlcBlobError::MalformedAssetId);
+				}
+				let mut decoded_asset_id = [0; TAPROOT_ASSET_ID_LEN];
+				cursor
+					.read_exact(&mut decoded_asset_id)
+					.map_err(|_| TaprootAssetHtlcBlobError::MalformedTlv)?;
+				asset_id = Some(decoded_asset_id);
+			},
+			TAPROOT_ASSET_HTLC_BLOB_AMOUNT_RECORD_TYPE => {
+				if asset_amount.is_some() {
+					return Err(TaprootAssetHtlcBlobError::DuplicateField);
+				}
+				if len != 8 {
+					return Err(TaprootAssetHtlcBlobError::MalformedAmount);
+				}
+				let mut decoded_amount = [0; 8];
+				cursor
+					.read_exact(&mut decoded_amount)
+					.map_err(|_| TaprootAssetHtlcBlobError::MalformedTlv)?;
+				asset_amount = Some(u64::from_be_bytes(decoded_amount));
+			},
+			unknown if unknown % 2 == 0 => {
+				return Err(TaprootAssetHtlcBlobError::UnknownRequiredTlv);
+			},
+			_ => cursor.set_position(end as u64),
+		}
+
+		if cursor.position() as usize != end {
+			return Err(TaprootAssetHtlcBlobError::MalformedTlv);
+		}
+	}
+
+	let asset_id = asset_id.ok_or(TaprootAssetHtlcBlobError::MissingAssetId)?;
+	if asset_id == [0; TAPROOT_ASSET_ID_LEN] {
+		return Err(TaprootAssetHtlcBlobError::ZeroAssetId);
+	}
+	let asset_amount = asset_amount.ok_or(TaprootAssetHtlcBlobError::MissingAmount)?;
+	if asset_amount == 0 {
+		return Err(TaprootAssetHtlcBlobError::ZeroAmount);
+	}
+
+	Ok(TaprootAssetHtlcBlob { asset_id, asset_amount })
+}
+
+/// Decodes the Lightning Labs Taproot Asset HTLC blob carried on
+/// `update_add_htlc`.
+///
+/// The live `tapd`/`litd` payload currently wraps the HTLC metadata records in
+/// an outer TLV record. This decoder accepts both that wrapper and the direct
+/// inner records so callers can validate captured live data and locally built
+/// blobs through the same bounded surface.
+pub fn decode_taproot_asset_htlc_blob(
+	payload: &[u8],
+) -> Result<TaprootAssetHtlcBlob, TaprootAssetHtlcBlobError> {
+	if payload.is_empty() {
+		return Err(TaprootAssetHtlcBlobError::Empty);
+	}
+	if let Some(inner_payload) = taproot_asset_htlc_blob_outer_value(payload)? {
+		return decode_taproot_asset_htlc_blob_records(inner_payload);
+	}
+	decode_taproot_asset_htlc_blob_records(payload)
 }
 
 /// Expected final-hop metadata for an asset-channel HTLC.
@@ -959,6 +1095,31 @@ pub enum TaprootAssetHtlcMetadataError {
 	FinalHopDigestMismatch,
 }
 
+/// Errors returned while decoding an `update_add_htlc` Taproot Asset blob.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum TaprootAssetHtlcBlobError {
+	/// The blob was empty.
+	Empty,
+	/// The TLV stream was not canonical or its length fields were malformed.
+	MalformedTlv,
+	/// An unknown even TLV record was present.
+	UnknownRequiredTlv,
+	/// A known TLV field appeared more than once.
+	DuplicateField,
+	/// The required asset ID field was missing.
+	MissingAssetId,
+	/// The required asset amount field was missing.
+	MissingAmount,
+	/// The asset ID field had an invalid length.
+	MalformedAssetId,
+	/// The asset amount field had an invalid length.
+	MalformedAmount,
+	/// The asset ID was all zeros.
+	ZeroAssetId,
+	/// The asset amount was zero.
+	ZeroAmount,
+}
+
 /// Errors returned by cooperative asset-channel close allocation validation.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum TaprootAssetCloseAllocationError {
@@ -1458,6 +1619,21 @@ mod tests {
 		[42; TAPROOT_ASSET_ID_LEN]
 	}
 
+	fn live_litd_htlc_blob() -> Vec<u8> {
+		vec![
+			1, 44, 0, 32, 8, 126, 72, 111, 196, 6, 91, 164, 83, 39, 252, 20, 99, 146, 93, 241, 11,
+			66, 138, 211, 2, 71, 54, 118, 93, 160, 16, 26, 67, 197, 190, 60, 1, 8, 0, 0, 0, 0, 0,
+			0, 0, 1,
+		]
+	}
+
+	fn live_litd_asset_id() -> [u8; TAPROOT_ASSET_ID_LEN] {
+		[
+			8, 126, 72, 111, 196, 6, 91, 164, 83, 39, 252, 20, 99, 146, 93, 241, 11, 66, 138, 211,
+			2, 71, 54, 118, 93, 160, 16, 26, 67, 197, 190, 60,
+		]
+	}
+
 	fn descriptor() -> TaprootAssetChannelDescriptor {
 		TaprootAssetChannelDescriptor::new(
 			asset_id(),
@@ -1479,6 +1655,50 @@ mod tests {
 		let secp_ctx = Secp256k1::new();
 		let secret_key = SecretKey::from_slice(&[byte; 32]).unwrap();
 		PublicKey::from_secret_key(&secp_ctx, &secret_key)
+	}
+
+	#[test]
+	fn decodes_live_litd_taproot_asset_htlc_blob() {
+		let decoded = decode_taproot_asset_htlc_blob(&live_litd_htlc_blob()).unwrap();
+
+		assert_eq!(decoded.asset_id, live_litd_asset_id());
+		assert_eq!(decoded.asset_amount, 1);
+	}
+
+	#[test]
+	fn decodes_direct_taproot_asset_htlc_blob_records() {
+		let blob = live_litd_htlc_blob();
+		let decoded = decode_taproot_asset_htlc_blob(&blob[2..]).unwrap();
+
+		assert_eq!(decoded.asset_id, live_litd_asset_id());
+		assert_eq!(decoded.asset_amount, 1);
+	}
+
+	#[test]
+	fn rejects_malformed_taproot_asset_htlc_blobs() {
+		assert_eq!(decode_taproot_asset_htlc_blob(&[]), Err(TaprootAssetHtlcBlobError::Empty));
+
+		let mut zero_amount = live_litd_htlc_blob();
+		*zero_amount.last_mut().unwrap() = 0;
+		assert_eq!(
+			decode_taproot_asset_htlc_blob(&zero_amount),
+			Err(TaprootAssetHtlcBlobError::ZeroAmount)
+		);
+
+		let mut unknown_even_required = live_litd_htlc_blob();
+		unknown_even_required.splice(46..46, [2, 1, 1]);
+		unknown_even_required[1] = 47;
+		assert_eq!(
+			decode_taproot_asset_htlc_blob(&unknown_even_required),
+			Err(TaprootAssetHtlcBlobError::UnknownRequiredTlv)
+		);
+
+		let mut bad_asset_id_len = live_litd_htlc_blob();
+		bad_asset_id_len[3] = 31;
+		assert_eq!(
+			decode_taproot_asset_htlc_blob(&bad_asset_id_len),
+			Err(TaprootAssetHtlcBlobError::MalformedAssetId)
+		);
 	}
 
 	fn funding_outpoint() -> OutPoint {

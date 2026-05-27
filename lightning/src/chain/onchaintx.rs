@@ -1382,6 +1382,7 @@ mod tests {
 					cltv_expiry: i as u32,
 					payment_hash: hash,
 					transaction_output_index: Some(i as u32),
+					simple_taproot_aux_leaf_script: None,
 				}
 			);
 		}

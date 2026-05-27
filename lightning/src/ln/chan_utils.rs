@@ -48,7 +48,7 @@ use super::channel_keys::{
 };
 #[cfg(feature = "simple_taproot_musig2")]
 use super::simple_taproot::{
-	simple_taproot_anchor_spend_info, simple_taproot_htlc_spend_info,
+	simple_taproot_anchor_spend_info, simple_taproot_htlc_spend_info_with_aux_leaf,
 	simple_taproot_second_level_htlc_spend_info, simple_taproot_to_local_spend_info,
 	simple_taproot_to_local_spend_info_with_aux_leaf, simple_taproot_to_remote_spend_info,
 	simple_taproot_to_remote_spend_info_with_aux_leaf, SimpleTaprootKeyAggContext,
@@ -766,6 +766,12 @@ pub struct HTLCOutputInCommitment {
 	/// below the dust limit (in which case no output appears in the commitment transaction and the
 	/// value is spent to additional transaction fees).
 	pub transaction_output_index: Option<u32>,
+	/// Optional Taproot Asset auxiliary leaf script committed into this HTLC output's
+	/// simple-taproot tree.
+	///
+	/// This must be derived from the asset-channel commitment state that corresponds to the same
+	/// Lightning commitment number. Normal BTC-only HTLCs leave this unset.
+	pub simple_taproot_aux_leaf_script: Option<ScriptBuf>,
 }
 
 impl HTLCOutputInCommitment {
@@ -783,6 +789,7 @@ impl HTLCOutputInCommitment {
 			&& self.amount_msat == other.amount_msat
 			&& self.cltv_expiry == other.cltv_expiry
 			&& self.payment_hash == other.payment_hash
+			&& self.simple_taproot_aux_leaf_script == other.simple_taproot_aux_leaf_script
 	}
 }
 
@@ -792,6 +799,7 @@ impl_writeable_tlv_based!(HTLCOutputInCommitment, {
 	(4, cltv_expiry, required),
 	(6, payment_hash, required),
 	(8, transaction_output_index, option),
+	(10, simple_taproot_aux_leaf_script, option),
 });
 
 #[inline]
@@ -2227,7 +2235,7 @@ impl CommitmentTransaction {
 					#[cfg(feature = "simple_taproot_musig2")]
 					if requires_simple_taproot_outputs(channel_type) {
 						let secp_ctx = Secp256k1::verification_only();
-						simple_taproot_htlc_spend_info(
+						simple_taproot_htlc_spend_info_with_aux_leaf(
 							&secp_ctx,
 							htlc.offered,
 							&htlc.payment_hash,
@@ -2235,6 +2243,7 @@ impl CommitmentTransaction {
 							&keys.broadcaster_htlc_key.to_public_key(),
 							&keys.countersignatory_htlc_key.to_public_key(),
 							&keys.revocation_key.to_public_key(),
+							htlc.simple_taproot_aux_leaf_script.as_deref(),
 						)
 						.expect("valid simple-taproot HTLC output")
 						.script_pubkey
@@ -2586,12 +2595,14 @@ mod tests {
 	use crate::ln::channel_keys::{DelayedPaymentBasepoint, HtlcBasepoint, RevocationBasepoint};
 	#[cfg(feature = "simple_taproot_musig2")]
 	use crate::ln::simple_taproot::{
+		simple_taproot_htlc_spend_info_with_aux_leaf,
 		simple_taproot_to_local_spend_info_with_aux_leaf,
 		simple_taproot_to_remote_spend_info_with_aux_leaf,
 	};
 	use crate::sign::{ChannelSigner, SignerProvider};
 	use crate::types::features::ChannelTypeFeatures;
 	use crate::types::payment::PaymentHash;
+	use crate::util::ser::{Readable, Writeable};
 	use crate::util::test_utils;
 	use bitcoin::hashes::sha256::Hash as Sha256;
 	use bitcoin::hashes::Hash;
@@ -2743,6 +2754,7 @@ mod tests {
 			cltv_expiry,
 			payment_hash: PaymentHash(Sha256::hash(&[preimage_byte; 32]).to_byte_array()),
 			transaction_output_index: None,
+			simple_taproot_aux_leaf_script: None,
 		}
 	}
 
@@ -2804,6 +2816,7 @@ mod tests {
 			cltv_expiry: 100,
 			payment_hash: PaymentHash([42; 32]),
 			transaction_output_index: None,
+			simple_taproot_aux_leaf_script: None,
 		};
 
 		let offered_htlc = HTLCOutputInCommitment {
@@ -2812,6 +2825,7 @@ mod tests {
 			cltv_expiry: 100,
 			payment_hash: PaymentHash([43; 32]),
 			transaction_output_index: None,
+			simple_taproot_aux_leaf_script: None,
 		};
 
 		// Generate broadcaster output and received and offered HTLC outputs, w/o anchors
@@ -3072,6 +3086,7 @@ mod tests {
 			cltv_expiry: 500,
 			payment_hash,
 			transaction_output_index: None,
+			simple_taproot_aux_leaf_script: None,
 		};
 		let offered_htlc = HTLCOutputInCommitment {
 			offered: true,
@@ -3079,6 +3094,7 @@ mod tests {
 			cltv_expiry: 500,
 			payment_hash,
 			transaction_output_index: None,
+			simple_taproot_aux_leaf_script: None,
 		};
 		let tx = builder.build(6_988_000, 3_000_000, vec![accepted_htlc.clone(), offered_htlc.clone()]);
 		let outputs = &tx.built.transaction.output;
@@ -3099,6 +3115,55 @@ mod tests {
 		assert_eq!(htlc_success.output[0].script_pubkey.as_bytes(), &<Vec<u8>>::from_hex("51205cf3964a0c10272a8fb62e9e1b87afb712265641eb89462f2df18cf1f43cf0c3").unwrap()[..]);
 
 		assert_eq!(commit_tx_fee_sat(15_000, 0, &ChannelTypeFeatures::simple_taproot_staging()), 14_520);
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	#[test]
+	#[rustfmt::skip]
+	fn test_simple_taproot_htlc_outputs_include_asset_aux_leaves() {
+		let mut builder = simple_taproot_vector_builder();
+		builder.feerate_per_kw = 644;
+		let aux_leaf = ScriptBuf::new_op_return(&[11; 32]);
+		let plain_htlc = bolt_simple_taproot_htlc(false, 1_000_000, 500, 3);
+		let mut asset_htlc = plain_htlc.clone();
+		asset_htlc.simple_taproot_aux_leaf_script = Some(aux_leaf.clone());
+
+		let plain_tx = builder.build(6_988_000, 3_000_000, vec![plain_htlc]);
+		let asset_tx = builder.build(6_988_000, 3_000_000, vec![asset_htlc.clone()]);
+		let keys = asset_tx.trust().keys();
+		let expected_asset_htlc_script = simple_taproot_htlc_spend_info_with_aux_leaf(
+			&builder.secp_ctx,
+			asset_htlc.offered,
+			&asset_htlc.payment_hash,
+			asset_htlc.cltv_expiry,
+			&keys.broadcaster_htlc_key.to_public_key(),
+			&keys.countersignatory_htlc_key.to_public_key(),
+			&keys.revocation_key.to_public_key(),
+			Some(aux_leaf.as_script()),
+		)
+		.unwrap()
+		.script_pubkey;
+
+		assert!(asset_tx.built.transaction.output.iter().any(|out| {
+			out.value.to_sat() == 1_000 && out.script_pubkey == expected_asset_htlc_script
+		}));
+		assert!(!plain_tx.built.transaction.output.iter().any(|out| {
+			out.value.to_sat() == 1_000 && out.script_pubkey == expected_asset_htlc_script
+		}));
+		assert_eq!(
+			asset_tx.nondust_htlcs()[0].simple_taproot_aux_leaf_script,
+			Some(aux_leaf.clone())
+		);
+		assert!(builder.verify(&asset_tx).is_ok());
+
+		let mut writer = test_utils::TestVecWriter(Vec::new());
+		asset_tx.write(&mut writer).unwrap();
+		let read_tx = CommitmentTransaction::read(&mut &writer.0[..]).unwrap();
+		assert_eq!(
+			read_tx.nondust_htlcs()[0].simple_taproot_aux_leaf_script,
+			Some(aux_leaf)
+		);
+		assert!(builder.verify(&read_tx).is_ok());
 	}
 
 	#[cfg(feature = "simple_taproot_musig2")]
@@ -3650,6 +3715,7 @@ mod tests {
 			cltv_expiry: 123,
 			payment_hash: PaymentHash([0xbb; 32]),
 			transaction_output_index: Some(0),
+			simple_taproot_aux_leaf_script: None,
 		};
 
 		// Check amount sorting

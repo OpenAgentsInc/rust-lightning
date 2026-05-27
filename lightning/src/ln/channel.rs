@@ -88,6 +88,7 @@ use crate::ln::simple_taproot::{
 };
 #[cfg(simple_close)]
 use crate::ln::simple_taproot::{SimpleTaprootClosingOutputSet, SimpleTaprootPartialSignature};
+use crate::ln::taproot_asset::decode_taproot_asset_htlc_blob;
 use crate::ln::types::ChannelId;
 use crate::offers::static_invoice::StaticInvoice;
 use crate::routing::gossip::NodeId;
@@ -5926,6 +5927,28 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 		&self, funding: &FundingScope, msg: &msgs::UpdateAddHTLC,
 		fee_estimator: &LowerBoundedFeeEstimator<F>,
 	) -> Result<(), ChannelError> {
+		match (
+			funding.get_channel_type().requires_taproot_asset_channel(),
+			msg.taproot_asset_htlc_blob.as_deref(),
+		) {
+			(true, Some(blob)) => {
+				decode_taproot_asset_htlc_blob(blob).map_err(|_| {
+					ChannelError::close("Remote sent malformed Taproot Asset HTLC blob".to_owned())
+				})?;
+			},
+			(true, None) => {
+				return Err(ChannelError::close(
+					"Remote omitted Taproot Asset HTLC blob for Taproot Asset channel".to_owned(),
+				));
+			},
+			(false, Some(_)) => {
+				return Err(ChannelError::close(
+					"Remote sent Taproot Asset HTLC blob for non-asset channel".to_owned(),
+				));
+			},
+			(false, None) => {},
+		}
+
 		if msg.amount_msat > funding.get_value_satoshis() * 1000 {
 			return Err(ChannelError::close(
 				"Remote side tried to send more than the total value of the channel".to_owned(),
@@ -7029,6 +7052,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 					cltv_expiry: $htlc.cltv_expiry,
 					payment_hash: $htlc.payment_hash,
 					transaction_output_index: None,
+					simple_taproot_aux_leaf_script: None,
 				}
 			}
 		}

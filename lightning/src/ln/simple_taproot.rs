@@ -1398,6 +1398,26 @@ pub fn simple_taproot_htlc_spend_info<C: Verification>(
 	secp_ctx: &Secp256k1<C>, offered: bool, payment_hash: &PaymentHash, cltv_expiry: u32,
 	local_htlc_pubkey: &PublicKey, remote_htlc_pubkey: &PublicKey, revocation_pubkey: &PublicKey,
 ) -> Result<SimpleTaprootHtlcSpendInfo, SimpleTaprootMusigError> {
+	simple_taproot_htlc_spend_info_with_aux_leaf(
+		secp_ctx,
+		offered,
+		payment_hash,
+		cltv_expiry,
+		local_htlc_pubkey,
+		remote_htlc_pubkey,
+		revocation_pubkey,
+		None,
+	)
+}
+
+/// Returns all script-path spend data for a BOLT simple-taproot HTLC output, optionally
+/// including a Taproot Asset auxiliary leaf at the top level.
+#[cfg(feature = "simple_taproot_musig2")]
+pub fn simple_taproot_htlc_spend_info_with_aux_leaf<C: Verification>(
+	secp_ctx: &Secp256k1<C>, offered: bool, payment_hash: &PaymentHash, cltv_expiry: u32,
+	local_htlc_pubkey: &PublicKey, remote_htlc_pubkey: &PublicKey, revocation_pubkey: &PublicKey,
+	auxiliary_leaf_script: Option<&Script>,
+) -> Result<SimpleTaprootHtlcSpendInfo, SimpleTaprootMusigError> {
 	let (timeout_script, success_script) = if offered {
 		(
 			simple_taproot_offered_htlc_timeout_script(local_htlc_pubkey, remote_htlc_pubkey),
@@ -1413,11 +1433,23 @@ pub fn simple_taproot_htlc_spend_info<C: Verification>(
 			),
 		)
 	};
-	let spend_info = TaprootBuilder::new()
-		.add_leaf(1, timeout_script.clone())
-		.map_err(|_| SimpleTaprootMusigError::InvalidKey)?
-		.add_leaf(1, success_script.clone())
-		.map_err(|_| SimpleTaprootMusigError::InvalidKey)?
+	let mut builder = TaprootBuilder::new();
+	if let Some(auxiliary_leaf_script) = auxiliary_leaf_script {
+		builder = builder
+			.add_leaf(2, timeout_script.clone())
+			.map_err(|_| SimpleTaprootMusigError::InvalidKey)?
+			.add_leaf(2, success_script.clone())
+			.map_err(|_| SimpleTaprootMusigError::InvalidKey)?
+			.add_leaf(1, auxiliary_leaf_script.to_owned())
+			.map_err(|_| SimpleTaprootMusigError::InvalidKey)?;
+	} else {
+		builder = builder
+			.add_leaf(1, timeout_script.clone())
+			.map_err(|_| SimpleTaprootMusigError::InvalidKey)?
+			.add_leaf(1, success_script.clone())
+			.map_err(|_| SimpleTaprootMusigError::InvalidKey)?;
+	}
+	let spend_info = builder
 		.finalize(secp_ctx, xonly_key(revocation_pubkey))
 		.map_err(|_| SimpleTaprootMusigError::InvalidKey)?;
 	let script_pubkey = p2tr_script_pubkey(&spend_info);
