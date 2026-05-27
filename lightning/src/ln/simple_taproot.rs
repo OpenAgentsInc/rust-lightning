@@ -2479,6 +2479,60 @@ mod tests {
 
 	#[cfg(feature = "simple_taproot_musig2")]
 	#[test]
+	fn taproot_asset_to_local_script_matches_litd_initial_commitment_vector() {
+		let secp_ctx = Secp256k1::new();
+		let local_delayed_pubkey =
+			pubkey_from_hex("02d74d7a2695a4343b85021736266c14002a924c3058365171b2fd479c2dbcadb8");
+		let revocation_pubkey =
+			pubkey_from_hex("02dfcf93bab0607db26e9e36767b2ed6266ed6de09c63dff939143168cc0c758e9");
+		let aux_leaf = ScriptBuf::from(
+			Vec::<u8>::from_hex(
+				"6a47e8543f2ab163faf693971a653e54efe3d8056c52164c6b8bbf597b6ddb28020d752aed73081a6ebdaf454038debcec162e8820eb260ef5e7d6138eb3500d28000000000000007d",
+			)
+			.unwrap(),
+		);
+
+		let base_to_local = simple_taproot_to_local_spend_info(
+			&secp_ctx,
+			&local_delayed_pubkey,
+			&revocation_pubkey,
+			0,
+		)
+		.unwrap();
+		assert_script_hex(
+			&base_to_local.script_pubkey,
+			"5120cbbd4b8a6d3d8a3f38133b48aae35593005f6129f368f55c4508fef703c95870",
+		);
+
+		let zero_csv_asset_to_local = simple_taproot_to_local_spend_info_with_aux_leaf(
+			&secp_ctx,
+			&local_delayed_pubkey,
+			&revocation_pubkey,
+			0,
+			Some(aux_leaf.as_script()),
+		)
+		.unwrap();
+		assert_script_hex(
+			&zero_csv_asset_to_local.script_pubkey,
+			"5120c7ae498ef02eaa3141f73042eb21640ea6b659cd2d49244b395fda273a49795d",
+		);
+
+		let asset_to_local = simple_taproot_to_local_spend_info_with_aux_leaf(
+			&secp_ctx,
+			&local_delayed_pubkey,
+			&revocation_pubkey,
+			144,
+			Some(aux_leaf.as_script()),
+		)
+		.unwrap();
+		assert_script_hex(
+			&asset_to_local.script_pubkey,
+			"51205c4d17a56be11d9403abc370ba104ecbdfcc7e6b9f6f4042de09a0d038f9b921",
+		);
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	#[test]
 	fn htlc_and_second_level_scripts_match_bolt_vectors() {
 		let secp_ctx = Secp256k1::new();
 		let local_delayed_pubkey =

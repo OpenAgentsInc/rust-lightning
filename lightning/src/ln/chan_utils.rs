@@ -1438,15 +1438,7 @@ impl<'a> DirectedChannelTransactionParameters<'a> {
 
 	#[cfg(feature = "simple_taproot_musig2")]
 	fn simple_taproot_to_broadcaster_contest_delay(&self) -> u16 {
-		if self.inner.channel_type_features.requires_taproot_asset_channel()
-			&& self.simple_taproot_to_broadcaster_aux_leaf_script().is_some()
-		{
-			// Lightning Labs' Taproot Asset channel controller derives asset-bearing
-			// to-local aux leaves from an AuxChanState with a zero CSV delay.
-			0
-		} else {
-			self.contest_delay()
-		}
+		self.contest_delay()
 	}
 
 	/// Whether the channel is outbound from the broadcaster.
@@ -2941,7 +2933,7 @@ mod tests {
 	#[cfg(feature = "simple_taproot_musig2")]
 	#[test]
 	#[rustfmt::skip]
-	fn test_taproot_asset_to_broadcaster_aux_leaf_uses_zero_csv() {
+	fn test_taproot_asset_to_broadcaster_aux_leaf_uses_channel_csv() {
 		let mut builder = simple_taproot_vector_builder();
 		builder.channel_parameters.channel_type_features = ChannelTypeFeatures::taproot_asset_single_asset();
 		let aux_leaf = ScriptBuf::new_op_return(&[7; 32]);
@@ -2960,6 +2952,15 @@ mod tests {
 			&builder.secp_ctx,
 			&keys.broadcaster_delayed_payment_key.to_public_key(),
 			&keys.revocation_key.to_public_key(),
+			builder.channel_parameters.as_holder_broadcastable().contest_delay(),
+			Some(aux_leaf.as_script()),
+		)
+		.unwrap()
+		.script_pubkey;
+		let zero_csv_to_broadcaster = simple_taproot_to_local_spend_info_with_aux_leaf(
+			&builder.secp_ctx,
+			&keys.broadcaster_delayed_payment_key.to_public_key(),
+			&keys.revocation_key.to_public_key(),
 			0,
 			Some(aux_leaf.as_script()),
 		)
@@ -2967,6 +2968,7 @@ mod tests {
 		.script_pubkey;
 
 		assert_eq!(tx.built.transaction.output[to_broadcaster_idx].script_pubkey, expected_to_broadcaster);
+		assert_ne!(tx.built.transaction.output[to_broadcaster_idx].script_pubkey, zero_csv_to_broadcaster);
 		assert!(builder.verify(&tx).is_ok());
 	}
 
