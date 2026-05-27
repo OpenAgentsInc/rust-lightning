@@ -369,16 +369,17 @@ fn test_simple_taproot_funding_generation_uses_p2tr_and_rejects_wrong_script() {
 #[cfg(feature = "simple_taproot_musig2")]
 #[test]
 fn test_taproot_asset_pending_output_keys_public_api() {
-	let mut taproot_asset_config = UserConfig::default();
-	taproot_asset_config.channel_handshake_config.negotiate_taproot_asset_channels = true;
+	let mut initiator_config = UserConfig::default();
+	initiator_config.channel_handshake_config.negotiate_taproot_asset_channels = true;
+	initiator_config.channel_handshake_config.our_to_self_delay = 200;
+	let mut acceptor_config = UserConfig::default();
+	acceptor_config.channel_handshake_config.negotiate_taproot_asset_channels = true;
+	acceptor_config.channel_handshake_config.our_to_self_delay = 251;
 
 	let chanmon_cfgs = create_chanmon_cfgs(2);
 	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
-	let node_chanmgrs = create_node_chanmgrs(
-		2,
-		&node_cfgs,
-		&[Some(taproot_asset_config.clone()), Some(taproot_asset_config)],
-	);
+	let node_chanmgrs =
+		create_node_chanmgrs(2, &node_cfgs, &[Some(initiator_config), Some(acceptor_config)]);
 	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
 
 	let node_a_id = nodes[0].node.get_our_node_id();
@@ -386,6 +387,8 @@ fn test_taproot_asset_pending_output_keys_public_api() {
 	nodes[0].node.create_channel(node_b_id, 1_000_000, 0, 42, None, None).unwrap();
 	let open_channel_msg = get_event_msg!(nodes[0], MessageSendEvent::SendOpenChannel, node_b_id);
 	handle_and_accept_open_channel(&nodes[1], node_a_id, &open_channel_msg);
+	let accept_channel_msg =
+		get_event_msg!(nodes[1], MessageSendEvent::SendAcceptChannel, node_a_id);
 
 	let output_keys = nodes[1]
 		.node
@@ -398,8 +401,102 @@ fn test_taproot_asset_pending_output_keys_public_api() {
 	assert_ne!(output_keys.holder_commitment_to_counterparty, [0; 32]);
 	assert_ne!(output_keys.counterparty_commitment_to_holder, [0; 32]);
 	assert_ne!(output_keys.counterparty_commitment_to_counterparty, [0; 32]);
-	let _accept_channel_msg =
-		get_event_msg!(nodes[1], MessageSendEvent::SendAcceptChannel, node_a_id);
+
+	use crate::ln::chan_utils::{ChannelPublicKeys, TxCreationKeys};
+	use crate::ln::channel_keys::{DelayedPaymentBasepoint, HtlcBasepoint, RevocationBasepoint};
+	use crate::ln::simple_taproot::simple_taproot_to_local_spend_info;
+	use bitcoin::secp256k1::Secp256k1;
+
+	let secp_ctx = Secp256k1::new();
+	let p2tr_xonly = |script_pubkey: &ScriptBuf| {
+		let script = script_pubkey.as_bytes();
+		assert_eq!(script.len(), 34);
+		assert_eq!(script[0], 0x51);
+		assert_eq!(script[1], 0x20);
+		let mut key = [0; 32];
+		key.copy_from_slice(&script[2..]);
+		key
+	};
+	let initiator_pubkeys = ChannelPublicKeys {
+		funding_pubkey: open_channel_msg.common_fields.funding_pubkey,
+		revocation_basepoint: RevocationBasepoint::from(
+			open_channel_msg.common_fields.revocation_basepoint,
+		),
+		payment_point: open_channel_msg.common_fields.payment_basepoint,
+		delayed_payment_basepoint: DelayedPaymentBasepoint::from(
+			open_channel_msg.common_fields.delayed_payment_basepoint,
+		),
+		htlc_basepoint: HtlcBasepoint::from(open_channel_msg.common_fields.htlc_basepoint),
+	};
+	let acceptor_pubkeys = ChannelPublicKeys {
+		funding_pubkey: accept_channel_msg.common_fields.funding_pubkey,
+		revocation_basepoint: RevocationBasepoint::from(
+			accept_channel_msg.common_fields.revocation_basepoint,
+		),
+		payment_point: accept_channel_msg.common_fields.payment_basepoint,
+		delayed_payment_basepoint: DelayedPaymentBasepoint::from(
+			accept_channel_msg.common_fields.delayed_payment_basepoint,
+		),
+		htlc_basepoint: HtlcBasepoint::from(accept_channel_msg.common_fields.htlc_basepoint),
+	};
+
+	let acceptor_commitment_keys = TxCreationKeys::from_channel_static_keys(
+		&accept_channel_msg.common_fields.first_per_commitment_point,
+		&acceptor_pubkeys,
+		&initiator_pubkeys,
+		&secp_ctx,
+	);
+	let expected_acceptor_to_local = simple_taproot_to_local_spend_info(
+		&secp_ctx,
+		&acceptor_commitment_keys.broadcaster_delayed_payment_key.to_public_key(),
+		&acceptor_commitment_keys.revocation_key.to_public_key(),
+		accept_channel_msg.common_fields.to_self_delay,
+	)
+	.unwrap();
+	assert_eq!(
+		output_keys.holder_commitment_to_holder,
+		p2tr_xonly(&expected_acceptor_to_local.script_pubkey)
+	);
+	let swapped_acceptor_to_local = simple_taproot_to_local_spend_info(
+		&secp_ctx,
+		&acceptor_commitment_keys.broadcaster_delayed_payment_key.to_public_key(),
+		&acceptor_commitment_keys.revocation_key.to_public_key(),
+		open_channel_msg.common_fields.to_self_delay,
+	)
+	.unwrap();
+	assert_ne!(
+		output_keys.holder_commitment_to_holder,
+		p2tr_xonly(&swapped_acceptor_to_local.script_pubkey)
+	);
+
+	let initiator_commitment_keys = TxCreationKeys::from_channel_static_keys(
+		&open_channel_msg.common_fields.first_per_commitment_point,
+		&initiator_pubkeys,
+		&acceptor_pubkeys,
+		&secp_ctx,
+	);
+	let expected_initiator_to_local = simple_taproot_to_local_spend_info(
+		&secp_ctx,
+		&initiator_commitment_keys.broadcaster_delayed_payment_key.to_public_key(),
+		&initiator_commitment_keys.revocation_key.to_public_key(),
+		open_channel_msg.common_fields.to_self_delay,
+	)
+	.unwrap();
+	assert_eq!(
+		output_keys.counterparty_commitment_to_counterparty,
+		p2tr_xonly(&expected_initiator_to_local.script_pubkey)
+	);
+	let swapped_initiator_to_local = simple_taproot_to_local_spend_info(
+		&secp_ctx,
+		&initiator_commitment_keys.broadcaster_delayed_payment_key.to_public_key(),
+		&initiator_commitment_keys.revocation_key.to_public_key(),
+		accept_channel_msg.common_fields.to_self_delay,
+	)
+	.unwrap();
+	assert_ne!(
+		output_keys.counterparty_commitment_to_counterparty,
+		p2tr_xonly(&swapped_initiator_to_local.script_pubkey)
+	);
 }
 
 #[test]

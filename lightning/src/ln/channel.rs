@@ -1882,7 +1882,7 @@ where
 			&context.secp_ctx,
 			&holder_commitment_keys.broadcaster_delayed_payment_key.to_public_key(),
 			&holder_commitment_keys.revocation_key.to_public_key(),
-			counterparty_parameters.selected_contest_delay,
+			parameters.holder_selected_contest_delay,
 		)
 		.map_err(|_| {
 			ChannelError::close("Failed to derive holder Taproot Asset output key".to_owned())
@@ -1919,7 +1919,7 @@ where
 			&context.secp_ctx,
 			&counterparty_commitment_keys.broadcaster_delayed_payment_key.to_public_key(),
 			&counterparty_commitment_keys.revocation_key.to_public_key(),
-			parameters.holder_selected_contest_delay,
+			counterparty_parameters.selected_contest_delay,
 		)
 		.map_err(|_| {
 			ChannelError::close("Failed to derive counterparty Taproot Asset output key".to_owned())
