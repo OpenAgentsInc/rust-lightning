@@ -48,10 +48,11 @@ use super::channel_keys::{
 };
 #[cfg(feature = "simple_taproot_musig2")]
 use super::simple_taproot::{
-	simple_taproot_anchor_spend_info, simple_taproot_htlc_spend_info_with_aux_leaf,
-	simple_taproot_second_level_htlc_spend_info, simple_taproot_to_local_spend_info,
-	simple_taproot_to_local_spend_info_with_aux_leaf, simple_taproot_to_remote_spend_info,
-	simple_taproot_to_remote_spend_info_with_aux_leaf, SimpleTaprootKeyAggContext,
+	simple_taproot_anchor_spend_info, simple_taproot_htlc_spend_info,
+	simple_taproot_htlc_spend_info_with_aux_leaf, simple_taproot_second_level_htlc_spend_info,
+	simple_taproot_to_local_spend_info, simple_taproot_to_local_spend_info_with_aux_leaf,
+	simple_taproot_to_remote_spend_info, simple_taproot_to_remote_spend_info_with_aux_leaf,
+	SimpleTaprootKeyAggContext,
 };
 use crate::chain;
 use crate::crypto::utils::{sign, sign_with_aux_rand};
@@ -1808,6 +1809,12 @@ pub struct CommitmentTransaction {
 	built: BuiltCommitmentTransaction,
 }
 
+#[derive(Clone, Debug)]
+struct CommitmentTxOutputSortKey {
+	value: Amount,
+	script_pubkey: ScriptBuf,
+}
+
 impl Eq for CommitmentTransaction {}
 impl PartialEq for CommitmentTransaction {
 	#[rustfmt::skip]
@@ -1928,16 +1935,17 @@ impl CommitmentTransaction {
 	// A helper function that checks if the HTLC to the left of the HTLC at i is greater than itself,
 	// first by value, then by script pubkey, then by cltv expiry.
 	//
-	// It does so by reading both a vector of `TxOut` and a vector of `HTLCOutputInCommitment`.
+	// It does so by reading both a vector of output sort keys and a vector of
+	// `HTLCOutputInCommitment`.
 	//
 	// We use this function to both sort HTLCs, and to check that a set of HTLCs is sorted.
 	//
-	// `txouts` and `nondust_htlcs` MUST be of equal length, and of length >= 2.
-	// For all `i < len`, the `TxOut` at `txouts[i]` MUST correspond to the HTLC at `nondust_htlcs[i]`.
+	// `output_sort_keys` and `nondust_htlcs` MUST be of equal length, and of length >= 2.
+	// For all `i < len`, the sort key at `output_sort_keys[i]` MUST correspond to the HTLC at `nondust_htlcs[i]`.
 	#[rustfmt::skip]
-	fn is_left_greater(i: usize, txouts: &Vec<TxOut>, nondust_htlcs: &Vec<HTLCOutputInCommitment>) -> bool {
-		txouts[i - 1].value.cmp(&txouts[i].value)
-			.then(txouts[i - 1].script_pubkey.cmp(&txouts[i].script_pubkey))
+	fn is_left_greater(i: usize, output_sort_keys: &Vec<CommitmentTxOutputSortKey>, nondust_htlcs: &Vec<HTLCOutputInCommitment>) -> bool {
+		output_sort_keys[i - 1].value.cmp(&output_sort_keys[i].value)
+			.then(output_sort_keys[i - 1].script_pubkey.cmp(&output_sort_keys[i].script_pubkey))
 			.then(nondust_htlcs[i - 1].cltv_expiry.cmp(&nondust_htlcs[i].cltv_expiry))
 			// Note that due to hash collisions, we have to have a fallback comparison
 			// here for fuzzing mode (otherwise at least chanmon_fail_consistency
@@ -1946,30 +1954,47 @@ impl CommitmentTransaction {
 			.is_gt()
 	}
 
+	fn output_sort_key(output: &TxOut, sort_script_pubkey: ScriptBuf) -> CommitmentTxOutputSortKey {
+		CommitmentTxOutputSortKey { value: output.value, script_pubkey: sort_script_pubkey }
+	}
+
+	fn insert_sorted_output(
+		outputs: &mut Vec<TxOut>, output_sort_keys: &mut Vec<CommitmentTxOutputSortKey>,
+		output: TxOut, output_sort_key: CommitmentTxOutputSortKey,
+	) -> usize {
+		let idx = match output_sort_keys.binary_search_by(|key| {
+			key.value
+				.cmp(&output_sort_key.value)
+				.then(key.script_pubkey.cmp(&output_sort_key.script_pubkey))
+		}) {
+			// For non-HTLC outputs, if they're copying our SPK we don't really care if we
+			// close the channel due to mismatches - they're doing something dumb
+			Ok(i) => i,
+			Err(i) => i,
+		};
+		outputs.insert(idx, output);
+		output_sort_keys.insert(idx, output_sort_key);
+		idx
+	}
+
 	#[rustfmt::skip]
 	fn rebuild_transaction(&self, keys: &TxCreationKeys, channel_parameters: &DirectedChannelTransactionParameters) -> Result<BuiltCommitmentTransaction, ()> {
 		let (obscured_commitment_transaction_number, txins) = Self::build_inputs(self.commitment_number, channel_parameters);
 
 		// First rebuild the htlc outputs, note that `outputs` is now the same length as `self.nondust_htlcs`
-		let mut outputs = Self::build_htlc_outputs(keys, &self.nondust_htlcs, channel_parameters.channel_type_features());
+		let (mut outputs, mut output_sort_keys) = Self::build_htlc_outputs_and_sort_keys(keys, &self.nondust_htlcs, channel_parameters.channel_type_features());
 
 		let nondust_htlcs_value_sum_sat = self.nondust_htlcs.iter().map(|htlc| htlc.to_bitcoin_amount()).sum();
 
 		// Check that the HTLC outputs are sorted by value, script pubkey, and cltv expiry.
 		// Note that this only iterates if the length of `outputs` and `self.nondust_htlcs` is >= 2.
-		if (1..outputs.len()).into_iter().any(|i| Self::is_left_greater(i, &outputs, &self.nondust_htlcs)) {
+		if (1..output_sort_keys.len()).into_iter().any(|i| Self::is_left_greater(i, &output_sort_keys, &self.nondust_htlcs)) {
 			return Err(())
 		}
 
 		// Then insert the max-4 non-htlc outputs, ordered by value, then by script pubkey
-		let insert_non_htlc_output = |non_htlc_output: TxOut| {
-			let idx = match outputs.binary_search_by(|output| output.value.cmp(&non_htlc_output.value).then(output.script_pubkey.cmp(&non_htlc_output.script_pubkey))) {
-				// For non-HTLC outputs, if they're copying our SPK we don't really care if we
-				// close the channel due to mismatches - they're doing something dumb
-				Ok(i) => i,
-				Err(i) => i,
-			};
-			outputs.insert(idx, non_htlc_output);
+		let insert_non_htlc_output = |non_htlc_output: TxOut, output_sort_key: CommitmentTxOutputSortKey| {
+			Self::insert_sorted_output(&mut outputs, &mut output_sort_keys, non_htlc_output, output_sort_key);
 		};
 
 		Self::insert_non_htlc_outputs(
@@ -2015,7 +2040,7 @@ impl CommitmentTransaction {
 	) -> Vec<TxOut> {
 		// First build and sort the HTLC outputs.
 		// Also sort the HTLC output data in `nondust_htlcs` in the same order.
-		let mut outputs = Self::build_sorted_htlc_outputs(keys, nondust_htlcs, channel_parameters.channel_type_features());
+		let (mut outputs, mut output_sort_keys) = Self::build_sorted_htlc_outputs(keys, nondust_htlcs, channel_parameters.channel_type_features());
 
 		let nondust_htlcs_value_sum_sat = nondust_htlcs.iter().map(|htlc| htlc.to_bitcoin_amount()).sum();
 
@@ -2027,14 +2052,8 @@ impl CommitmentTransaction {
 			.for_each(|(i, htlc)| htlc.transaction_output_index = Some(i as u32));
 
 		// Then insert the max-4 non-htlc outputs, ordered by value, then by script pubkey
-		let insert_non_htlc_output = |non_htlc_output: TxOut| {
-			let idx = match outputs.binary_search_by(|output| output.value.cmp(&non_htlc_output.value).then(output.script_pubkey.cmp(&non_htlc_output.script_pubkey))) {
-				// For non-HTLC outputs, if they're copying our SPK we don't really care if we
-				// close the channel due to mismatches - they're doing something dumb
-				Ok(i) => i,
-				Err(i) => i,
-			};
-			outputs.insert(idx, non_htlc_output);
+		let insert_non_htlc_output = |non_htlc_output: TxOut, output_sort_key: CommitmentTxOutputSortKey| {
+			let idx = Self::insert_sorted_output(&mut outputs, &mut output_sort_keys, non_htlc_output, output_sort_key);
 
 			// Increment the transaction output indices of all the HTLCs that come after the output we
 			// just inserted.
@@ -2070,7 +2089,7 @@ impl CommitmentTransaction {
 		nondust_htlcs_value_sum_sat: Amount,
 		mut insert_non_htlc_output: F,
 	) where
-		F: FnMut(TxOut),
+		F: FnMut(TxOut, CommitmentTxOutputSortKey),
 	{
 		let countersignatory_payment_point = &channel_parameters.countersignatory_pubkeys().payment_point;
 		let countersignatory_funding_key = &channel_parameters.countersignatory_pubkeys().funding_pubkey;
@@ -2081,41 +2100,54 @@ impl CommitmentTransaction {
 
 		if to_countersignatory_value_sat > Amount::ZERO {
 			#[cfg(feature = "simple_taproot_musig2")]
-			let script = if requires_simple_taproot_outputs(channel_type) {
+			let (script, sort_script) = if requires_simple_taproot_outputs(channel_type) {
 				let secp_ctx = Secp256k1::verification_only();
 				let countersignatory_payment_key = simple_taproot_to_remote_payment_key(
 					channel_type,
 					countersignatory_payment_point,
 				);
-				simple_taproot_to_remote_spend_info_with_aux_leaf(
+				let script = simple_taproot_to_remote_spend_info_with_aux_leaf(
 					&secp_ctx,
 					&countersignatory_payment_key,
 					channel_parameters.simple_taproot_to_countersignatory_aux_leaf_script(),
 				)
 				.expect("valid simple-taproot to_remote output")
-				.script_pubkey
+				.script_pubkey;
+				let sort_script = simple_taproot_to_remote_spend_info(
+					&secp_ctx,
+					&countersignatory_payment_key,
+				)
+				.expect("valid simple-taproot to_remote sort output")
+				.script_pubkey;
+				(script, sort_script)
 			} else if channel_type.supports_anchors_zero_fee_htlc_tx() {
-				get_to_countersigner_keyed_anchor_redeemscript(countersignatory_payment_point).to_p2wsh()
+				let script = get_to_countersigner_keyed_anchor_redeemscript(countersignatory_payment_point).to_p2wsh();
+				(script.clone(), script)
 			} else {
-				ScriptBuf::new_p2wpkh(&Hash160::hash(&countersignatory_payment_point.serialize()).into())
+				let script = ScriptBuf::new_p2wpkh(&Hash160::hash(&countersignatory_payment_point.serialize()).into());
+				(script.clone(), script)
 			};
 			#[cfg(not(feature = "simple_taproot_musig2"))]
-			let script = if channel_type.supports_anchors_zero_fee_htlc_tx() {
-				get_to_countersigner_keyed_anchor_redeemscript(countersignatory_payment_point).to_p2wsh()
+			let (script, sort_script) = if channel_type.supports_anchors_zero_fee_htlc_tx() {
+				let script = get_to_countersigner_keyed_anchor_redeemscript(countersignatory_payment_point).to_p2wsh();
+				(script.clone(), script)
 			} else {
-				ScriptBuf::new_p2wpkh(&Hash160::hash(&countersignatory_payment_point.serialize()).into())
+				let script = ScriptBuf::new_p2wpkh(&Hash160::hash(&countersignatory_payment_point.serialize()).into());
+				(script.clone(), script)
 			};
-			insert_non_htlc_output(TxOut {
+			let output = TxOut {
 				script_pubkey: script,
 				value: to_countersignatory_value_sat,
-			});
+			};
+			let output_sort_key = Self::output_sort_key(&output, sort_script);
+			insert_non_htlc_output(output, output_sort_key);
 		}
 
 		if to_broadcaster_value_sat > Amount::ZERO {
 			#[cfg(feature = "simple_taproot_musig2")]
-			let script_pubkey = if requires_simple_taproot_outputs(channel_type) {
+			let (script_pubkey, sort_script_pubkey) = if requires_simple_taproot_outputs(channel_type) {
 				let secp_ctx = Secp256k1::verification_only();
-				simple_taproot_to_local_spend_info_with_aux_leaf(
+				let script_pubkey = simple_taproot_to_local_spend_info_with_aux_leaf(
 					&secp_ctx,
 					&keys.broadcaster_delayed_payment_key.to_public_key(),
 					&keys.revocation_key.to_public_key(),
@@ -2123,33 +2155,53 @@ impl CommitmentTransaction {
 					channel_parameters.simple_taproot_to_broadcaster_aux_leaf_script(),
 				)
 				.expect("valid simple-taproot to_local output")
-				.script_pubkey
+				.script_pubkey;
+				let sort_script_pubkey = simple_taproot_to_local_spend_info(
+					&secp_ctx,
+					&keys.broadcaster_delayed_payment_key.to_public_key(),
+					&keys.revocation_key.to_public_key(),
+					channel_parameters.simple_taproot_to_broadcaster_contest_delay(),
+				)
+				.expect("valid simple-taproot to_local sort output")
+				.script_pubkey;
+				(script_pubkey, sort_script_pubkey)
 			} else {
-				get_revokeable_redeemscript(
+				let script_pubkey = get_revokeable_redeemscript(
 					&keys.revocation_key,
 					contest_delay,
 					&keys.broadcaster_delayed_payment_key,
 				)
-				.to_p2wsh()
+				.to_p2wsh();
+				(script_pubkey.clone(), script_pubkey)
 			};
 			#[cfg(not(feature = "simple_taproot_musig2"))]
-			let script_pubkey = get_revokeable_redeemscript(
-				&keys.revocation_key,
-				contest_delay,
-				&keys.broadcaster_delayed_payment_key,
-			)
-			.to_p2wsh();
-			insert_non_htlc_output(TxOut {
+			let (script_pubkey, sort_script_pubkey) = {
+				let script_pubkey = get_revokeable_redeemscript(
+					&keys.revocation_key,
+					contest_delay,
+					&keys.broadcaster_delayed_payment_key,
+				)
+				.to_p2wsh();
+				(script_pubkey.clone(), script_pubkey)
+			};
+			let output = TxOut {
 				script_pubkey,
 				value: to_broadcaster_value_sat,
-			});
+			};
+			let output_sort_key = Self::output_sort_key(&output, sort_script_pubkey);
+			insert_non_htlc_output(output, output_sort_key);
 		}
+
+		let mut insert_non_htlc_output_with_final_sort_key = |output: TxOut| {
+			let output_sort_key = Self::output_sort_key(&output, output.script_pubkey.clone());
+			insert_non_htlc_output(output, output_sort_key);
+		};
 
 		#[cfg(feature = "simple_taproot_musig2")]
 		if requires_simple_taproot_outputs(channel_type) {
 			let secp_ctx = Secp256k1::verification_only();
 			if to_broadcaster_value_sat > Amount::ZERO || tx_has_htlc_outputs {
-				insert_non_htlc_output(TxOut {
+				insert_non_htlc_output_with_final_sort_key(TxOut {
 					script_pubkey: simple_taproot_anchor_spend_info(
 						&secp_ctx,
 						&keys.broadcaster_delayed_payment_key.to_public_key(),
@@ -2161,7 +2213,7 @@ impl CommitmentTransaction {
 			}
 
 			if to_countersignatory_value_sat > Amount::ZERO || tx_has_htlc_outputs {
-				insert_non_htlc_output(TxOut {
+				insert_non_htlc_output_with_final_sort_key(TxOut {
 					script_pubkey: simple_taproot_anchor_spend_info(
 						&secp_ctx,
 						countersignatory_payment_point,
@@ -2174,7 +2226,7 @@ impl CommitmentTransaction {
 		} else if channel_type.supports_anchors_zero_fee_htlc_tx() {
 			if to_broadcaster_value_sat > Amount::ZERO || tx_has_htlc_outputs {
 				let anchor_script = get_keyed_anchor_redeemscript(broadcaster_funding_key);
-				insert_non_htlc_output(TxOut {
+				insert_non_htlc_output_with_final_sort_key(TxOut {
 					script_pubkey: anchor_script.to_p2wsh(),
 					value: Amount::from_sat(ANCHOR_OUTPUT_VALUE_SATOSHI),
 				});
@@ -2182,7 +2234,7 @@ impl CommitmentTransaction {
 
 			if to_countersignatory_value_sat > Amount::ZERO || tx_has_htlc_outputs {
 				let anchor_script = get_keyed_anchor_redeemscript(countersignatory_funding_key);
-				insert_non_htlc_output(TxOut {
+				insert_non_htlc_output_with_final_sort_key(TxOut {
 					script_pubkey: anchor_script.to_p2wsh(),
 					value: Amount::from_sat(ANCHOR_OUTPUT_VALUE_SATOSHI),
 				});
@@ -2191,7 +2243,7 @@ impl CommitmentTransaction {
 				let channel_value_satoshis = Amount::from_sat(channel_parameters.channel_value_satoshis());
 				// These subtractions panic on underflow, but this should never happen
 				let trimmed_sum_sat = channel_value_satoshis - nondust_htlcs_value_sum_sat - to_broadcaster_value_sat - to_countersignatory_value_sat;
-				insert_non_htlc_output(TxOut {
+				insert_non_htlc_output_with_final_sort_key(TxOut {
 					script_pubkey: shared_anchor_script_pubkey(),
 					value: cmp::min(Amount::from_sat(P2A_MAX_VALUE), trimmed_sum_sat),
 				});
@@ -2200,7 +2252,7 @@ impl CommitmentTransaction {
 		if channel_type.supports_anchors_zero_fee_htlc_tx() {
 			if to_broadcaster_value_sat > Amount::ZERO || tx_has_htlc_outputs {
 				let anchor_script = get_keyed_anchor_redeemscript(broadcaster_funding_key);
-				insert_non_htlc_output(TxOut {
+				insert_non_htlc_output_with_final_sort_key(TxOut {
 					script_pubkey: anchor_script.to_p2wsh(),
 					value: Amount::from_sat(ANCHOR_OUTPUT_VALUE_SATOSHI),
 				});
@@ -2208,7 +2260,7 @@ impl CommitmentTransaction {
 
 			if to_countersignatory_value_sat > Amount::ZERO || tx_has_htlc_outputs {
 				let anchor_script = get_keyed_anchor_redeemscript(countersignatory_funding_key);
-				insert_non_htlc_output(TxOut {
+				insert_non_htlc_output_with_final_sort_key(TxOut {
 					script_pubkey: anchor_script.to_p2wsh(),
 					value: Amount::from_sat(ANCHOR_OUTPUT_VALUE_SATOSHI),
 				});
@@ -2217,7 +2269,7 @@ impl CommitmentTransaction {
 				let channel_value_satoshis = Amount::from_sat(channel_parameters.channel_value_satoshis());
 				// These subtractions panic on underflow, but this should never happen
 				let trimmed_sum_sat = channel_value_satoshis - nondust_htlcs_value_sum_sat - to_broadcaster_value_sat - to_countersignatory_value_sat;
-				insert_non_htlc_output(TxOut {
+				insert_non_htlc_output_with_final_sort_key(TxOut {
 					script_pubkey: shared_anchor_script_pubkey(),
 					value: cmp::min(Amount::from_sat(P2A_MAX_VALUE), trimmed_sum_sat),
 				});
@@ -2225,17 +2277,17 @@ impl CommitmentTransaction {
 	}
 
 	#[rustfmt::skip]
-	fn build_htlc_outputs(keys: &TxCreationKeys, nondust_htlcs: &Vec<HTLCOutputInCommitment>, channel_type: &ChannelTypeFeatures) -> Vec<TxOut> {
+	fn build_htlc_outputs_and_sort_keys(keys: &TxCreationKeys, nondust_htlcs: &Vec<HTLCOutputInCommitment>, channel_type: &ChannelTypeFeatures) -> (Vec<TxOut>, Vec<CommitmentTxOutputSortKey>) {
 		// Allocate memory for the 4 possible non-htlc outputs
 		let mut txouts = Vec::with_capacity(nondust_htlcs.len() + 4);
+		let mut output_sort_keys = Vec::with_capacity(nondust_htlcs.len() + 4);
 
 		for htlc in nondust_htlcs {
-			let txout = TxOut {
-				script_pubkey: {
+			let (script_pubkey, sort_script_pubkey) = {
 					#[cfg(feature = "simple_taproot_musig2")]
 					if requires_simple_taproot_outputs(channel_type) {
 						let secp_ctx = Secp256k1::verification_only();
-						simple_taproot_htlc_spend_info_with_aux_leaf(
+						let script_pubkey = simple_taproot_htlc_spend_info_with_aux_leaf(
 							&secp_ctx,
 							htlc.offered,
 							&htlc.payment_hash,
@@ -2246,21 +2298,38 @@ impl CommitmentTransaction {
 							htlc.simple_taproot_aux_leaf_script.as_deref(),
 						)
 						.expect("valid simple-taproot HTLC output")
-						.script_pubkey
+						.script_pubkey;
+						let sort_script_pubkey = simple_taproot_htlc_spend_info(
+							&secp_ctx,
+							htlc.offered,
+							&htlc.payment_hash,
+							htlc.cltv_expiry,
+							&keys.broadcaster_htlc_key.to_public_key(),
+							&keys.countersignatory_htlc_key.to_public_key(),
+							&keys.revocation_key.to_public_key(),
+						)
+						.expect("valid simple-taproot HTLC sort output")
+						.script_pubkey;
+						(script_pubkey, sort_script_pubkey)
 					} else {
-						get_htlc_redeemscript(htlc, channel_type, keys).to_p2wsh()
+						let script_pubkey = get_htlc_redeemscript(htlc, channel_type, keys).to_p2wsh();
+						(script_pubkey.clone(), script_pubkey)
 					}
 					#[cfg(not(feature = "simple_taproot_musig2"))]
 					{
-						get_htlc_redeemscript(htlc, channel_type, keys).to_p2wsh()
+						let script_pubkey = get_htlc_redeemscript(htlc, channel_type, keys).to_p2wsh();
+						(script_pubkey.clone(), script_pubkey)
 					}
-				},
+				};
+			let txout = TxOut {
+				script_pubkey,
 				value: htlc.to_bitcoin_amount(),
 			};
+			output_sort_keys.push(Self::output_sort_key(&txout, sort_script_pubkey));
 			txouts.push(txout);
 		}
 
-		txouts
+		(txouts, output_sort_keys)
 	}
 
 	#[rustfmt::skip]
@@ -2268,9 +2337,9 @@ impl CommitmentTransaction {
 		keys: &TxCreationKeys,
 		nondust_htlcs: &mut Vec<HTLCOutputInCommitment>,
 		channel_type: &ChannelTypeFeatures
-	) -> Vec<TxOut> {
+	) -> (Vec<TxOut>, Vec<CommitmentTxOutputSortKey>) {
 		// Note that `txouts` has the same length as `nondust_htlcs` here
-		let mut txouts = Self::build_htlc_outputs(keys, nondust_htlcs, channel_type);
+		let (mut txouts, mut output_sort_keys) = Self::build_htlc_outputs_and_sort_keys(keys, nondust_htlcs, channel_type);
 
 		// Sort the HTLC outputs by value, then by script pubkey, then by cltv expiration height.
 		//
@@ -2289,14 +2358,15 @@ impl CommitmentTransaction {
 			// While there is a value to the left of j,
 			// and that value is greater than the value at j,
 			// swap the two values.
-			while j > 0 && Self::is_left_greater(j, &txouts, &nondust_htlcs) {
+			while j > 0 && Self::is_left_greater(j, &output_sort_keys, &nondust_htlcs) {
 				txouts.swap(j - 1, j);
+				output_sort_keys.swap(j - 1, j);
 				nondust_htlcs.swap(j - 1, j);
 				j -= 1;
 			}
 		}
 
-		txouts
+		(txouts, output_sort_keys)
 	}
 
 	#[rustfmt::skip]
@@ -2595,8 +2665,8 @@ mod tests {
 	use crate::ln::channel_keys::{DelayedPaymentBasepoint, HtlcBasepoint, RevocationBasepoint};
 	#[cfg(feature = "simple_taproot_musig2")]
 	use crate::ln::simple_taproot::{
-		simple_taproot_htlc_spend_info_with_aux_leaf,
-		simple_taproot_to_local_spend_info_with_aux_leaf,
+		simple_taproot_htlc_spend_info_with_aux_leaf, simple_taproot_to_local_spend_info,
+		simple_taproot_to_local_spend_info_with_aux_leaf, simple_taproot_to_remote_spend_info,
 		simple_taproot_to_remote_spend_info_with_aux_leaf,
 	};
 	use crate::sign::{ChannelSigner, SignerProvider};
@@ -2941,6 +3011,81 @@ mod tests {
 			outputs[3].script_pubkey.as_bytes(),
 			&<Vec<u8>>::from_hex("51207b49ec6082e5fe6cd59ab23ab3030a918928dab1e3ea202b5c0faba770a830bf").unwrap()[..]
 		);
+		assert!(builder.verify(&tx).is_ok());
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	#[test]
+	#[rustfmt::skip]
+	fn test_taproot_asset_non_htlc_output_sort_uses_base_scripts() {
+		let mut builder = simple_taproot_vector_builder();
+		builder.channel_parameters.channel_type_features = ChannelTypeFeatures::taproot_asset_single_asset();
+		let plain_tx = builder.build(3_000_000, 3_000_000, Vec::new());
+		let keys = plain_tx.trust().keys().clone();
+		let countersignatory_payment_key = simple_taproot_to_remote_payment_key(
+			&builder.channel_parameters.channel_type_features,
+			&builder.counterparty_pubkeys.payment_point,
+		);
+		let base_to_countersignatory = simple_taproot_to_remote_spend_info(
+			&builder.secp_ctx,
+			&countersignatory_payment_key,
+		)
+		.unwrap()
+		.script_pubkey;
+		let base_to_broadcaster = simple_taproot_to_local_spend_info(
+			&builder.secp_ctx,
+			&keys.broadcaster_delayed_payment_key.to_public_key(),
+			&keys.revocation_key.to_public_key(),
+			builder.channel_parameters.as_holder_broadcastable().contest_delay(),
+		)
+		.unwrap()
+		.script_pubkey;
+		let base_countersignatory_first = base_to_countersignatory < base_to_broadcaster;
+
+		let mut selected = None;
+		for marker in 0u8..=u8::MAX {
+			let aux_leaf = ScriptBuf::new_op_return(&[marker; 32]);
+			let final_to_countersignatory = simple_taproot_to_remote_spend_info_with_aux_leaf(
+				&builder.secp_ctx,
+				&countersignatory_payment_key,
+				Some(aux_leaf.as_script()),
+			)
+			.unwrap()
+			.script_pubkey;
+			let final_to_broadcaster = simple_taproot_to_local_spend_info_with_aux_leaf(
+				&builder.secp_ctx,
+				&keys.broadcaster_delayed_payment_key.to_public_key(),
+				&keys.revocation_key.to_public_key(),
+				builder.channel_parameters.as_holder_broadcastable().contest_delay(),
+				Some(aux_leaf.as_script()),
+			)
+			.unwrap()
+			.script_pubkey;
+			if (final_to_countersignatory < final_to_broadcaster) != base_countersignatory_first {
+				selected = Some((aux_leaf, final_to_countersignatory, final_to_broadcaster));
+				break;
+			}
+		}
+		let (aux_leaf, final_to_countersignatory, final_to_broadcaster) =
+			selected.expect("test vectors should contain an aux leaf that flips final-script order");
+
+		builder.channel_parameters.simple_taproot_holder_commitment_to_holder_aux_leaf_script =
+			Some(aux_leaf.clone());
+		builder.channel_parameters.simple_taproot_holder_commitment_to_counterparty_aux_leaf_script =
+			Some(aux_leaf);
+
+		let tx = builder.build(3_000_000, 3_000_000, Vec::new());
+		let value_outputs: Vec<&TxOut> = tx.built.transaction.output.iter()
+			.filter(|output| output.value.to_sat() == 3_000_000)
+			.collect();
+		assert_eq!(value_outputs.len(), 2);
+		if base_countersignatory_first {
+			assert_eq!(value_outputs[0].script_pubkey, final_to_countersignatory);
+			assert_eq!(value_outputs[1].script_pubkey, final_to_broadcaster);
+		} else {
+			assert_eq!(value_outputs[0].script_pubkey, final_to_broadcaster);
+			assert_eq!(value_outputs[1].script_pubkey, final_to_countersignatory);
+		}
 		assert!(builder.verify(&tx).is_ok());
 	}
 
