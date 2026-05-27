@@ -60,6 +60,10 @@ use crate::ln::simple_taproot::{
 	SimpleTaprootNonceScope, SimpleTaprootNonceState, SimpleTaprootNonceUse,
 	SimpleTaprootPartialSignatureWithNonce, SimpleTaprootSecretNonce,
 };
+#[cfg(feature = "simple_taproot_musig2")]
+use crate::ln::simple_taproot::{
+	simple_taproot_schnorr_signature_to_htlc_wire_signature, simple_taproot_sign_htlc_tapscript,
+};
 use crate::offers::invoice::UnsignedBolt12Invoice;
 use crate::types::features::ChannelTypeFeatures;
 use crate::types::payment::PaymentPreimage;
@@ -1890,6 +1894,40 @@ impl EcdsaChannelSigner for InMemorySigner {
 				&keys.broadcaster_delayed_payment_key,
 				&keys.revocation_key,
 			);
+			let holder_htlc_key = chan_utils::derive_private_key(
+				&secp_ctx,
+				&keys.per_commitment_point,
+				&self.htlc_base_key,
+			);
+			#[cfg(feature = "simple_taproot_musig2")]
+			if chan_utils::requires_simple_taproot_outputs(chan_type) {
+				let spend_info = chan_utils::simple_taproot_htlc_spend_info_for_htlc(
+					secp_ctx, htlc, chan_type, &keys,
+				)
+				.map_err(|_| ())?;
+				let leaf = if htlc.offered { &spend_info.timeout } else { &spend_info.success };
+				let previous_output = TxOut {
+					value: htlc.to_bitcoin_amount(),
+					script_pubkey: spend_info.script_pubkey,
+				};
+				let taproot_signature = simple_taproot_sign_htlc_tapscript(
+					secp_ctx,
+					&htlc_tx,
+					0,
+					previous_output,
+					leaf,
+					&holder_htlc_key,
+					&self.get_secure_random_bytes(),
+				)
+				.map_err(|_| ())?;
+				htlc_sigs.push(
+					simple_taproot_schnorr_signature_to_htlc_wire_signature(
+						&taproot_signature.signature,
+					)
+					.map_err(|_| ())?,
+				);
+				continue;
+			}
 			let htlc_redeemscript = chan_utils::get_htlc_redeemscript(&htlc, chan_type, &keys);
 			let htlc_sighashtype = if chan_type.supports_anchors_zero_fee_htlc_tx()
 				|| chan_type.supports_anchor_zero_fee_commitments()
@@ -1907,11 +1945,6 @@ impl EcdsaChannelSigner for InMemorySigner {
 						htlc_sighashtype
 					)
 					.unwrap()[..]
-			);
-			let holder_htlc_key = chan_utils::derive_private_key(
-				&secp_ctx,
-				&keys.per_commitment_point,
-				&self.htlc_base_key,
 			);
 			htlc_sigs.push(sign(secp_ctx, &htlc_sighash, &holder_htlc_key));
 		}
@@ -2072,6 +2105,52 @@ impl EcdsaChannelSigner for InMemorySigner {
 			&htlc_descriptor.channel_derivation_parameters.transaction_parameters;
 		assert!(channel_parameters.is_populated(), "Channel parameters must be fully populated");
 
+		let our_htlc_private_key = chan_utils::derive_private_key(
+			&secp_ctx,
+			&htlc_descriptor.per_commitment_point,
+			&self.htlc_base_key,
+		);
+		#[cfg(feature = "simple_taproot_musig2")]
+		if chan_utils::requires_simple_taproot_outputs(&channel_parameters.channel_type_features) {
+			let channel_params = channel_parameters.as_holder_broadcastable();
+			let keys = chan_utils::TxCreationKeys::from_channel_static_keys(
+				&htlc_descriptor.per_commitment_point,
+				channel_params.broadcaster_pubkeys(),
+				channel_params.countersignatory_pubkeys(),
+				secp_ctx,
+			);
+			let spend_info = chan_utils::simple_taproot_htlc_spend_info_for_htlc(
+				secp_ctx,
+				&htlc_descriptor.htlc,
+				channel_params.channel_type_features(),
+				&keys,
+			)
+			.map_err(|_| ())?;
+			let leaf = if htlc_descriptor.preimage.is_some() {
+				&spend_info.success
+			} else {
+				&spend_info.timeout
+			};
+			let previous_output = TxOut {
+				value: htlc_descriptor.htlc.to_bitcoin_amount(),
+				script_pubkey: spend_info.script_pubkey,
+			};
+			let taproot_signature = simple_taproot_sign_htlc_tapscript(
+				secp_ctx,
+				htlc_tx,
+				input,
+				previous_output,
+				leaf,
+				&our_htlc_private_key,
+				&self.get_secure_random_bytes(),
+			)
+			.map_err(|_| ())?;
+			return simple_taproot_schnorr_signature_to_htlc_wire_signature(
+				&taproot_signature.signature,
+			)
+			.map_err(|_| ());
+		}
+
 		let witness_script = htlc_descriptor.witness_script(secp_ctx);
 		let sighash = &sighash::SighashCache::new(&*htlc_tx)
 			.p2wsh_signature_hash(
@@ -2081,11 +2160,6 @@ impl EcdsaChannelSigner for InMemorySigner {
 				EcdsaSighashType::All,
 			)
 			.map_err(|_| ())?;
-		let our_htlc_private_key = chan_utils::derive_private_key(
-			&secp_ctx,
-			&htlc_descriptor.per_commitment_point,
-			&self.htlc_base_key,
-		);
 		let sighash = hash_to_message!(sighash.as_byte_array());
 		Ok(sign_with_aux_rand(&secp_ctx, &sighash, &our_htlc_private_key, &self))
 	}

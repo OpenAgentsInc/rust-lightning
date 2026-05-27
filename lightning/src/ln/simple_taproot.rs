@@ -32,7 +32,7 @@ use bitcoin::script::{Builder, Script, ScriptBuf};
 use bitcoin::secp256k1::PublicKey;
 #[cfg(feature = "simple_taproot_musig2")]
 use bitcoin::secp256k1::{
-	schnorr, Keypair, Message, Secp256k1, SecretKey, Signing, Verification, XOnlyPublicKey,
+	ecdsa, schnorr, Keypair, Message, Secp256k1, SecretKey, Signing, Verification, XOnlyPublicKey,
 };
 #[cfg(feature = "simple_taproot_musig2")]
 use bitcoin::sighash::{self, SighashCache, TapSighashType};
@@ -356,6 +356,31 @@ impl Readable for SimpleTaprootPartialSignatureWithNonce {
 		let public_nonce = Readable::read(reader)?;
 		Ok(Self { partial_signature, public_nonce })
 	}
+}
+
+/// Reinterprets the existing BOLT `htlc_signature` 64-byte field as a raw
+/// BIP340 signature for simple-taproot HTLC transactions.
+///
+/// LDK's message type still stores these bytes in an ECDSA signature wrapper
+/// because legacy channels use the same fixed-width field. The simple-taproot
+/// wire value is not DER-encoded ECDSA; it is the Schnorr signature bytes
+/// specified by the simple-taproot draft.
+#[cfg(feature = "simple_taproot_musig2")]
+pub fn simple_taproot_schnorr_signature_from_htlc_wire_signature(
+	signature: &ecdsa::Signature,
+) -> Result<schnorr::Signature, SimpleTaprootMusigError> {
+	schnorr::Signature::from_slice(&signature.serialize_compact())
+		.map_err(|_| SimpleTaprootMusigError::InvalidSignature)
+}
+
+/// Packs a raw BIP340 simple-taproot HTLC signature into the existing BOLT
+/// `htlc_signature` fixed-width field.
+#[cfg(feature = "simple_taproot_musig2")]
+pub fn simple_taproot_schnorr_signature_to_htlc_wire_signature(
+	signature: &schnorr::Signature,
+) -> Result<ecdsa::Signature, SimpleTaprootMusigError> {
+	ecdsa::Signature::from_compact(signature.as_ref())
+		.map_err(|_| SimpleTaprootMusigError::InvalidSignature)
 }
 
 /// A retransmittable simple-taproot commitment partial signature.

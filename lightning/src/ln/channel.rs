@@ -80,10 +80,11 @@ use crate::ln::onion_utils::{
 use crate::ln::script::{self, ShutdownScript};
 #[cfg(feature = "simple_taproot_musig2")]
 use crate::ln::simple_taproot::{
-	simple_taproot_htlc_spend_info_with_aux_leaf_for_variant, simple_taproot_to_local_spend_info,
-	simple_taproot_to_remote_spend_info, SimpleTaprootNoncePair, SimpleTaprootNonceScope,
-	SimpleTaprootSentCommitmentSignature, SIMPLE_TAPROOT_COMMITMENT_NONCE_PREIMAGE,
-	SIMPLE_TAPROOT_COOPERATIVE_CLOSE_NONCE_PREIMAGE,
+	simple_taproot_htlc_spend_info_with_aux_leaf_for_variant,
+	simple_taproot_schnorr_signature_from_htlc_wire_signature, simple_taproot_to_local_spend_info,
+	simple_taproot_to_remote_spend_info, simple_taproot_verify_htlc_tapscript_signature,
+	SimpleTaprootNoncePair, SimpleTaprootNonceScope, SimpleTaprootSentCommitmentSignature,
+	SIMPLE_TAPROOT_COMMITMENT_NONCE_PREIMAGE, SIMPLE_TAPROOT_COOPERATIVE_CLOSE_NONCE_PREIMAGE,
 	SIMPLE_TAPROOT_COUNTERPARTY_COMMITMENT_NONCE_PREIMAGE,
 };
 use crate::ln::simple_taproot::{
@@ -6883,6 +6884,58 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 				&holder_keys.broadcaster_delayed_payment_key,
 				&holder_keys.revocation_key,
 			);
+
+			#[cfg(feature = "simple_taproot_musig2")]
+			if chan_utils::requires_simple_taproot_outputs(funding.get_channel_type()) {
+				let spend_info = chan_utils::simple_taproot_htlc_spend_info_for_htlc(
+					&self.secp_ctx,
+					htlc,
+					funding.get_channel_type(),
+					&holder_keys,
+				)
+				.map_err(|_| {
+					ChannelError::close("Failed to build simple-taproot HTLC spend info".to_owned())
+				})?;
+				let leaf = if htlc.offered { &spend_info.timeout } else { &spend_info.success };
+				let previous_output = TxOut {
+					value: htlc.to_bitcoin_amount(),
+					script_pubkey: spend_info.script_pubkey,
+				};
+				let schnorr_sig =
+					simple_taproot_schnorr_signature_from_htlc_wire_signature(counterparty_sig)
+						.map_err(|_| {
+							ChannelError::close(
+								"Invalid simple-taproot HTLC signature from peer".to_owned(),
+							)
+						})?;
+				let taproot_sig = bitcoin::taproot::Signature {
+					signature: schnorr_sig,
+					sighash_type: bitcoin::sighash::TapSighashType::SinglePlusAnyoneCanPay,
+				};
+				log_trace!(logger, "Checking simple-taproot HTLC signature {} by key {} against tx {} with leaf {} in channel {}.",
+					log_bytes!(counterparty_sig.serialize_compact()[..]),
+					log_bytes!(holder_keys.countersignatory_htlc_key.to_public_key().serialize()),
+					encode::serialize_hex(&htlc_tx),
+					encode::serialize_hex(&leaf.script),
+					&self.channel_id(),
+				);
+				if simple_taproot_verify_htlc_tapscript_signature(
+					&self.secp_ctx,
+					&htlc_tx,
+					0,
+					previous_output,
+					leaf,
+					&holder_keys.countersignatory_htlc_key.to_public_key(),
+					&taproot_sig,
+				)
+				.is_err()
+				{
+					return Err(ChannelError::close(
+						"Invalid simple-taproot HTLC signature from peer".to_owned(),
+					));
+				}
+				continue;
+			}
 
 			let htlc_redeemscript =
 				chan_utils::get_htlc_redeemscript(&htlc, funding.get_channel_type(), &holder_keys);

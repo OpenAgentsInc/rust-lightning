@@ -52,7 +52,7 @@ use super::simple_taproot::{
 	simple_taproot_second_level_htlc_spend_info, simple_taproot_to_local_spend_info,
 	simple_taproot_to_local_spend_info_with_aux_leaf, simple_taproot_to_remote_spend_info,
 	simple_taproot_to_remote_spend_info_with_aux_leaf, SimpleTaprootHtlcScriptVariant,
-	SimpleTaprootKeyAggContext,
+	SimpleTaprootHtlcSpendInfo, SimpleTaprootKeyAggContext, SimpleTaprootMusigError,
 };
 use crate::chain;
 use crate::crypto::utils::{sign, sign_with_aux_rand};
@@ -930,6 +930,26 @@ pub(crate) fn simple_taproot_htlc_script_variant(
 	} else {
 		SimpleTaprootHtlcScriptVariant::Staging
 	}
+}
+
+/// Returns the simple-taproot spend tree for a commitment HTLC using the same
+/// keys and optional aux leaf used to construct the commitment output.
+#[cfg(feature = "simple_taproot_musig2")]
+pub(crate) fn simple_taproot_htlc_spend_info_for_htlc<C: secp256k1::Verification>(
+	secp_ctx: &Secp256k1<C>, htlc: &HTLCOutputInCommitment,
+	channel_type_features: &ChannelTypeFeatures, keys: &TxCreationKeys,
+) -> Result<SimpleTaprootHtlcSpendInfo, SimpleTaprootMusigError> {
+	simple_taproot_htlc_spend_info_with_aux_leaf_for_variant(
+		secp_ctx,
+		htlc.offered,
+		&htlc.payment_hash,
+		htlc.cltv_expiry,
+		&keys.broadcaster_htlc_key.to_public_key(),
+		&keys.countersignatory_htlc_key.to_public_key(),
+		&keys.revocation_key.to_public_key(),
+		htlc.simple_taproot_aux_leaf_script.as_deref(),
+		simple_taproot_htlc_script_variant(channel_type_features),
+	)
 }
 
 #[cfg(not(feature = "simple_taproot_musig2"))]
