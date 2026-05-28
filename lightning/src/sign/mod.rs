@@ -62,8 +62,9 @@ use crate::ln::simple_taproot::{
 };
 #[cfg(feature = "simple_taproot_musig2")]
 use crate::ln::simple_taproot::{
+	simple_taproot_htlc_input_witness, simple_taproot_schnorr_signature_from_htlc_wire_signature,
 	simple_taproot_schnorr_signature_to_htlc_wire_signature,
-	simple_taproot_sign_htlc_tapscript_with_sighash_type,
+	simple_taproot_sign_htlc_tapscript_with_sighash_type, SimpleTaprootHtlcSpendPath,
 };
 use crate::offers::invoice::UnsignedBolt12Invoice;
 use crate::types::features::ChannelTypeFeatures;
@@ -654,6 +655,30 @@ impl HTLCDescriptor {
 	pub fn previous_utxo<C: secp256k1::Signing + secp256k1::Verification>(
 		&self, secp: &Secp256k1<C>,
 	) -> TxOut {
+		#[cfg(feature = "simple_taproot_musig2")]
+		if chan_utils::requires_simple_taproot_outputs(
+			&self.channel_derivation_parameters.transaction_parameters.channel_type_features,
+		) {
+			let channel_params =
+				self.channel_derivation_parameters.transaction_parameters.as_holder_broadcastable();
+			let keys = chan_utils::TxCreationKeys::from_channel_static_keys(
+				&self.per_commitment_point,
+				channel_params.broadcaster_pubkeys(),
+				channel_params.countersignatory_pubkeys(),
+				secp,
+			);
+			let spend_info = chan_utils::simple_taproot_htlc_spend_info_for_htlc(
+				secp,
+				&self.htlc,
+				channel_params.channel_type_features(),
+				&keys,
+			)
+			.expect("valid simple-taproot HTLC output");
+			return TxOut {
+				script_pubkey: spend_info.script_pubkey,
+				value: self.htlc.to_bitcoin_amount(),
+			};
+		}
 		TxOut {
 			script_pubkey: self.witness_script(secp).to_p2wsh(),
 			value: self.htlc.to_bitcoin_amount(),
@@ -734,6 +759,70 @@ impl HTLCDescriptor {
 	/// Returns the fully signed witness required to spend the HTLC output in the commitment
 	/// transaction.
 	pub fn tx_input_witness(&self, signature: &Signature, witness_script: &Script) -> Witness {
+		#[cfg(feature = "simple_taproot_musig2")]
+		if chan_utils::requires_simple_taproot_outputs(
+			&self.channel_derivation_parameters.transaction_parameters.channel_type_features,
+		) {
+			let secp = Secp256k1::new();
+			let channel_params =
+				self.channel_derivation_parameters.transaction_parameters.as_holder_broadcastable();
+			let keys = chan_utils::TxCreationKeys::from_channel_static_keys(
+				&self.per_commitment_point,
+				channel_params.broadcaster_pubkeys(),
+				channel_params.countersignatory_pubkeys(),
+				&secp,
+			);
+			let spend_info = chan_utils::simple_taproot_htlc_spend_info_for_htlc(
+				&secp,
+				&self.htlc,
+				channel_params.channel_type_features(),
+				&keys,
+			)
+			.expect("valid simple-taproot HTLC output");
+			let spend_path = match (self.htlc.offered, self.preimage.is_some()) {
+				(true, false) => SimpleTaprootHtlcSpendPath::OfferedTimeout,
+				(true, true) => SimpleTaprootHtlcSpendPath::OfferedSuccess,
+				(false, false) => SimpleTaprootHtlcSpendPath::AcceptedTimeout,
+				(false, true) => SimpleTaprootHtlcSpendPath::AcceptedSuccess,
+			};
+			let leaf =
+				if self.preimage.is_some() { &spend_info.success } else { &spend_info.timeout };
+			let sighash_type = chan_utils::simple_taproot_htlc_sighash_type(
+				channel_params.channel_type_features(),
+			);
+			let local_signature = bitcoin::taproot::Signature {
+				signature: simple_taproot_schnorr_signature_from_htlc_wire_signature(signature)
+					.expect("valid simple-taproot local HTLC signature"),
+				sighash_type,
+			};
+			let remote_signature = bitcoin::taproot::Signature {
+				signature: simple_taproot_schnorr_signature_from_htlc_wire_signature(
+					&self.counterparty_sig,
+				)
+				.expect("valid simple-taproot remote HTLC signature"),
+				sighash_type,
+			};
+			let needs_local_signature = matches!(
+				spend_path,
+				SimpleTaprootHtlcSpendPath::OfferedTimeout
+					| SimpleTaprootHtlcSpendPath::AcceptedTimeout
+					| SimpleTaprootHtlcSpendPath::AcceptedSuccess
+			);
+			let needs_remote_signature = matches!(
+				spend_path,
+				SimpleTaprootHtlcSpendPath::OfferedTimeout
+					| SimpleTaprootHtlcSpendPath::OfferedSuccess
+					| SimpleTaprootHtlcSpendPath::AcceptedSuccess
+			);
+			return simple_taproot_htlc_input_witness(
+				spend_path,
+				needs_remote_signature.then_some(&remote_signature),
+				needs_local_signature.then_some(&local_signature),
+				self.preimage.as_ref().map(|preimage| &preimage.0),
+				leaf,
+			)
+			.expect("valid simple-taproot HTLC witness");
+		}
 		chan_utils::build_htlc_input_witness(
 			signature,
 			&self.counterparty_sig,
@@ -2200,6 +2289,43 @@ impl EcdsaChannelSigner for InMemorySigner {
 		let htlc_basepoint = channel_parameters.holder_pubkeys.htlc_basepoint;
 		let htlcpubkey = HtlcKey::from_basepoint(&secp_ctx, &htlc_basepoint, &per_commitment_point);
 		let chan_type = &channel_parameters.channel_type_features;
+		#[cfg(feature = "simple_taproot_musig2")]
+		if chan_utils::requires_simple_taproot_outputs(chan_type) {
+			let directed_parameters = channel_parameters.as_counterparty_broadcastable();
+			let keys = chan_utils::TxCreationKeys::from_channel_static_keys(
+				per_commitment_point,
+				directed_parameters.broadcaster_pubkeys(),
+				directed_parameters.countersignatory_pubkeys(),
+				secp_ctx,
+			);
+			let spend_info = chan_utils::simple_taproot_htlc_spend_info_for_htlc(
+				secp_ctx,
+				htlc,
+				directed_parameters.channel_type_features(),
+				&keys,
+			)
+			.map_err(|_| ())?;
+			let leaf = if htlc.offered { &spend_info.success } else { &spend_info.timeout };
+			let previous_output =
+				TxOut { value: Amount::from_sat(amount), script_pubkey: spend_info.script_pubkey };
+			let taproot_signature = simple_taproot_sign_htlc_tapscript_with_sighash_type(
+				secp_ctx,
+				htlc_tx,
+				input,
+				previous_output,
+				leaf,
+				&htlc_key,
+				&self.get_secure_random_bytes(),
+				chan_utils::simple_taproot_htlc_sighash_type(
+					directed_parameters.channel_type_features(),
+				),
+			)
+			.map_err(|_| ())?;
+			return simple_taproot_schnorr_signature_to_htlc_wire_signature(
+				&taproot_signature.signature,
+			)
+			.map_err(|_| ());
+		}
 		let witness_script = chan_utils::get_htlc_redeemscript_with_explicit_keys(
 			&htlc,
 			chan_type,

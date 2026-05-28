@@ -18,6 +18,8 @@ use bitcoin::locktime::absolute::LockTime;
 use bitcoin::script::{Script, ScriptBuf};
 use bitcoin::secp256k1::{PublicKey, SecretKey};
 use bitcoin::sighash::EcdsaSighashType;
+#[cfg(feature = "simple_taproot_musig2")]
+use bitcoin::taproot::Signature as TaprootSignature;
 use bitcoin::transaction::OutPoint as BitcoinOutPoint;
 use bitcoin::transaction::Version;
 use bitcoin::transaction::{Transaction, TxIn, TxOut};
@@ -37,6 +39,11 @@ use crate::ln::chan_utils::{
 use crate::ln::channel_keys::{DelayedPaymentBasepoint, HtlcBasepoint};
 use crate::ln::channelmanager::MIN_CLTV_EXPIRY_DELTA;
 use crate::ln::msgs::DecodeError;
+#[cfg(feature = "simple_taproot_musig2")]
+use crate::ln::simple_taproot::{
+	simple_taproot_htlc_input_witness, simple_taproot_schnorr_signature_from_htlc_wire_signature,
+	SimpleTaprootHtlcSpendPath,
+};
 use crate::sign::ecdsa::EcdsaChannelSigner;
 use crate::sign::{ChannelDerivationParameters, HTLCDescriptor};
 use crate::types::features::ChannelTypeFeatures;
@@ -112,6 +119,16 @@ pub(crate) fn verify_channel_type_features(channel_type_features: &Option<Channe
 	}
 
 	Ok(())
+}
+
+#[cfg(feature = "simple_taproot_musig2")]
+fn taproot_htlc_signature_from_wire(
+	signature: &bitcoin::secp256k1::ecdsa::Signature, channel_type: &ChannelTypeFeatures,
+) -> Option<TaprootSignature> {
+	Some(TaprootSignature {
+		signature: simple_taproot_schnorr_signature_from_htlc_wire_signature(signature).ok()?,
+		sighash_type: chan_utils::simple_taproot_htlc_sighash_type(channel_type),
+	})
 }
 
 // number_of_witness_elements + sig_length + revocation_sig + true_length + op_true + witness_script_length + witness_script
@@ -561,6 +578,61 @@ impl HolderHTLCOutput {
 		if let Ok(htlc_sig) = onchain_tx_handler.signer.sign_holder_htlc_transaction(
 			&htlc_tx, 0, &htlc_descriptor, &onchain_tx_handler.secp_ctx,
 		) {
+			#[cfg(feature = "simple_taproot_musig2")]
+			if chan_utils::requires_simple_taproot_outputs(
+				&channel_parameters.channel_type_features,
+			) {
+				let spend_info = chan_utils::simple_taproot_htlc_spend_info_for_htlc(
+					&onchain_tx_handler.secp_ctx,
+					&htlc_descriptor.htlc,
+					directed_parameters.channel_type_features(),
+					&keys,
+				)
+				.ok()?;
+				let spend_path = match (
+					htlc_descriptor.htlc.offered,
+					htlc_descriptor.preimage.is_some(),
+				) {
+					(true, false) => SimpleTaprootHtlcSpendPath::OfferedTimeout,
+					(true, true) => SimpleTaprootHtlcSpendPath::OfferedSuccess,
+					(false, false) => SimpleTaprootHtlcSpendPath::AcceptedTimeout,
+					(false, true) => SimpleTaprootHtlcSpendPath::AcceptedSuccess,
+				};
+				let leaf = if htlc_descriptor.preimage.is_some() {
+					&spend_info.success
+				} else {
+					&spend_info.timeout
+				};
+				let local_signature = taproot_htlc_signature_from_wire(
+					&htlc_sig,
+					&channel_parameters.channel_type_features,
+				)?;
+				let remote_signature = taproot_htlc_signature_from_wire(
+					&htlc_descriptor.counterparty_sig,
+					&channel_parameters.channel_type_features,
+				)?;
+				let needs_local_signature = matches!(
+					spend_path,
+					SimpleTaprootHtlcSpendPath::OfferedTimeout
+						| SimpleTaprootHtlcSpendPath::AcceptedTimeout
+						| SimpleTaprootHtlcSpendPath::AcceptedSuccess
+				);
+				let needs_remote_signature = matches!(
+					spend_path,
+					SimpleTaprootHtlcSpendPath::OfferedTimeout
+						| SimpleTaprootHtlcSpendPath::OfferedSuccess
+						| SimpleTaprootHtlcSpendPath::AcceptedSuccess
+				);
+				htlc_tx.input[0].witness = simple_taproot_htlc_input_witness(
+					spend_path,
+					needs_remote_signature.then_some(&remote_signature),
+					needs_local_signature.then_some(&local_signature),
+					htlc_descriptor.preimage.as_ref().map(|preimage| &preimage.0),
+					leaf,
+				)
+				.ok()?;
+				return Some(MaybeSignedTransaction(htlc_tx));
+			}
 			let htlc_redeem_script = chan_utils::get_htlc_redeemscript_with_explicit_keys(
 				&htlc_descriptor.htlc, &channel_parameters.channel_type_features,
 				&keys.broadcaster_htlc_key, &keys.countersignatory_htlc_key, &keys.revocation_key,
@@ -854,12 +926,16 @@ impl PackageSolvingData {
 		let sequence = match self {
 			PackageSolvingData::RevokedOutput(_) => Sequence::ENABLE_RBF_NO_LOCKTIME,
 			PackageSolvingData::RevokedHTLCOutput(_) => Sequence::ENABLE_RBF_NO_LOCKTIME,
-			PackageSolvingData::CounterpartyOfferedHTLCOutput(outp) => if outp.channel_type_features.supports_anchors_zero_fee_htlc_tx() {
+			PackageSolvingData::CounterpartyOfferedHTLCOutput(outp) => if outp.channel_type_features.supports_anchors_zero_fee_htlc_tx()
+				|| chan_utils::requires_simple_taproot_outputs(&outp.channel_type_features)
+			{
 				Sequence::from_consensus(1)
 			} else {
 				Sequence::ENABLE_RBF_NO_LOCKTIME
 			},
-			PackageSolvingData::CounterpartyReceivedHTLCOutput(outp) => if outp.channel_type_features.supports_anchors_zero_fee_htlc_tx() {
+			PackageSolvingData::CounterpartyReceivedHTLCOutput(outp) => if outp.channel_type_features.supports_anchors_zero_fee_htlc_tx()
+				|| chan_utils::requires_simple_taproot_outputs(&outp.channel_type_features)
+			{
 				Sequence::from_consensus(1)
 			} else {
 				Sequence::ENABLE_RBF_NO_LOCKTIME
@@ -947,6 +1023,40 @@ impl PackageSolvingData {
 					&outp.per_commitment_point, directed_parameters.broadcaster_pubkeys(),
 					directed_parameters.countersignatory_pubkeys(), &onchain_handler.secp_ctx,
 				);
+				#[cfg(feature = "simple_taproot_musig2")]
+				if chan_utils::requires_simple_taproot_outputs(&channel_parameters.channel_type_features) {
+					let spend_info = match chan_utils::simple_taproot_htlc_spend_info_for_htlc(
+						&onchain_handler.secp_ctx,
+						&outp.htlc,
+						directed_parameters.channel_type_features(),
+						&chan_keys,
+					) {
+						Ok(spend_info) => spend_info,
+						Err(_) => return false,
+					};
+					let sig = match onchain_handler.signer.sign_counterparty_htlc_transaction(channel_parameters, &bumped_tx, i, &outp.htlc.amount_msat / 1000, &outp.per_commitment_point, &outp.htlc, &onchain_handler.secp_ctx) {
+						Ok(sig) => sig,
+						Err(_) => return false,
+					};
+					let remote_signature = match taproot_htlc_signature_from_wire(
+						&sig,
+						&channel_parameters.channel_type_features,
+					) {
+						Some(signature) => signature,
+						None => return false,
+					};
+					bumped_tx.input[i].witness = match simple_taproot_htlc_input_witness(
+						SimpleTaprootHtlcSpendPath::OfferedSuccess,
+						Some(&remote_signature),
+						None,
+						Some(&outp.preimage.0),
+						&spend_info.success,
+					) {
+						Ok(witness) => witness,
+						Err(_) => return false,
+					};
+					return true;
+				}
 				let witness_script = chan_utils::get_htlc_redeemscript(
 					&outp.htlc, &channel_parameters.channel_type_features, &chan_keys,
 				);
@@ -974,6 +1084,40 @@ impl PackageSolvingData {
 					&outp.per_commitment_point, directed_parameters.broadcaster_pubkeys(),
 					directed_parameters.countersignatory_pubkeys(), &onchain_handler.secp_ctx,
 				);
+				#[cfg(feature = "simple_taproot_musig2")]
+				if chan_utils::requires_simple_taproot_outputs(&channel_parameters.channel_type_features) {
+					let spend_info = match chan_utils::simple_taproot_htlc_spend_info_for_htlc(
+						&onchain_handler.secp_ctx,
+						&outp.htlc,
+						directed_parameters.channel_type_features(),
+						&chan_keys,
+					) {
+						Ok(spend_info) => spend_info,
+						Err(_) => return false,
+					};
+					let sig = match onchain_handler.signer.sign_counterparty_htlc_transaction(channel_parameters, &bumped_tx, i, &outp.htlc.amount_msat / 1000, &outp.per_commitment_point, &outp.htlc, &onchain_handler.secp_ctx) {
+						Ok(sig) => sig,
+						Err(_) => return false,
+					};
+					let local_signature = match taproot_htlc_signature_from_wire(
+						&sig,
+						&channel_parameters.channel_type_features,
+					) {
+						Some(signature) => signature,
+						None => return false,
+					};
+					bumped_tx.input[i].witness = match simple_taproot_htlc_input_witness(
+						SimpleTaprootHtlcSpendPath::AcceptedTimeout,
+						None,
+						Some(&local_signature),
+						None,
+						&spend_info.timeout,
+					) {
+						Ok(witness) => witness,
+						Err(_) => return false,
+					};
+					return true;
+				}
 				let witness_script = chan_utils::get_htlc_redeemscript(
 					&outp.htlc, &channel_parameters.channel_type_features, &chan_keys,
 				);
@@ -1767,17 +1911,32 @@ fn feerate_bump<F: FeeEstimator, L: Logger>(
 
 #[cfg(test)]
 mod tests {
+	#[cfg(feature = "simple_taproot_musig2")]
+	use crate::chain::onchaintx::OnchainTxHandler;
 	use crate::chain::package::{
 		feerate_bump, weight_offered_htlc, weight_received_htlc, CounterpartyOfferedHTLCOutput,
 		CounterpartyReceivedHTLCOutput, HolderFundingOutput, HolderHTLCOutput, PackageSolvingData,
 		PackageTemplate, RevokedHTLCOutput, RevokedOutput, WEIGHT_REVOKED_OUTPUT,
 	};
 	use crate::chain::Txid;
+	#[cfg(feature = "simple_taproot_musig2")]
+	use crate::ln::chan_utils::{
+		self, ChannelPublicKeys, CounterpartyChannelTransactionParameters, TxCreationKeys,
+	};
 	use crate::ln::chan_utils::{
 		ChannelTransactionParameters, HTLCOutputInCommitment, HolderCommitmentTransaction,
 	};
+	#[cfg(feature = "simple_taproot_musig2")]
+	use crate::ln::channel_keys::{DelayedPaymentBasepoint, HtlcBasepoint, RevocationBasepoint};
+	#[cfg(feature = "simple_taproot_musig2")]
 	use crate::ln::msgs::DecodeError;
+	#[cfg(feature = "simple_taproot_musig2")]
+	use crate::ln::simple_taproot::simple_taproot_verify_htlc_tapscript_signature;
+	#[cfg(feature = "simple_taproot_musig2")]
+	use crate::ln::types::ChannelId;
 	use crate::sign::{ChannelDerivationParameters, HTLCDescriptor};
+	#[cfg(feature = "simple_taproot_musig2")]
+	use crate::sign::{ChannelSigner, InMemorySigner};
 	use crate::types::payment::{PaymentHash, PaymentPreimage};
 
 	use bitcoin::absolute::LockTime;
@@ -1811,6 +1970,139 @@ mod tests {
 			super::verify_channel_type_features(&Some(unknown_required), None),
 			Err(DecodeError::UnknownRequiredFeature)
 		);
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	#[test]
+	fn simple_taproot_counterparty_htlc_claim_uses_taproot_witness_and_csv_sequence() {
+		let secp_ctx = Secp256k1::new();
+		let make_secret = |byte| SecretKey::from_slice(&[byte; 32]).unwrap();
+		let signer = InMemorySigner::new(
+			make_secret(41),
+			make_secret(42),
+			make_secret(43),
+			make_secret(44),
+			true,
+			make_secret(45),
+			make_secret(46),
+			[47; 32],
+			[48; 32],
+			[49; 32],
+		);
+		let counterparty_pubkeys = ChannelPublicKeys {
+			funding_pubkey: PublicKey::from_secret_key(&secp_ctx, &make_secret(51)),
+			revocation_basepoint: RevocationBasepoint::from(PublicKey::from_secret_key(
+				&secp_ctx,
+				&make_secret(52),
+			)),
+			payment_point: PublicKey::from_secret_key(&secp_ctx, &make_secret(53)),
+			delayed_payment_basepoint: DelayedPaymentBasepoint::from(PublicKey::from_secret_key(
+				&secp_ctx,
+				&make_secret(54),
+			)),
+			htlc_basepoint: HtlcBasepoint::from(PublicKey::from_secret_key(
+				&secp_ctx,
+				&make_secret(55),
+			)),
+		};
+		let counterparty_node_id = counterparty_pubkeys.funding_pubkey;
+		let mut channel_parameters = ChannelTransactionParameters::test_dummy(100_000);
+		channel_parameters.holder_pubkeys = signer.pubkeys(&secp_ctx);
+		channel_parameters.counterparty_parameters =
+			Some(CounterpartyChannelTransactionParameters {
+				pubkeys: counterparty_pubkeys,
+				selected_contest_delay: 43,
+			});
+		channel_parameters.channel_type_features =
+			ChannelTypeFeatures::taproot_asset_single_asset();
+
+		let preimage = PaymentPreimage([2; 32]);
+		let htlc = HTLCOutputInCommitment {
+			offered: true,
+			amount_msat: 1_000_000,
+			cltv_expiry: 144,
+			payment_hash: PaymentHash::from(preimage),
+			transaction_output_index: Some(0),
+			simple_taproot_aux_leaf_script: None,
+			simple_taproot_second_level_aux_leaf_script: None,
+		};
+		let per_commitment_point = PublicKey::from_secret_key(&secp_ctx, &make_secret(56));
+		let package = PackageTemplate::build_package(
+			fake_txid(101),
+			0,
+			PackageSolvingData::CounterpartyOfferedHTLCOutput(
+				CounterpartyOfferedHTLCOutput::build(
+					per_commitment_point,
+					preimage,
+					htlc.clone(),
+					channel_parameters.clone(),
+					None,
+				),
+			),
+			0,
+		);
+
+		let holder_commitment = HolderCommitmentTransaction::dummy(
+			100_000,
+			channel_parameters.funding_outpoint.unwrap(),
+			Vec::new(),
+		);
+		let mut tx_handler = OnchainTxHandler::new(
+			ChannelId::from_bytes([0; 32]),
+			counterparty_node_id,
+			100_000,
+			[48; 32],
+			ScriptBuf::new(),
+			signer,
+			channel_parameters.clone(),
+			holder_commitment,
+			secp_ctx.clone(),
+		);
+		let claim_tx = package
+			.maybe_finalize_malleable_package(
+				1,
+				&mut tx_handler,
+				Amount::from_sat(900),
+				ScriptBuf::new(),
+				&TestLogger::new(),
+			)
+			.unwrap()
+			.0;
+
+		assert_eq!(claim_tx.input[0].sequence, bitcoin::Sequence::from_consensus(1));
+		let witness = &claim_tx.input[0].witness;
+		assert_eq!(witness.len(), 4);
+		assert_eq!(&witness[1], preimage.0.as_slice());
+
+		let directed_parameters = channel_parameters.as_counterparty_broadcastable();
+		let keys = TxCreationKeys::from_channel_static_keys(
+			&per_commitment_point,
+			directed_parameters.broadcaster_pubkeys(),
+			directed_parameters.countersignatory_pubkeys(),
+			&secp_ctx,
+		);
+		let spend_info = chan_utils::simple_taproot_htlc_spend_info_for_htlc(
+			&secp_ctx,
+			&htlc,
+			directed_parameters.channel_type_features(),
+			&keys,
+		)
+		.unwrap();
+		assert_eq!(&witness[2], spend_info.success.script.as_bytes());
+		assert!(witness[3].len() >= 33);
+		assert_eq!((witness[3].len() - 33) % 32, 0);
+
+		let taproot_signature = bitcoin::taproot::Signature::from_slice(&witness[0]).unwrap();
+		simple_taproot_verify_htlc_tapscript_signature(
+			&secp_ctx,
+			&claim_tx,
+			0,
+			TxOut { value: htlc.to_bitcoin_amount(), script_pubkey: spend_info.script_pubkey },
+			&spend_info.success,
+			&keys.countersignatory_htlc_key.to_public_key(),
+			&taproot_signature,
+		)
+		.unwrap();
 	}
 
 	#[rustfmt::skip]
