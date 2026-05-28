@@ -83,6 +83,9 @@ fn simple_taproot_cooperative_close_uses_closing_complete_and_sig() {
 	let node_0_tx = nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap().remove(0);
 	assert_eq!(node_0_tx, node_1_tx);
 	check_spends!(node_0_tx, funding_tx);
+	assert_eq!(node_0_tx.input.len(), 1);
+	assert_eq!(node_0_tx.input[0].witness.len(), 1);
+	assert_eq!(node_0_tx.input[0].witness[0].len(), 64);
 
 	check_closed_event(
 		&nodes[0],
