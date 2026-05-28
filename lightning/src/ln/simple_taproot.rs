@@ -1693,9 +1693,9 @@ pub fn simple_taproot_htlc_input_witness(
 		},
 		SimpleTaprootHtlcSpendPath::AcceptedSuccess => {
 			witness
-				.push(local_signature.ok_or(SimpleTaprootMusigError::InvalidSignature)?.to_vec());
-			witness
 				.push(remote_signature.ok_or(SimpleTaprootMusigError::InvalidSignature)?.to_vec());
+			witness
+				.push(local_signature.ok_or(SimpleTaprootMusigError::InvalidSignature)?.to_vec());
 			witness.push(preimage.ok_or(SimpleTaprootMusigError::InvalidSignature)?.to_vec());
 		},
 	}
@@ -3030,8 +3030,8 @@ mod tests {
 		let remote_success_signature = signed_success.remote_signature.as_ref().unwrap().to_vec();
 		assert_eq!(local_success_signature.len(), 65);
 		assert_eq!(remote_success_signature.len(), 65);
-		assert_eq!(&signed_success.witness[0], local_success_signature.as_slice());
-		assert_eq!(&signed_success.witness[1], remote_success_signature.as_slice());
+		assert_eq!(&signed_success.witness[0], remote_success_signature.as_slice());
+		assert_eq!(&signed_success.witness[1], local_success_signature.as_slice());
 		assert_eq!(&signed_success.witness[2], &preimage[..]);
 	}
 
