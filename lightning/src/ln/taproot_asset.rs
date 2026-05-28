@@ -331,6 +331,35 @@ impl TaprootAssetChannelAssetTemplate {
 		self.total_amount
 	}
 
+	/// Returns a template for an asset spend from a later channel output.
+	///
+	/// Lightning Labs derives second-level HTLC asset leaves from the HTLC
+	/// output created by the commitment transaction, not directly from the
+	/// original funding proof. This keeps the bounded full-amount helper on the
+	/// same previous-outpoint boundary when the commitment txid and output index
+	/// are known.
+	pub fn with_previous_asset_output(
+		&self, previous_outpoint_txid: [u8; 32], previous_outpoint_vout: u32,
+		previous_script_key: [u8; 33], previous_tx_witness: Option<Vec<u8>>,
+	) -> Result<Self, TaprootAssetChannelAssetTemplateError> {
+		Self::new_with_previous_tx_witness(
+			self.asset_id,
+			self.total_amount,
+			self.genesis_outpoint_txid,
+			self.genesis_outpoint_vout,
+			self.genesis_tag.clone(),
+			self.genesis_meta_hash,
+			self.genesis_output_index,
+			self.asset_type,
+			self.tap_commitment_key,
+			self.group_key,
+			previous_outpoint_txid,
+			previous_outpoint_vout,
+			previous_script_key,
+			previous_tx_witness,
+		)
+	}
+
 	fn validate(&self) -> Result<(), TaprootAssetChannelAssetTemplateError> {
 		if self.asset_id == [0; TAPROOT_ASSET_ID_LEN] {
 			return Err(TaprootAssetChannelAssetTemplateError::ZeroAssetId);
