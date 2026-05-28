@@ -81,6 +81,7 @@ use crate::ln::script::{self, ShutdownScript};
 #[cfg(feature = "simple_taproot_musig2")]
 use crate::ln::simple_taproot::{
 	simple_taproot_htlc_spend_info_with_aux_leaf_for_variant,
+	simple_taproot_htlc_tapscript_sighash,
 	simple_taproot_schnorr_signature_from_htlc_wire_signature,
 	simple_taproot_second_level_htlc_spend_info, simple_taproot_to_local_spend_info,
 	simple_taproot_to_remote_spend_info, simple_taproot_verify_htlc_tapscript_signature,
@@ -6958,11 +6959,59 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 						funding.get_channel_type(),
 					),
 				};
-				log_trace!(logger, "Checking simple-taproot HTLC signature {} by key {} against tx {} with leaf {} in channel {}.",
+				let htlc_sighash = simple_taproot_htlc_tapscript_sighash(
+					&htlc_tx,
+					0,
+					previous_output.clone(),
+					leaf,
+					taproot_sig.sighash_type,
+				)
+				.map_err(|_| {
+					ChannelError::close(
+						"Failed to compute simple-taproot HTLC signature transcript".to_owned(),
+					)
+				})?;
+				let htlc_tx_outputs = htlc_tx
+					.output
+					.iter()
+					.enumerate()
+					.map(|(idx, output)| {
+						format!(
+							"{}:{}:{}",
+							idx,
+							output.value.to_sat(),
+							encode::serialize_hex(&output.script_pubkey)
+						)
+					})
+					.collect::<Vec<_>>()
+					.join(",");
+				let first_level_aux_leaf = htlc_for_signature
+					.simple_taproot_aux_leaf_script
+					.as_ref()
+					.map(|script| encode::serialize_hex(script))
+					.unwrap_or_else(|| "none".to_owned());
+				let second_level_aux_leaf = htlc_for_signature
+					.simple_taproot_second_level_aux_leaf_script
+					.as_ref()
+					.map(|script| encode::serialize_hex(script))
+					.unwrap_or_else(|| "none".to_owned());
+				log_trace!(logger, "Checking simple-taproot HTLC signature {} by key {} against tx {} with tx_outputs [{}], commitment_output_index {}, previous_output_value_sat {}, previous_output_script {}, commitment_output_value_sat {}, commitment_output_script {}, leaf {}, control_block {}, first_level_aux_leaf {}, second_level_aux_leaf {}, sighash_type {:?}, sighash {}, adjusted_for_taproot_asset {} in channel {}.",
 					log_bytes!(counterparty_sig.serialize_compact()[..]),
 					log_bytes!(holder_keys.countersignatory_htlc_key.to_public_key().serialize()),
 					encode::serialize_hex(&htlc_tx),
+					htlc_tx_outputs,
+					htlc_output_index,
+					previous_output.value.to_sat(),
+					encode::serialize_hex(&previous_output.script_pubkey),
+					actual_htlc_output.value.to_sat(),
+					encode::serialize_hex(&actual_htlc_output.script_pubkey),
 					encode::serialize_hex(&leaf.script),
+					log_bytes!(leaf.control_block[..]),
+					first_level_aux_leaf,
+					second_level_aux_leaf,
+					taproot_sig.sighash_type,
+					log_bytes!(htlc_sighash[..]),
+					adjusted_htlc.is_some(),
 					&self.channel_id(),
 				);
 				if simple_taproot_verify_htlc_tapscript_signature(
