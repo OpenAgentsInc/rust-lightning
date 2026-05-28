@@ -5569,6 +5569,7 @@ impl<
 			bolt12_invoice: None,
 			session_priv_bytes,
 			hold_htlc_at_next_hop: false,
+			taproot_asset_htlc_blob: None,
 		})
 	}
 
@@ -5584,6 +5585,7 @@ impl<
 			bolt12_invoice,
 			session_priv_bytes,
 			hold_htlc_at_next_hop,
+			taproot_asset_htlc_blob,
 		} = args;
 		// The top-level caller should hold the total_consistency_lock read lock.
 		debug_assert!(self.total_consistency_lock.try_write().is_err());
@@ -5666,6 +5668,7 @@ impl<
 							htlc_source,
 							onion_packet,
 							None,
+							taproot_asset_htlc_blob,
 							hold_htlc_at_next_hop,
 							false, // Not accountable by default for sender.
 							&self.fee_estimator,
@@ -6253,6 +6256,40 @@ impl<
 			best_block_height,
 			&self.pending_events,
 			|args| self.send_payment_along_path(args),
+			None,
+			&WithContext::for_payment(&self.logger, None, None, payment_hash, payment_id),
+		)
+	}
+
+	/// Send a spontaneous payment carrying a Taproot Asset HTLC blob on the first-hop
+	/// `update_add_htlc`.
+	///
+	/// This is an experimental OpenAgents extension for the Taproot Assets proof-of-concept.
+	/// The blob is only supported for single-path payments; multi-path sends fail before any HTLC
+	/// is committed.
+	pub fn send_spontaneous_payment_with_taproot_asset_htlc_blob(
+		&self, payment_preimage: Option<PaymentPreimage>, recipient_onion: RecipientOnionFields,
+		payment_id: PaymentId, route_params: RouteParameters, retry_strategy: Retry,
+		taproot_asset_htlc_blob: Vec<u8>,
+	) -> Result<PaymentHash, RetryableSendFailure> {
+		let best_block_height = self.best_block.read().unwrap().height;
+		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
+		let payment_hash = payment_preimage.map(|preimage| preimage.into());
+		self.pending_outbound_payments.send_spontaneous_payment(
+			payment_preimage,
+			recipient_onion,
+			payment_id,
+			retry_strategy,
+			route_params,
+			&self.router,
+			self.list_usable_channels(),
+			|| self.compute_inflight_htlcs(),
+			&self.entropy_source,
+			&self.node_signer,
+			best_block_height,
+			&self.pending_events,
+			|args| self.send_payment_along_path(args),
+			Some(taproot_asset_htlc_blob),
 			&WithContext::for_payment(&self.logger, None, None, payment_hash, payment_id),
 		)
 	}

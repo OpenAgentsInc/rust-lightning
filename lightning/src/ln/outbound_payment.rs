@@ -937,6 +937,7 @@ pub(super) struct SendAlongPathArgs<'a> {
 	pub bolt12_invoice: Option<&'a PaidBolt12Invoice>,
 	pub session_priv_bytes: [u8; 32],
 	pub hold_htlc_at_next_hop: bool,
+	pub taproot_asset_htlc_blob: Option<Vec<u8>>,
 }
 
 pub(super) struct OutboundPayments {
@@ -1006,7 +1007,7 @@ impl OutboundPayments {
 	{
 		self.send_payment_for_non_bolt12_invoice(payment_id, payment_hash, recipient_onion, None, retry_strategy,
 			route_params, router, first_hops, &compute_inflight_htlcs, entropy_source, node_signer,
-			best_block_height, pending_events, &send_payment_along_path, logger)
+			best_block_height, pending_events, &send_payment_along_path, None, logger)
 	}
 
 	#[rustfmt::skip]
@@ -1016,7 +1017,7 @@ impl OutboundPayments {
 		first_hops: Vec<ChannelDetails>, inflight_htlcs: IH, entropy_source: &ES,
 		node_signer: &NS, best_block_height: u32,
 		pending_events: &Mutex<VecDeque<(events::Event, Option<EventCompletionAction>)>>, send_payment_along_path: SP,
-		logger: &WithContext<L>,
+		taproot_asset_htlc_blob: Option<Vec<u8>>, logger: &WithContext<L>,
 	) -> Result<PaymentHash, RetryableSendFailure>
 	where
 		IH: Fn() -> InFlightHtlcs,
@@ -1027,7 +1028,8 @@ impl OutboundPayments {
 		let payment_hash = PaymentHash(Sha256::hash(&preimage.0).to_byte_array());
 		self.send_payment_for_non_bolt12_invoice(payment_id, payment_hash, recipient_onion, Some(preimage),
 			retry_strategy, route_params, router, first_hops, inflight_htlcs, entropy_source,
-			node_signer, best_block_height,  pending_events, send_payment_along_path, logger,
+			node_signer, best_block_height,  pending_events, send_payment_along_path,
+			taproot_asset_htlc_blob, logger,
 		)
 		.map(|()| payment_hash)
 	}
@@ -1085,7 +1087,7 @@ impl OutboundPayments {
 		self.send_payment_for_non_bolt12_invoice(payment_id, payment_hash, recipient_onion, None, optional_params.retry_strategy, route_params,
 			router, first_hops, compute_inflight_htlcs,
 			entropy_source, node_signer, best_block_height,
-			pending_events, send_payment_along_path, logger,
+			pending_events, send_payment_along_path, None, logger,
 		).map_err(|err| Bolt11PaymentError::SendingFailed(err))
 	}
 
@@ -1221,7 +1223,7 @@ impl OutboundPayments {
 		let result = self.pay_route_internal(
 			&route, payment_hash, &recipient_onion, keysend_preimage, invoice_request, Some(&bolt12_invoice), payment_id,
 			&onion_session_privs, hold_htlcs_at_next_hop, node_signer,
-			best_block_height, &send_payment_along_path
+			best_block_height, &send_payment_along_path, None
 		);
 		log_info!(
 			logger, "Sending payment with id {} and hash {} returned {:?}", payment_id,
@@ -1231,7 +1233,7 @@ impl OutboundPayments {
 			self.handle_pay_route_err(
 				e, payment_id, payment_hash, route, route_params, onion_session_privs, router, first_hops,
 				&inflight_htlcs, entropy_source, node_signer, best_block_height,  pending_events,
-				&send_payment_along_path, logger,
+				&send_payment_along_path, None, logger,
 			);
 		}
 		Ok(())
@@ -1490,6 +1492,7 @@ impl OutboundPayments {
 					best_block_height,
 					pending_events,
 					&send_payment_along_path,
+					None,
 					logger,
 				);
 				should_persist = true;
@@ -1590,7 +1593,7 @@ impl OutboundPayments {
 		router: &R, first_hops: Vec<ChannelDetails>, inflight_htlcs: IH, entropy_source: &ES,
 		node_signer: &NS, best_block_height: u32,
 		pending_events: &Mutex<VecDeque<(events::Event, Option<EventCompletionAction>)>>, send_payment_along_path: SP,
-		logger: &WithContext<L>,
+		taproot_asset_htlc_blob: Option<Vec<u8>>, logger: &WithContext<L>,
 	) -> Result<(), RetryableSendFailure>
 	where
 		IH: Fn() -> InFlightHtlcs,
@@ -1612,14 +1615,14 @@ impl OutboundPayments {
 
 		let res = self.pay_route_internal(&route, payment_hash, &recipient_onion,
 			keysend_preimage, None, None, payment_id, &onion_session_privs, false, node_signer,
-			best_block_height, &send_payment_along_path);
+			best_block_height, &send_payment_along_path, taproot_asset_htlc_blob.as_ref());
 		log_info!(logger, "Sending payment with id {} and hash {} returned {:?}",
 			payment_id, payment_hash, res);
 		if let Err(e) = res {
 			self.handle_pay_route_err(
 				e, payment_id, payment_hash, route, route_params, onion_session_privs, router, first_hops,
 				&inflight_htlcs, entropy_source, node_signer, best_block_height, pending_events,
-				&send_payment_along_path, logger,
+				&send_payment_along_path, taproot_asset_htlc_blob.as_ref(), logger,
 			);
 		}
 		Ok(())
@@ -1631,7 +1634,8 @@ impl OutboundPayments {
 		router: &R, first_hops: Vec<ChannelDetails>, inflight_htlcs: &IH, entropy_source: &ES,
 		node_signer: &NS, best_block_height: u32,
 		pending_events: &Mutex<VecDeque<(events::Event, Option<EventCompletionAction>)>>,
-		send_payment_along_path: &SP, logger: &WithContext<L>,
+		send_payment_along_path: &SP, taproot_asset_htlc_blob: Option<&Vec<u8>>,
+		logger: &WithContext<L>,
 	)
 	where
 		IH: Fn() -> InFlightHtlcs,
@@ -1763,13 +1767,14 @@ impl OutboundPayments {
 		};
 		let res = self.pay_route_internal(&route, payment_hash, &recipient_onion, keysend_preimage,
 			invoice_request.as_ref(), bolt12_invoice.as_ref(), payment_id,
-			&onion_session_privs, false, node_signer, best_block_height, &send_payment_along_path);
+			&onion_session_privs, false, node_signer, best_block_height, &send_payment_along_path,
+			taproot_asset_htlc_blob);
 		log_info!(logger, "Result retrying payment id {}: {:?}", &payment_id, res);
 		if let Err(e) = res {
 			self.handle_pay_route_err(
 				e, payment_id, payment_hash, route, route_params, onion_session_privs, router, first_hops,
 				inflight_htlcs, entropy_source, node_signer, best_block_height, pending_events,
-				send_payment_along_path, logger
+				send_payment_along_path, taproot_asset_htlc_blob, logger
 			);
 		}
 	}
@@ -1781,7 +1786,8 @@ impl OutboundPayments {
 		first_hops: Vec<ChannelDetails>, inflight_htlcs: &IH, entropy_source: &ES, node_signer: &NS,
 		best_block_height: u32,
 		pending_events: &Mutex<VecDeque<(events::Event, Option<EventCompletionAction>)>>,
-		send_payment_along_path: &SP, logger: &WithContext<L>,
+		send_payment_along_path: &SP, taproot_asset_htlc_blob: Option<&Vec<u8>>,
+		logger: &WithContext<L>,
 	)
 	where
 		IH: Fn() -> InFlightHtlcs,
@@ -1791,7 +1797,7 @@ impl OutboundPayments {
 			PaymentSendFailure::AllFailedResendSafe(errs) => {
 				self.remove_session_privs(payment_id, route.paths.iter().zip(onion_session_privs.iter()));
 				Self::push_path_failed_evs_and_scids(payment_id, payment_hash, &mut route_params, route.paths, errs.into_iter().map(|e| Err(e)), pending_events, logger);
-				self.find_route_and_send_payment(payment_hash, payment_id, route_params, router, first_hops, inflight_htlcs, entropy_source, node_signer, best_block_height, pending_events, send_payment_along_path, logger);
+				self.find_route_and_send_payment(payment_hash, payment_id, route_params, router, first_hops, inflight_htlcs, entropy_source, node_signer, best_block_height, pending_events, send_payment_along_path, taproot_asset_htlc_blob, logger);
 			},
 			PaymentSendFailure::PartialFailure { failed_paths_retry: Some(mut retry), results, .. } => {
 				debug_assert_eq!(results.len(), route.paths.len());
@@ -1811,7 +1817,7 @@ impl OutboundPayments {
 				// Some paths were sent, even if we failed to send the full MPP value our recipient may
 				// misbehave and claim the funds, at which point we have to consider the payment sent, so
 				// return `Ok()` here, ignoring any retry errors.
-				self.find_route_and_send_payment(payment_hash, payment_id, retry, router, first_hops, inflight_htlcs, entropy_source, node_signer, best_block_height,  pending_events, send_payment_along_path, logger);
+				self.find_route_and_send_payment(payment_hash, payment_id, retry, router, first_hops, inflight_htlcs, entropy_source, node_signer, best_block_height,  pending_events, send_payment_along_path, taproot_asset_htlc_blob, logger);
 			},
 			PaymentSendFailure::PartialFailure { failed_paths_retry: None, .. } => {
 				// This may happen if we send a payment and some paths fail, but only due to a temporary
@@ -1922,7 +1928,7 @@ impl OutboundPayments {
 
 		match self.pay_route_internal(&route, payment_hash, &recipient_onion_fields,
 			None, None, None, payment_id, &onion_session_privs, false, node_signer,
-			best_block_height, &send_payment_along_path
+			best_block_height, &send_payment_along_path, None
 		) {
 			Ok(()) => Ok((payment_hash, payment_id)),
 			Err(e) => {
@@ -2109,13 +2115,17 @@ impl OutboundPayments {
 		&self, route: &Route, payment_hash: PaymentHash, recipient_onion: &RecipientOnionFields,
 		keysend_preimage: Option<PaymentPreimage>, invoice_request: Option<&InvoiceRequest>, bolt12_invoice: Option<&PaidBolt12Invoice>,
 		payment_id: PaymentId, onion_session_privs: &Vec<[u8; 32]>,
-		hold_htlcs_at_next_hop: bool, node_signer: &NS, best_block_height: u32, send_payment_along_path: &F
+		hold_htlcs_at_next_hop: bool, node_signer: &NS, best_block_height: u32,
+		send_payment_along_path: &F, taproot_asset_htlc_blob: Option<&Vec<u8>>,
 	) -> Result<(), PaymentSendFailure>
 	where
 		F: Fn(SendAlongPathArgs) -> Result<(), APIError>,
 	{
 		if route.paths.len() < 1 {
 			return Err(PaymentSendFailure::ParameterError(APIError::InvalidRoute{err: "There must be at least one path to send over".to_owned()}));
+		}
+		if taproot_asset_htlc_blob.is_some() && route.paths.len() != 1 {
+			return Err(PaymentSendFailure::ParameterError(APIError::APIMisuseError{err: "Taproot Asset HTLC blobs are only supported on single-path sends".to_owned()}));
 		}
 		if recipient_onion.payment_secret.is_none() && route.paths.len() > 1
 			&& !route.paths.iter().any(|p| p.blinded_tail.is_some())
@@ -2158,7 +2168,8 @@ impl OutboundPayments {
 				path: &path, payment_hash: &payment_hash, recipient_onion,
 				cur_height, payment_id, keysend_preimage: &keysend_preimage, invoice_request,
 				bolt12_invoice, hold_htlc_at_next_hop: hold_htlcs_at_next_hop,
-				session_priv_bytes: *session_priv_bytes
+				session_priv_bytes: *session_priv_bytes,
+				taproot_asset_htlc_blob: taproot_asset_htlc_blob.cloned(),
 			});
 			results.push(path_res);
 		}
@@ -2225,7 +2236,7 @@ impl OutboundPayments {
 	{
 		self.pay_route_internal(route, payment_hash, &recipient_onion,
 			keysend_preimage, None, None, payment_id, &onion_session_privs,
-			false, node_signer, best_block_height, &send_payment_along_path)
+			false, node_signer, best_block_height, &send_payment_along_path, None)
 			.map_err(|e| { self.remove_outbound_if_all_failed(payment_id, &e); e })
 	}
 
@@ -2944,7 +2955,7 @@ mod tests {
 			outbound_payments.find_route_and_send_payment(
 				PaymentHash([0; 32]), PaymentId([0; 32]), expired_route_params, &&router, vec![],
 				&|| InFlightHtlcs::new(), &&keys_manager, &&keys_manager, 0, &pending_events,
-				&|_| Ok(()), &log);
+				&|_| Ok(()), None, &log);
 			let events = pending_events.lock().unwrap();
 			assert_eq!(events.len(), 1);
 			if let Event::PaymentFailed { ref reason, .. } = events[0].0 {
@@ -2990,7 +3001,7 @@ mod tests {
 			outbound_payments.find_route_and_send_payment(
 				PaymentHash([0; 32]), PaymentId([0; 32]), route_params, &&router, vec![],
 				&|| InFlightHtlcs::new(), &&keys_manager, &&keys_manager, 0, &pending_events,
-				&|_| Ok(()), &log);
+				&|_| Ok(()), None, &log);
 			let events = pending_events.lock().unwrap();
 			assert_eq!(events.len(), 1);
 			if let Event::PaymentFailed { .. } = events[0].0 { } else { panic!("Unexpected event"); }
@@ -3086,6 +3097,68 @@ mod tests {
 			assert_eq!(short_channel_id, None);
 		} else { panic!("Unexpected event"); }
 		if let Event::PaymentFailed { .. } = events[1].0 { } else { panic!("Unexpected event"); }
+	}
+
+	#[test]
+	#[rustfmt::skip]
+	fn spontaneous_taproot_asset_htlc_blob_reaches_send_path() {
+		let logger = test_utils::TestLogger::new();
+		let logger_ref = &logger;
+		let log = WithContext::from(&logger_ref, None, None, Some(PaymentHash([9; 32])));
+		let outbound_payments = OutboundPayments::new(new_hash_map());
+		let network_graph = Arc::new(NetworkGraph::new(Network::Testnet, &logger));
+		let scorer = RwLock::new(test_utils::TestScorer::new());
+		let router = test_utils::TestRouter::new(network_graph, &logger, &scorer);
+		let secp_ctx = Secp256k1::new();
+		let keys_manager = test_utils::TestKeysInterface::new(&[0; 32], Network::Testnet);
+
+		let receiver_pk = PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[43; 32]).unwrap());
+		let route_params = RouteParameters::from_payment_params_and_value(
+			PaymentParameters::from_node_id(receiver_pk, 0), 1_000);
+		let route = Route {
+			paths: vec![Path { hops: vec![RouteHop {
+				pubkey: receiver_pk,
+				node_features: NodeFeatures::empty(),
+				short_channel_id: 42,
+				channel_features: ChannelFeatures::empty(),
+				fee_msat: 1_000,
+				cltv_expiry_delta: 0,
+				maybe_announced_channel: true,
+			}], blinded_tail: None }],
+			route_params: Some(route_params.clone()),
+		};
+		router.expect_find_route(route_params.clone(), Ok(route));
+
+		let taproot_asset_htlc_blob = vec![
+			0, 32, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+			7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 1, 8, 0, 0, 0, 0, 0, 0, 0, 125,
+		];
+		let captured_blob = Arc::new(Mutex::new(None));
+		let captured_blob_ref = Arc::clone(&captured_blob);
+		let pending_events = Mutex::new(VecDeque::new());
+		let payment_hash = outbound_payments.send_spontaneous_payment(
+			Some(PaymentPreimage([9; 32])),
+			RecipientOnionFields::spontaneous_empty(1_000),
+			PaymentId([9; 32]),
+			Retry::Attempts(0),
+			route_params,
+			&&router,
+			vec![],
+			|| InFlightHtlcs::new(),
+			&&keys_manager,
+			&&keys_manager,
+			0,
+			&pending_events,
+			|args| {
+				*captured_blob_ref.lock().unwrap() = args.taproot_asset_htlc_blob.clone();
+				Ok(())
+			},
+			Some(taproot_asset_htlc_blob.clone()),
+			&log,
+		).unwrap();
+
+		assert_eq!(payment_hash, PaymentHash::from(PaymentPreimage([9; 32])));
+		assert_eq!(*captured_blob.lock().unwrap(), Some(taproot_asset_htlc_blob));
 	}
 
 	#[test]

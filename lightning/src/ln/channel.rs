@@ -17203,8 +17203,8 @@ where
 	pub fn send_htlc_and_commit<F: FeeEstimator, L: Logger>(
 		&mut self, amount_msat: u64, payment_hash: PaymentHash, cltv_expiry: u32,
 		source: HTLCSource, onion_routing_packet: msgs::OnionPacket, skimmed_fee_msat: Option<u64>,
-		hold_htlc: bool, accountable: bool, fee_estimator: &LowerBoundedFeeEstimator<F>,
-		logger: &L,
+		taproot_asset_htlc_blob: Option<Vec<u8>>, hold_htlc: bool, accountable: bool,
+		fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L,
 	) -> Result<Option<ChannelMonitorUpdate>, ChannelError> {
 		let send_res = self.send_htlc(
 			amount_msat,
@@ -17215,7 +17215,7 @@ where
 			false,
 			skimmed_fee_msat,
 			None,
-			None,
+			taproot_asset_htlc_blob,
 			hold_htlc,
 			accountable,
 			fee_estimator,
