@@ -4269,6 +4269,11 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 		);
 		let announce_for_forwarding =
 			if (open_channel_fields.channel_flags & 1) == 1 { true } else { false };
+		if channel_type_requires_private_channel(&channel_type) && announce_for_forwarding {
+			return Err(ChannelError::close(
+				"Simple taproot channel types cannot be set on a public channel".to_owned(),
+			));
+		}
 
 		let channel_value_satoshis =
 			our_funding_satoshis.saturating_add(open_channel_fields.funding_satoshis);
@@ -4819,6 +4824,8 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 		}
 
 		let channel_type = get_initial_channel_type(&config, their_features);
+		let announce_for_forwarding = config.channel_handshake_config.announce_for_forwarding
+			&& !channel_type_requires_private_channel(&channel_type);
 		if !channel_type.supports_anchors_zero_fee_htlc_tx()
 			&& !channel_type.supports_anchor_zero_fee_commitments()
 			&& holder_selected_channel_reserve_satoshis == 0
@@ -4926,7 +4933,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 
 			config: LegacyChannelConfig {
 				options: config.channel_config.clone(),
-				announce_for_forwarding: config.channel_handshake_config.announce_for_forwarding,
+				announce_for_forwarding,
 				commit_upfront_shutdown_pubkey: config
 					.channel_handshake_config
 					.commit_upfront_shutdown_pubkey,
@@ -4994,7 +5001,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 			// receive `accept_channel2`.
 			holder_max_htlc_value_in_flight_msat: get_holder_max_htlc_value_in_flight_msat(
 				channel_value_satoshis,
-				config.channel_handshake_config.announce_for_forwarding,
+				announce_for_forwarding,
 				&config.channel_handshake_config,
 			),
 			counterparty_htlc_minimum_msat: 0,
@@ -18142,6 +18149,9 @@ pub(super) fn channel_type_from_open_channel(
 	if channel_type.requires_scid_privacy() && announce_for_forwarding {
 		return Err(ChannelError::close("SCID Alias/Privacy Channel Type cannot be set on a public channel".to_owned()));
 	}
+	if channel_type_requires_private_channel(channel_type) && announce_for_forwarding {
+		return Err(ChannelError::close("Simple taproot channel types cannot be set on a public channel".to_owned()));
+	}
 	Ok(channel_type.clone())
 }
 
@@ -18819,6 +18829,12 @@ pub(super) fn get_initial_channel_type(
 	}
 
 	ret
+}
+
+fn channel_type_requires_private_channel(channel_type: &ChannelTypeFeatures) -> bool {
+	channel_type.requires_simple_taproot()
+		|| channel_type.requires_simple_taproot_staging()
+		|| channel_type.requires_taproot_asset_channel()
 }
 
 const SERIALIZATION_VERSION: u8 = 4;

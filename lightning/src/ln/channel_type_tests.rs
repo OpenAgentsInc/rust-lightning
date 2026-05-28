@@ -165,6 +165,102 @@ fn test_experimental_taproot_asset_channel_requires_simple_taproot_base() {
 }
 
 #[cfg(feature = "simple_taproot_musig2")]
+fn outbound_open_channel_from_config(config: UserConfig) -> crate::ln::msgs::OpenChannel {
+	let test_est = TestFeeEstimator::new(15000);
+	let feeest = LowerBoundedFeeEstimator::new(&test_est);
+	let secp_ctx = Secp256k1::new();
+	let network = Network::Testnet;
+	let keys_provider = TestKeysInterface::new(&[42; 32], network);
+	let logger = TestLogger::new();
+
+	let node_b_node_id =
+		PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[42; 32]).unwrap());
+	let mut node_a_chan = OutboundV1Channel::<&TestKeysInterface>::new(
+		&feeest,
+		&&keys_provider,
+		&&keys_provider,
+		node_b_node_id,
+		&channelmanager::provided_init_features(&config),
+		10000000,
+		100000,
+		42,
+		&config,
+		0,
+		42,
+		None,
+		&logger,
+		None,
+	)
+	.unwrap();
+
+	node_a_chan.get_open_channel(ChainHash::using_genesis_block(network), &&logger).unwrap()
+}
+
+#[cfg(feature = "simple_taproot_musig2")]
+#[test]
+fn test_simple_taproot_public_announcement_request_is_cleared() {
+	let mut config = UserConfig::default();
+	config.channel_handshake_config.announce_for_forwarding = true;
+	config.channel_handshake_config.negotiate_simple_taproot_channels = true;
+
+	let open_channel_msg = outbound_open_channel_from_config(config);
+	assert_eq!(open_channel_msg.common_fields.channel_flags & 1, 0);
+	assert_eq!(
+		open_channel_msg.common_fields.channel_type,
+		Some(ChannelTypeFeatures::simple_taproot_staging())
+	);
+}
+
+#[cfg(feature = "simple_taproot_musig2")]
+#[test]
+fn test_taproot_asset_public_announcement_request_is_cleared() {
+	let mut config = UserConfig::default();
+	config.channel_handshake_config.announce_for_forwarding = true;
+	config.channel_handshake_config.negotiate_taproot_asset_channels = true;
+
+	let open_channel_msg = outbound_open_channel_from_config(config);
+	assert_eq!(open_channel_msg.common_fields.channel_flags & 1, 0);
+	assert_eq!(
+		open_channel_msg.common_fields.channel_type,
+		Some(ChannelTypeFeatures::taproot_asset_single_asset())
+	);
+}
+
+#[cfg(feature = "simple_taproot_musig2")]
+#[test]
+fn test_rejects_public_simple_taproot_channel_types() {
+	let mut init_features = InitFeatures::empty();
+	init_features.set_static_remote_key_optional();
+	init_features.set_simple_taproot_staging_optional();
+	init_features.set_taproot_asset_channel_optional();
+	let supported_channel_types = ChannelTypeFeatures::from_init(&init_features);
+
+	let mut simple_taproot_msg = outbound_open_channel_from_config({
+		let mut config = UserConfig::default();
+		config.channel_handshake_config.negotiate_simple_taproot_channels = true;
+		config
+	});
+	simple_taproot_msg.common_fields.channel_flags |= 1;
+	assert!(channel_type_from_open_channel(
+		&simple_taproot_msg.common_fields,
+		&supported_channel_types
+	)
+	.is_err());
+
+	let mut taproot_asset_msg = outbound_open_channel_from_config({
+		let mut config = UserConfig::default();
+		config.channel_handshake_config.negotiate_taproot_asset_channels = true;
+		config
+	});
+	taproot_asset_msg.common_fields.channel_flags |= 1;
+	assert!(channel_type_from_open_channel(
+		&taproot_asset_msg.common_fields,
+		&supported_channel_types
+	)
+	.is_err());
+}
+
+#[cfg(feature = "simple_taproot_musig2")]
 #[test]
 fn test_experimental_taproot_asset_channel_open_accepts_overlay_type() {
 	let test_est = TestFeeEstimator::new(15000);
