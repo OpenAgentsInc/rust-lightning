@@ -262,6 +262,241 @@ fn test_rejects_public_simple_taproot_channel_types() {
 
 #[cfg(feature = "simple_taproot_musig2")]
 #[test]
+fn test_simple_taproot_open_requires_local_nonce() {
+	let mut init_features = InitFeatures::empty();
+	init_features.set_static_remote_key_optional();
+	init_features.set_simple_taproot_staging_optional();
+	init_features.set_taproot_asset_channel_optional();
+	let supported_channel_types = ChannelTypeFeatures::from_init(&init_features);
+
+	let mut legacy_msg = outbound_open_channel_from_config(UserConfig::default());
+	legacy_msg.common_fields.simple_taproot_next_local_nonce = None;
+	assert!(channel_type_from_open_channel(
+		&legacy_msg.common_fields,
+		&channelmanager::provided_channel_type_features(&UserConfig::default())
+	)
+	.is_ok());
+
+	let mut simple_taproot_msg = outbound_open_channel_from_config({
+		let mut config = UserConfig::default();
+		config.channel_handshake_config.negotiate_simple_taproot_channels = true;
+		config
+	});
+	simple_taproot_msg.common_fields.simple_taproot_next_local_nonce = None;
+	assert!(channel_type_from_open_channel(
+		&simple_taproot_msg.common_fields,
+		&supported_channel_types
+	)
+	.is_err());
+
+	let mut taproot_asset_msg = outbound_open_channel_from_config({
+		let mut config = UserConfig::default();
+		config.channel_handshake_config.negotiate_taproot_asset_channels = true;
+		config
+	});
+	taproot_asset_msg.common_fields.simple_taproot_next_local_nonce = None;
+	assert!(channel_type_from_open_channel(
+		&taproot_asset_msg.common_fields,
+		&supported_channel_types
+	)
+	.is_err());
+}
+
+#[cfg(feature = "simple_taproot_musig2")]
+#[test]
+fn test_simple_taproot_accept_requires_local_nonce() {
+	fn assert_accept_nonce_required(config: UserConfig) {
+		let test_est = TestFeeEstimator::new(15000);
+		let feeest = LowerBoundedFeeEstimator::new(&test_est);
+		let secp_ctx = Secp256k1::new();
+		let network = Network::Testnet;
+		let keys_provider = TestKeysInterface::new(&[42; 32], network);
+		let logger = TestLogger::new();
+		let node_id_a =
+			PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[1; 32]).unwrap());
+		let node_id_b =
+			PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[2; 32]).unwrap());
+
+		let mut channel_a = OutboundV1Channel::<&TestKeysInterface>::new(
+			&feeest,
+			&&keys_provider,
+			&&keys_provider,
+			node_id_b,
+			&channelmanager::provided_init_features(&config),
+			10000000,
+			100000,
+			42,
+			&config,
+			0,
+			42,
+			None,
+			&logger,
+			None,
+		)
+		.unwrap();
+		let open_channel_msg =
+			channel_a.get_open_channel(ChainHash::using_genesis_block(network), &&logger).unwrap();
+		let mut channel_b = InboundV1Channel::<&TestKeysInterface>::new(
+			&feeest,
+			&&keys_provider,
+			&&keys_provider,
+			node_id_a,
+			&channelmanager::provided_channel_type_features(&config),
+			&channelmanager::provided_init_features(&config),
+			&open_channel_msg,
+			7,
+			&config,
+			0,
+			&&logger,
+			None,
+		)
+		.unwrap();
+
+		let mut accept_channel_msg = channel_b.get_accept_channel_message(&&logger).unwrap();
+		accept_channel_msg.common_fields.simple_taproot_next_local_nonce = None;
+		assert!(channel_a
+			.accept_channel(
+				&accept_channel_msg,
+				&config.channel_handshake_limits,
+				&channelmanager::provided_init_features(&config),
+			)
+			.is_err());
+	}
+
+	let mut simple_taproot_config = UserConfig::default();
+	simple_taproot_config.channel_handshake_config.negotiate_simple_taproot_channels = true;
+	assert_accept_nonce_required(simple_taproot_config);
+
+	let mut taproot_asset_config = UserConfig::default();
+	taproot_asset_config.channel_handshake_config.negotiate_taproot_asset_channels = true;
+	assert_accept_nonce_required(taproot_asset_config);
+}
+
+#[cfg(feature = "simple_taproot_musig2")]
+#[test]
+fn test_inbound_simple_taproot_open_missing_nonce_is_rejected() {
+	fn assert_inbound_open_nonce_required(config: UserConfig) {
+		let test_est = TestFeeEstimator::new(15000);
+		let feeest = LowerBoundedFeeEstimator::new(&test_est);
+		let secp_ctx = Secp256k1::new();
+		let network = Network::Testnet;
+		let keys_provider = TestKeysInterface::new(&[42; 32], network);
+		let logger = TestLogger::new();
+		let node_id_a =
+			PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[1; 32]).unwrap());
+		let node_id_b =
+			PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[2; 32]).unwrap());
+
+		let mut channel_a = OutboundV1Channel::<&TestKeysInterface>::new(
+			&feeest,
+			&&keys_provider,
+			&&keys_provider,
+			node_id_b,
+			&channelmanager::provided_init_features(&config),
+			10000000,
+			100000,
+			42,
+			&config,
+			0,
+			42,
+			None,
+			&logger,
+			None,
+		)
+		.unwrap();
+		let mut open_channel_msg =
+			channel_a.get_open_channel(ChainHash::using_genesis_block(network), &&logger).unwrap();
+		open_channel_msg.common_fields.simple_taproot_next_local_nonce = None;
+
+		assert!(InboundV1Channel::<&TestKeysInterface>::new(
+			&feeest,
+			&&keys_provider,
+			&&keys_provider,
+			node_id_a,
+			&channelmanager::provided_channel_type_features(&config),
+			&channelmanager::provided_init_features(&config),
+			&open_channel_msg,
+			7,
+			&config,
+			0,
+			&&logger,
+			None,
+		)
+		.is_err());
+	}
+
+	let mut simple_taproot_config = UserConfig::default();
+	simple_taproot_config.channel_handshake_config.negotiate_simple_taproot_channels = true;
+	assert_inbound_open_nonce_required(simple_taproot_config);
+
+	let mut taproot_asset_config = UserConfig::default();
+	taproot_asset_config.channel_handshake_config.negotiate_taproot_asset_channels = true;
+	assert_inbound_open_nonce_required(taproot_asset_config);
+}
+
+#[cfg(feature = "simple_taproot_musig2")]
+#[test]
+fn test_legacy_accept_can_omit_simple_taproot_nonce() {
+	let test_est = TestFeeEstimator::new(15000);
+	let feeest = LowerBoundedFeeEstimator::new(&test_est);
+	let secp_ctx = Secp256k1::new();
+	let network = Network::Testnet;
+	let keys_provider = TestKeysInterface::new(&[42; 32], network);
+	let logger = TestLogger::new();
+	let node_id_a =
+		PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[1; 32]).unwrap());
+	let node_id_b =
+		PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[2; 32]).unwrap());
+	let config = UserConfig::default();
+
+	let mut channel_a = OutboundV1Channel::<&TestKeysInterface>::new(
+		&feeest,
+		&&keys_provider,
+		&&keys_provider,
+		node_id_b,
+		&channelmanager::provided_init_features(&config),
+		10000000,
+		100000,
+		42,
+		&config,
+		0,
+		42,
+		None,
+		&logger,
+		None,
+	)
+	.unwrap();
+	let open_channel_msg =
+		channel_a.get_open_channel(ChainHash::using_genesis_block(network), &&logger).unwrap();
+	let mut channel_b = InboundV1Channel::<&TestKeysInterface>::new(
+		&feeest,
+		&&keys_provider,
+		&&keys_provider,
+		node_id_a,
+		&channelmanager::provided_channel_type_features(&config),
+		&channelmanager::provided_init_features(&config),
+		&open_channel_msg,
+		7,
+		&config,
+		0,
+		&&logger,
+		None,
+	)
+	.unwrap();
+
+	let mut accept_channel_msg = channel_b.get_accept_channel_message(&&logger).unwrap();
+	accept_channel_msg.common_fields.simple_taproot_next_local_nonce = None;
+	assert!(channel_a
+		.accept_channel(
+			&accept_channel_msg,
+			&config.channel_handshake_limits,
+			&channelmanager::provided_init_features(&config),
+		)
+		.is_ok());
+}
+
+#[cfg(feature = "simple_taproot_musig2")]
+#[test]
 fn test_experimental_taproot_asset_channel_open_accepts_overlay_type() {
 	let test_est = TestFeeEstimator::new(15000);
 	let feeest = LowerBoundedFeeEstimator::new(&test_est);

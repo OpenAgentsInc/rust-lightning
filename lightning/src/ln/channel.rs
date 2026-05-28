@@ -5344,6 +5344,13 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 				"Channel Type in accept_channel didn't match the one sent in open_channel.",
 			)));
 		}
+		if channel_type_requires_simple_taproot_nonce(channel_type)
+			&& common_fields.simple_taproot_next_local_nonce.is_none()
+		{
+			return Err(ChannelError::close(
+				"Simple taproot channel types require next_local_nonce".to_owned(),
+			));
+		}
 
 		if common_fields.dust_limit_satoshis > 21000000 * 100000000 {
 			return Err(ChannelError::close(format!(
@@ -18152,6 +18159,13 @@ pub(super) fn channel_type_from_open_channel(
 	if channel_type_requires_private_channel(channel_type) && announce_for_forwarding {
 		return Err(ChannelError::close("Simple taproot channel types cannot be set on a public channel".to_owned()));
 	}
+	if channel_type_requires_simple_taproot_nonce(channel_type)
+		&& common_fields.simple_taproot_next_local_nonce.is_none()
+	{
+		return Err(ChannelError::close(
+			"Simple taproot channel types require next_local_nonce".to_owned(),
+		));
+	}
 	Ok(channel_type.clone())
 }
 
@@ -18832,6 +18846,10 @@ pub(super) fn get_initial_channel_type(
 }
 
 fn channel_type_requires_private_channel(channel_type: &ChannelTypeFeatures) -> bool {
+	channel_type_requires_simple_taproot_nonce(channel_type)
+}
+
+fn channel_type_requires_simple_taproot_nonce(channel_type: &ChannelTypeFeatures) -> bool {
 	channel_type.requires_simple_taproot()
 		|| channel_type.requires_simple_taproot_staging()
 		|| channel_type.requires_taproot_asset_channel()
