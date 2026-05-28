@@ -16471,30 +16471,49 @@ where
 		let update = if self.pending_funding().is_empty() {
 			let (htlcs_ref, counterparty_commitment_tx) =
 				self.build_commitment_no_state_update(&self.funding, logger);
-			let htlc_outputs = htlcs_ref
-				.into_iter()
-				.map(|(htlc, htlc_source)| {
-					(htlc, htlc_source.map(|source_ref| Box::new(source_ref.clone())))
-				})
-				.collect();
+			if chan_utils::requires_simple_taproot_outputs(self.funding.get_channel_type()) {
+				let nondust_htlc_sources = htlcs_ref
+					.iter()
+					// We check !offered as this is the HTLC from the counterparty's point of view.
+					.filter(|(htlc, _)| !htlc.offered && htlc.transaction_output_index.is_some())
+					.map(|(_, source)| source.expect("Outbound HTLC must have a source").clone())
+					.collect();
+				let dust_htlcs = htlcs_ref
+					.into_iter()
+					.filter(|(htlc, _)| htlc.transaction_output_index.is_none())
+					.map(|(htlc, source)| (htlc, source.cloned()))
+					.collect();
+				let htlc_data = CommitmentHTLCData { nondust_htlc_sources, dust_htlcs };
+				ChannelMonitorUpdateStep::LatestCounterpartyCommitment {
+					commitment_txs: vec![counterparty_commitment_tx],
+					htlc_data,
+				}
+			} else {
+				let htlc_outputs = htlcs_ref
+					.into_iter()
+					.map(|(htlc, htlc_source)| {
+						(htlc, htlc_source.map(|source_ref| Box::new(source_ref.clone())))
+					})
+					.collect();
 
-			// Soon, we will switch this to `LatestCounterpartyCommitment`,
-			// and provide the full commit tx instead of the information needed to rebuild it.
-			ChannelMonitorUpdateStep::LatestCounterpartyCommitmentTXInfo {
-				commitment_txid: counterparty_commitment_tx.trust().txid(),
-				htlc_outputs,
-				commitment_number: self.context.counterparty_next_commitment_transaction_number,
-				their_per_commitment_point: self
-					.context
-					.counterparty_next_commitment_point
-					.unwrap(),
-				feerate_per_kw: Some(counterparty_commitment_tx.negotiated_feerate_per_kw()),
-				to_broadcaster_value_sat: Some(
-					counterparty_commitment_tx.to_broadcaster_value_sat(),
-				),
-				to_countersignatory_value_sat: Some(
-					counterparty_commitment_tx.to_countersignatory_value_sat(),
-				),
+				// Soon, we will switch this to `LatestCounterpartyCommitment`,
+				// and provide the full commit tx instead of the information needed to rebuild it.
+				ChannelMonitorUpdateStep::LatestCounterpartyCommitmentTXInfo {
+					commitment_txid: counterparty_commitment_tx.trust().txid(),
+					htlc_outputs,
+					commitment_number: self.context.counterparty_next_commitment_transaction_number,
+					their_per_commitment_point: self
+						.context
+						.counterparty_next_commitment_point
+						.unwrap(),
+					feerate_per_kw: Some(counterparty_commitment_tx.negotiated_feerate_per_kw()),
+					to_broadcaster_value_sat: Some(
+						counterparty_commitment_tx.to_broadcaster_value_sat(),
+					),
+					to_countersignatory_value_sat: Some(
+						counterparty_commitment_tx.to_countersignatory_value_sat(),
+					),
+				}
 			}
 		} else {
 			let mut htlc_data = None;
@@ -19906,14 +19925,15 @@ pub(crate) fn hold_time_since(send_timestamp: Option<Duration>) -> Option<u32> {
 #[cfg(test)]
 mod tests {
 	use crate::chain::chaininterface::LowerBoundedFeeEstimator;
+	use crate::chain::channelmonitor::ChannelMonitorUpdateStep;
 	use crate::chain::transaction::OutPoint;
 	use crate::chain::BlockLocator;
 	use crate::ln::chan_utils::{self, commit_tx_fee_sat};
 	use crate::ln::channel::{
-		AwaitingChannelReadyFlags, ChannelState, FundedChannel, HTLCUpdateAwaitingACK,
-		InboundHTLCOutput, InboundHTLCState, InboundUpdateAdd, InboundV1Channel,
-		OutboundHTLCOutput, OutboundHTLCState, OutboundV1Channel, WithChannelContext,
-		MIN_THEIR_CHAN_RESERVE_SATOSHIS,
+		AwaitingChannelReadyFlags, ChannelReadyFlags, ChannelState, FundedChannel,
+		HTLCUpdateAwaitingACK, InboundHTLCOutput, InboundHTLCState, InboundUpdateAdd,
+		InboundV1Channel, OutboundHTLCOutput, OutboundHTLCState, OutboundV1Channel,
+		WithChannelContext, MIN_THEIR_CHAN_RESERVE_SATOSHIS,
 	};
 	use crate::ln::channel_keys::{RevocationBasepoint, RevocationKey};
 	use crate::ln::channelmanager::{self, HTLCSource, PaymentId, TrustedChannelFeatures};
@@ -20573,6 +20593,100 @@ mod tests {
 		}
 
 		assert!(!node_a_chan.channel_update(&update).unwrap());
+		}
+
+	#[test]
+	#[cfg(feature = "simple_taproot_musig2")]
+	fn taproot_asset_counterparty_monitor_update_stores_full_commitment_tx() {
+		let logger = TestLogger::new();
+		let test_est = TestFeeEstimator::new(15000);
+		let feeest = LowerBoundedFeeEstimator::new(&test_est);
+		let secp_ctx = Secp256k1::new();
+		let seed = [42; 32];
+		let network = Network::Testnet;
+		let best_block = BlockLocator::from_network(network);
+		let keys_provider = TestKeysInterface::new(&seed, network);
+		let node_b_node_id =
+			PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[42; 32]).unwrap());
+		let mut config = UserConfig::default();
+		config.channel_handshake_config.negotiate_taproot_asset_channels = true;
+		let features = channelmanager::provided_init_features(&config);
+		let mut outbound_chan = OutboundV1Channel::<&TestKeysInterface>::new(
+			&feeest,
+			&&keys_provider,
+			&&keys_provider,
+			node_b_node_id,
+			&features,
+			10000000,
+			100000,
+			42,
+			&config,
+			0,
+			42,
+			None,
+			&logger,
+			None,
+		)
+		.unwrap();
+		let open_channel_msg = &outbound_chan
+			.get_open_channel(ChainHash::using_genesis_block(network), &&logger)
+			.unwrap();
+		let mut inbound_chan = InboundV1Channel::<&TestKeysInterface>::new(
+			&feeest,
+			&&keys_provider,
+			&&keys_provider,
+			node_b_node_id,
+			&channelmanager::provided_channel_type_features(&config),
+			&features,
+			open_channel_msg,
+			7,
+			&config,
+			0,
+			&&logger,
+			None,
+		)
+		.unwrap();
+		outbound_chan
+			.accept_channel(
+				&inbound_chan.get_accept_channel_message(&&logger).unwrap(),
+				&config.channel_handshake_limits,
+				&features,
+			)
+			.unwrap();
+		let tx = Transaction {
+			version: Version::ONE,
+			lock_time: LockTime::ZERO,
+			input: Vec::new(),
+			output: vec![TxOut {
+				value: Amount::from_sat(10000000),
+				script_pubkey: outbound_chan.funding.get_funding_redeemscript(),
+			}],
+		};
+		let funding_outpoint = OutPoint { txid: tx.compute_txid(), index: 0 };
+		let funding_created = outbound_chan
+			.get_funding_created(tx.clone(), funding_outpoint, false, &&logger)
+			.map_err(|_| ())
+			.unwrap()
+			.unwrap();
+		let (mut chan, _, _) = inbound_chan
+			.funding_created(&funding_created, best_block, &&keys_provider, &&logger)
+			.unwrap_or_else(|(_, e)| panic!("{}", e));
+		assert!(chan.funding.get_channel_type().requires_taproot_asset_channel());
+		chan.context.channel_state = ChannelState::ChannelReady(ChannelReadyFlags::new());
+
+		let update = chan.build_commitment_no_status_check(&&logger);
+		assert_eq!(update.updates.len(), 1);
+		match &update.updates[0] {
+			ChannelMonitorUpdateStep::LatestCounterpartyCommitment {
+				commitment_txs,
+				htlc_data,
+			} => {
+				assert_eq!(commitment_txs.len(), 1);
+				assert!(htlc_data.nondust_htlc_sources.is_empty());
+				assert!(htlc_data.dust_htlcs.is_empty());
+			},
+			other => panic!("unexpected taproot asset monitor update variant: {:?}", other),
+		}
 	}
 
 	#[test]
