@@ -2516,6 +2516,19 @@ impl CommitmentTransaction {
 		&self.nondust_htlcs
 	}
 
+	#[cfg(feature = "simple_taproot_musig2")]
+	pub(crate) fn set_nondust_htlc_second_level_aux_leaf_script(
+		&mut self, transaction_output_index: u32, script: ScriptBuf,
+	) -> Result<(), ()> {
+		let htlc = self
+			.nondust_htlcs
+			.iter_mut()
+			.find(|htlc| htlc.transaction_output_index == Some(transaction_output_index))
+			.ok_or(())?;
+		htlc.simple_taproot_second_level_aux_leaf_script = Some(script);
+		Ok(())
+	}
+
 	/// Trust our pre-built transaction and derived transaction creation public keys.
 	///
 	/// Applies a wrapper which allows access to these fields.

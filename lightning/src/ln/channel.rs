@@ -7442,7 +7442,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 		#[cfg(not(feature = "simple_taproot_musig2"))]
 		let channel_transaction_parameters = funding.channel_transaction_parameters.clone();
 
-		let (tx, stats) = SpecTxBuilder {}.build_commitment_transaction(
+		let (mut tx, stats) = SpecTxBuilder {}.build_commitment_transaction(
 			local,
 			commitment_number,
 			per_commitment_point,
@@ -7521,6 +7521,51 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 				(l, r) => cmp::Ord::cmp(&l, &r),
 			}
 		});
+
+		#[cfg(feature = "simple_taproot_musig2")]
+		if funding.get_channel_type().requires_taproot_asset_channel() {
+			let commitment_txid = tx.trust().txid();
+			let nondust_htlcs = tx.nondust_htlcs().clone();
+			for htlc in nondust_htlcs.iter() {
+				let htlc_output_index = match htlc.transaction_output_index {
+					Some(index) => index,
+					None => continue,
+				};
+				let Some((htlc_id, htlc_blob)) = self.taproot_asset_htlc_blob_for_commitment_htlc(
+					htlc,
+					local,
+					generated_by_local,
+				) else {
+					continue;
+				};
+				let Some(second_level_aux_leaf) = self
+					.taproot_asset_second_level_htlc_aux_leaf_script_for_commitment_output(
+						funding,
+						per_commitment_point,
+						local,
+						htlc_blob,
+						htlc_id,
+						htlc.offered,
+						htlc.cltv_expiry,
+						&htlc.payment_hash,
+						commitment_txid,
+						htlc_output_index,
+					) else {
+						continue;
+					};
+				let updated = tx.set_nondust_htlc_second_level_aux_leaf_script(
+					htlc_output_index,
+					second_level_aux_leaf.clone(),
+				);
+				debug_assert!(updated.is_ok());
+				if let Some((source_htlc, _)) = htlcs_included.iter_mut().find(|(source_htlc, _)| {
+					source_htlc.transaction_output_index == Some(htlc_output_index)
+				}) {
+					source_htlc.simple_taproot_second_level_aux_leaf_script =
+						Some(second_level_aux_leaf);
+				}
+			}
+		}
 
 		CommitmentData {
 			tx,
@@ -19941,6 +19986,8 @@ mod tests {
 	use crate::ln::msgs::{ChannelUpdate, UnsignedChannelUpdate, MAX_VALUE_MSAT};
 	use crate::ln::onion_utils::{AttributionData, LocalHTLCFailureReason};
 	use crate::ln::script::ShutdownScript;
+	#[cfg(feature = "simple_taproot_musig2")]
+	use crate::ln::taproot_asset::TaprootAssetChannelAssetTemplate;
 	use crate::prelude::*;
 	use crate::routing::router::{Path, RouteHop};
 	use crate::sign::tx_builder::HTLCAmountDirection;
@@ -20687,6 +20734,203 @@ mod tests {
 			},
 			other => panic!("unexpected taproot asset monitor update variant: {:?}", other),
 		}
+	}
+
+	#[test]
+	#[cfg(feature = "simple_taproot_musig2")]
+	fn taproot_asset_htlc_commitment_uses_exact_second_level_aux_leaf() {
+		let logger = TestLogger::new();
+		let test_est = TestFeeEstimator::new(15000);
+		let feeest = LowerBoundedFeeEstimator::new(&test_est);
+		let secp_ctx = Secp256k1::new();
+		let seed = [42; 32];
+		let network = Network::Testnet;
+		let best_block = BlockLocator::from_network(network);
+		let keys_provider = TestKeysInterface::new(&seed, network);
+		let node_b_node_id =
+			PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[42; 32]).unwrap());
+		let mut config = UserConfig::default();
+		config.channel_handshake_config.negotiate_taproot_asset_channels = true;
+		let features = channelmanager::provided_init_features(&config);
+		let mut outbound_chan = OutboundV1Channel::<&TestKeysInterface>::new(
+			&feeest,
+			&&keys_provider,
+			&&keys_provider,
+			node_b_node_id,
+			&features,
+			10000000,
+			100000,
+			42,
+			&config,
+			0,
+			42,
+			None,
+			&logger,
+			None,
+		)
+		.unwrap();
+		let open_channel_msg = &outbound_chan
+			.get_open_channel(ChainHash::using_genesis_block(network), &&logger)
+			.unwrap();
+		let mut inbound_chan = InboundV1Channel::<&TestKeysInterface>::new(
+			&feeest,
+			&&keys_provider,
+			&&keys_provider,
+			node_b_node_id,
+			&channelmanager::provided_channel_type_features(&config),
+			&features,
+			open_channel_msg,
+			7,
+			&config,
+			0,
+			&&logger,
+			None,
+		)
+		.unwrap();
+		outbound_chan
+			.accept_channel(
+				&inbound_chan.get_accept_channel_message(&&logger).unwrap(),
+				&config.channel_handshake_limits,
+				&features,
+			)
+			.unwrap();
+		let tx = Transaction {
+			version: Version::ONE,
+			lock_time: LockTime::ZERO,
+			input: Vec::new(),
+			output: vec![TxOut {
+				value: Amount::from_sat(10000000),
+				script_pubkey: outbound_chan.funding.get_funding_redeemscript(),
+			}],
+		};
+		let funding_outpoint = OutPoint { txid: tx.compute_txid(), index: 0 };
+		let funding_created = outbound_chan
+			.get_funding_created(tx.clone(), funding_outpoint, false, &&logger)
+			.map_err(|_| ())
+			.unwrap()
+			.unwrap();
+		let (_, funding_signed_msg, _) = inbound_chan
+			.funding_created(&funding_created, best_block, &&keys_provider, &&logger)
+			.unwrap_or_else(|(_, e)| panic!("{}", e));
+		let funding_signed_res = outbound_chan.funding_signed(
+			&funding_signed_msg.unwrap(),
+			best_block,
+			&&keys_provider,
+			&&logger,
+		);
+		let (mut chan, _) = if let Ok(res) = funding_signed_res { res } else { panic!() };
+		assert!(chan.funding.get_channel_type().requires_taproot_asset_channel());
+		chan.context.channel_state = ChannelState::ChannelReady(ChannelReadyFlags::new());
+
+		let asset_id = [
+			8, 126, 72, 111, 196, 6, 91, 164, 83, 39, 252, 20, 99, 146, 93, 241, 11, 66, 138, 211,
+			2, 71, 54, 118, 93, 160, 16, 26, 67, 197, 190, 60,
+		];
+		chan.funding.channel_transaction_parameters.simple_taproot_asset_channel_template = Some(
+			TaprootAssetChannelAssetTemplate::new(
+				asset_id,
+				1,
+				[7; 32],
+				1,
+				b"demo-usd".to_vec(),
+				[9; 32],
+				0,
+				0,
+				asset_id,
+				None,
+				[8; 32],
+				2,
+				test_utils::pubkey(2).serialize(),
+			)
+			.unwrap(),
+		);
+		let taproot_asset_htlc_blob = vec![
+			1, 44, 0, 32, 8, 126, 72, 111, 196, 6, 91, 164, 83, 39, 252, 20, 99, 146, 93, 241, 11,
+			66, 138, 211, 2, 71, 54, 118, 93, 160, 16, 26, 67, 197, 190, 60, 1, 8, 0, 0, 0, 0, 0,
+			0, 0, 1,
+		];
+		let dummy_htlc_source = HTLCSource::OutboundRoute {
+			path: Path {
+				hops: vec![RouteHop {
+					pubkey: test_utils::pubkey(2),
+					channel_features: ChannelFeatures::empty(),
+					node_features: NodeFeatures::empty(),
+					short_channel_id: 0,
+					fee_msat: 0,
+					cltv_expiry_delta: 0,
+					maybe_announced_channel: false,
+				}],
+				blinded_tail: None,
+			},
+			session_priv: test_utils::privkey(42),
+			first_hop_htlc_msat: 0,
+			payment_id: PaymentId([42; 32]),
+			bolt12_invoice: None,
+		};
+		chan.context.pending_outbound_htlcs.push(OutboundHTLCOutput {
+			htlc_id: 42,
+			amount_msat: 20_000_000,
+			payment_hash: PaymentHash([44; 32]),
+			cltv_expiry: 144,
+			taproot_asset_htlc_blob: Some(taproot_asset_htlc_blob.clone()),
+			state: OutboundHTLCState::LocalAnnounced(Box::new(msgs::OnionPacket {
+				version: 0,
+				public_key: Ok(test_utils::pubkey(1)),
+				hop_data: [0; 20 * 65],
+				hmac: [0; 32],
+			})),
+			source: dummy_htlc_source,
+			skimmed_fee_msat: None,
+			blinding_point: None,
+			send_timestamp: None,
+			hold_htlc: None,
+			accountable: false,
+		});
+
+		let per_commitment_point = chan.context.counterparty_next_commitment_point.unwrap();
+		let commitment_data = chan.context.build_commitment_transaction(
+			&chan.funding,
+			chan.context.counterparty_next_commitment_transaction_number,
+			&per_commitment_point,
+			false,
+			true,
+			&&logger,
+		);
+		let commitment_txid = commitment_data.tx.trust().txid();
+		let htlc = commitment_data.tx.nondust_htlcs().first().unwrap();
+		let htlc_output_index = htlc.transaction_output_index.unwrap();
+		let exact_second_level_aux_leaf = chan
+			.context
+			.taproot_asset_second_level_htlc_aux_leaf_script_for_commitment_output(
+				&chan.funding,
+				&per_commitment_point,
+				false,
+				&taproot_asset_htlc_blob,
+				42,
+				htlc.offered,
+				htlc.cltv_expiry,
+				&htlc.payment_hash,
+				commitment_txid,
+				htlc_output_index,
+			)
+			.unwrap();
+		let generic_second_level_aux_leaf = chan
+			.context
+			.taproot_asset_second_level_htlc_aux_leaf_script(
+				&chan.funding,
+				&per_commitment_point,
+				false,
+				Some(&taproot_asset_htlc_blob),
+				42,
+				htlc.offered,
+				htlc.cltv_expiry,
+			)
+			.unwrap();
+		assert_ne!(exact_second_level_aux_leaf, generic_second_level_aux_leaf);
+		assert_eq!(
+			htlc.simple_taproot_second_level_aux_leaf_script.as_ref(),
+			Some(&exact_second_level_aux_leaf)
+		);
 	}
 
 	#[test]
