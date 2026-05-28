@@ -423,10 +423,8 @@ fn simple_taproot_btc_only_conformance_gate_open_pay_reestablish_and_force_close
 	assert_eq!(node_0_reestablish.len(), 1);
 	assert_eq!(node_1_reestablish.len(), 1);
 	for reestablish in node_0_reestablish.iter().chain(node_1_reestablish.iter()) {
-		assert!(reestablish.simple_taproot_next_local_nonce.is_none());
-		let nonces = reestablish.simple_taproot_next_local_nonces.as_ref().unwrap();
-		assert_eq!(nonces.0.len(), 1);
-		assert_eq!(nonces.0[0].funding_txid, funding_tx.compute_txid());
+		assert!(reestablish.simple_taproot_next_local_nonce.is_some());
+		assert!(reestablish.simple_taproot_next_local_nonces.is_none());
 	}
 	nodes[1].node.handle_channel_reestablish(node_a_id, &node_0_reestablish[0]);
 	handle_chan_reestablish_msgs!(nodes[1], nodes[0]);

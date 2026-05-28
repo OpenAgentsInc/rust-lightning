@@ -6435,14 +6435,45 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 			return Ok(());
 		}
 
-		if legacy_next_local_nonce.is_some() {
+		if let Some(next_local_nonces) = next_local_nonces {
+			return self.simple_taproot_store_counterparty_next_local_nonce_map(
+				next_local_nonces,
+				expected_funding_txids,
+			);
+		}
+		if let Some(legacy_next_local_nonce) = legacy_next_local_nonce {
+			if expected_funding_txids.len() != 1 {
+				return Err(ChannelError::close(
+					"Peer sent legacy simple-taproot scalar nonce for multiple funding txids"
+						.to_owned(),
+				));
+			}
+			self.simple_taproot_store_counterparty_next_local_nonce(
+				expected_funding_txids[0],
+				legacy_next_local_nonce,
+			);
+			return Ok(());
+		}
+		Err(ChannelError::close("Peer omitted simple-taproot next-local nonce".to_owned()))
+	}
+
+	fn simple_taproot_store_counterparty_next_local_nonce_map(
+		&mut self, next_local_nonces: &SimpleTaprootNextLocalNonces,
+		expected_funding_txids: &[Txid],
+	) -> Result<(), ChannelError> {
+		if expected_funding_txids.is_empty() {
+			if !next_local_nonces.0.is_empty() {
+				return Err(ChannelError::close(
+					"Peer sent unexpected simple-taproot nonce state".to_owned(),
+				));
+			}
+			return Ok(());
+		}
+		if next_local_nonces.0.is_empty() {
 			return Err(ChannelError::close(
-				"Peer sent legacy simple-taproot scalar nonce".to_owned(),
+				"Peer omitted simple-taproot next-local nonce map".to_owned(),
 			));
 		}
-		let next_local_nonces = next_local_nonces.ok_or_else(|| {
-			ChannelError::close("Peer omitted simple-taproot next-local nonce map".to_owned())
-		})?;
 		let mut seen_funding_txids = Vec::new();
 		for entry in next_local_nonces.0.iter() {
 			if !expected_funding_txids.iter().any(|txid| *txid == entry.funding_txid) {
@@ -9363,6 +9394,27 @@ where
 		} else {
 			Ok(Some(SimpleTaprootNextLocalNonces(entries)))
 		}
+	}
+
+	fn simple_taproot_next_local_nonce_fields(
+		&self, nonce_index: u64,
+	) -> Result<(Option<Musig2PublicNonce>, Option<SimpleTaprootNextLocalNonces>), ChannelError> {
+		let next_local_nonces = self.simple_taproot_next_local_nonces(nonce_index)?;
+		let simple_taproot_funding_count = core::iter::once(&self.funding)
+			.chain(self.pending_funding().iter())
+			.filter(|funding| ChannelContext::<SP>::is_simple_taproot_funding(funding))
+			.count();
+		let requires_final_map = self.funding.get_channel_type().requires_simple_taproot()
+			&& !self.funding.get_channel_type().requires_simple_taproot_staging()
+			&& !self.funding.get_channel_type().requires_taproot_asset_channel();
+		if requires_final_map || simple_taproot_funding_count > 1 {
+			return Ok((None, next_local_nonces));
+		}
+		let next_local_nonce = next_local_nonces
+			.as_ref()
+			.and_then(|nonces| nonces.0.first())
+			.map(|entry| entry.public_nonce);
+		Ok((next_local_nonce, None))
 	}
 
 	fn simple_taproot_store_counterparty_next_local_nonces(
@@ -12540,10 +12592,11 @@ where
 				}
 
 				self.context.signer_pending_revoke_and_ack = false;
-				let simple_taproot_next_local_nonces = match self.simple_taproot_next_local_nonces(
-					self.holder_commitment_point.next_transaction_number(),
-				) {
-					Ok(nonces) => nonces,
+				let (simple_taproot_next_local_nonce, simple_taproot_next_local_nonces) = match self
+					.simple_taproot_next_local_nonce_fields(
+						self.holder_commitment_point.next_transaction_number(),
+					) {
+					Ok(fields) => fields,
 					Err(err) => {
 						log_trace!(
 							logger,
@@ -12560,7 +12613,7 @@ where
 					per_commitment_secret,
 					next_per_commitment_point: self.holder_commitment_point.next_point(),
 					release_htlc_message_paths,
-					simple_taproot_next_local_nonce: None,
+					simple_taproot_next_local_nonce,
 					simple_taproot_next_local_nonces,
 				});
 			}
@@ -15351,17 +15404,18 @@ where
 		let my_current_funding_locked = self.maybe_get_my_current_funding_locked();
 		self.context.funding_locked_txid_sent_in_reestablish =
 			my_current_funding_locked.as_ref().map(|funding_locked| funding_locked.txid);
-		let simple_taproot_next_local_nonces = match self.simple_taproot_next_local_nonces(
-			self.holder_commitment_point.next_transaction_number(),
-		) {
-			Ok(nonces) => nonces,
+		let (simple_taproot_next_local_nonce, simple_taproot_next_local_nonces) = match self
+			.simple_taproot_next_local_nonce_fields(
+				self.holder_commitment_point.next_transaction_number(),
+			) {
+			Ok(fields) => fields,
 			Err(err) => {
 				log_debug!(
 					logger,
 					"Sending channel_reestablish without simple-taproot nonces: {}",
 					err
 				);
-				None
+				(None, None)
 			},
 		};
 		msgs::ChannelReestablish {
@@ -15388,7 +15442,7 @@ where
 			my_current_per_commitment_point: dummy_pubkey,
 			next_funding: self.maybe_get_next_funding(),
 			my_current_funding_locked,
-			simple_taproot_next_local_nonce: None,
+			simple_taproot_next_local_nonce,
 			simple_taproot_next_local_nonces,
 		}
 	}
@@ -20838,7 +20892,7 @@ mod tests {
 
 	#[test]
 	#[cfg(feature = "simple_taproot_musig2")]
-	fn simple_taproot_type22_nonce_maps_are_authoritative_for_reconnect() {
+	fn simple_taproot_staging_uses_scalar_nonce_and_accepts_nonce_maps() {
 		let test_est = TestFeeEstimator::new(15000);
 		let feeest = LowerBoundedFeeEstimator::new(&test_est);
 		let logger = TestLogger::new();
@@ -20926,10 +20980,8 @@ mod tests {
 
 		assert!(chan.remove_uncommitted_htlcs_and_mark_paused(&&logger).is_ok());
 		let reestablish = chan.get_channel_reestablish(&&logger);
-		assert!(reestablish.simple_taproot_next_local_nonce.is_none());
-		let reestablish_nonces = reestablish.simple_taproot_next_local_nonces.unwrap();
-		assert_eq!(reestablish_nonces.0.len(), 1);
-		assert_eq!(reestablish_nonces.0[0].funding_txid, funding_outpoint.txid);
+		assert!(reestablish.simple_taproot_next_local_nonce.is_some());
+		assert!(reestablish.simple_taproot_next_local_nonces.is_none());
 
 		chan.holder_commitment_point
 			.advance(&chan.context.holder_signer, &chan.context.secp_ctx, &&logger)
@@ -20938,39 +20990,17 @@ mod tests {
 			.advance(&chan.context.holder_signer, &chan.context.secp_ctx, &&logger)
 			.unwrap();
 		let revoke_and_ack = chan.get_last_revoke_and_ack(|_| unreachable!(), &&logger).unwrap();
-		assert!(revoke_and_ack.simple_taproot_next_local_nonce.is_none());
-		let raa_nonces = revoke_and_ack.simple_taproot_next_local_nonces.unwrap();
-		assert_eq!(raa_nonces.0.len(), 1);
-		assert_eq!(raa_nonces.0[0].funding_txid, funding_outpoint.txid);
+		assert!(revoke_and_ack.simple_taproot_next_local_nonce.is_some());
+		assert!(revoke_and_ack.simple_taproot_next_local_nonces.is_none());
 
 		let first_nonce =
 			Musig2PublicNonce::from_points(&test_utils::pubkey(3), &test_utils::pubkey(4));
 		let second_nonce =
 			Musig2PublicNonce::from_points(&test_utils::pubkey(5), &test_utils::pubkey(6));
-		let first_map = SimpleTaprootNextLocalNonces(vec![SimpleTaprootNonceEntry {
-			funding_txid: funding_outpoint.txid,
-			public_nonce: first_nonce,
-		}]);
 		let second_map = SimpleTaprootNextLocalNonces(vec![SimpleTaprootNonceEntry {
 			funding_txid: funding_outpoint.txid,
 			public_nonce: second_nonce,
 		}]);
-		assert!(chan
-			.context
-			.simple_taproot_store_counterparty_next_local_nonces(
-				Some(first_nonce),
-				None,
-				&[funding_outpoint.txid],
-			)
-			.is_err());
-		assert!(chan
-			.context
-			.simple_taproot_store_counterparty_next_local_nonces(
-				Some(first_nonce),
-				Some(&first_map),
-				&[funding_outpoint.txid],
-			)
-			.is_err());
 		assert!(chan
 			.context
 			.simple_taproot_store_counterparty_next_local_nonces(
@@ -20989,8 +21019,8 @@ mod tests {
 			.is_err());
 		chan.context
 			.simple_taproot_store_counterparty_next_local_nonces(
+				Some(first_nonce),
 				None,
-				Some(&first_map),
 				&[funding_outpoint.txid],
 			)
 			.unwrap();
