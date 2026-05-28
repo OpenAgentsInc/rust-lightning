@@ -6435,25 +6435,14 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 			return Ok(());
 		}
 
-		let next_local_nonces = match next_local_nonces {
-			Some(next_local_nonces) => next_local_nonces,
-			None => {
-				let legacy_next_local_nonce = legacy_next_local_nonce.ok_or_else(|| {
-					ChannelError::close("Peer omitted simple-taproot next-local nonces".to_owned())
-				})?;
-				if expected_funding_txids.len() != 1 {
-					return Err(ChannelError::close(
-						"Peer sent legacy simple-taproot nonce for multiple funding txids"
-							.to_owned(),
-					));
-				}
-				self.simple_taproot_store_counterparty_next_local_nonce(
-					expected_funding_txids[0],
-					legacy_next_local_nonce,
-				);
-				return Ok(());
-			},
-		};
+		if legacy_next_local_nonce.is_some() {
+			return Err(ChannelError::close(
+				"Peer sent legacy simple-taproot scalar nonce".to_owned(),
+			));
+		}
+		let next_local_nonces = next_local_nonces.ok_or_else(|| {
+			ChannelError::close("Peer omitted simple-taproot next-local nonce map".to_owned())
+		})?;
 		let mut seen_funding_txids = Vec::new();
 		for entry in next_local_nonces.0.iter() {
 			if !expected_funding_txids.iter().any(|txid| *txid == entry.funding_txid) {
@@ -6483,6 +6472,20 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 			);
 		}
 		Ok(())
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	fn simple_taproot_counterparty_commitment_signing_nonce_index(
+		commitment_nonce_index: u64, counterparty_public_nonce: &Musig2PublicNonce,
+	) -> u64 {
+		let mut preimage = Vec::new();
+		preimage.extend_from_slice(b"ldk-simple-taproot-retransmit-nonce-index-v1");
+		preimage.extend_from_slice(&commitment_nonce_index.to_be_bytes());
+		preimage.extend_from_slice(counterparty_public_nonce.as_bytes());
+		let hash = Sha256::hash(&preimage).to_byte_array();
+		let mut index_bytes = [0; 8];
+		index_bytes.copy_from_slice(&hash[..8]);
+		u64::from_be_bytes(index_bytes) & INITIAL_COMMITMENT_NUMBER
 	}
 
 	#[cfg(feature = "simple_taproot_musig2")]
@@ -6588,11 +6591,6 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 			return Ok(None);
 		}
 		let funding_txid = Self::simple_taproot_funding_txid(funding)?;
-		if let Some(signature) =
-			self.simple_taproot_sent_commitment_signatures.get(funding_txid, nonce_index)
-		{
-			return Ok(Some(signature));
-		}
 
 		let counterparty_public_nonce = if nonce_index == INITIAL_COMMITMENT_NUMBER {
 			self.simple_taproot_counterparty_initial_local_nonce.ok_or_else(|| {
@@ -6609,6 +6607,23 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 				},
 			)?
 		};
+		let signing_nonce_index = if nonce_index == INITIAL_COMMITMENT_NUMBER {
+			nonce_index
+		} else {
+			// A reestablish may replace the peer's next-local nonce map for
+			// retransmission. Key our signing nonce and cached partial by that
+			// advertised nonce so a retransmit with fresh peer nonce material
+			// cannot reuse a partial generated for the old aggregate nonce.
+			Self::simple_taproot_counterparty_commitment_signing_nonce_index(
+				nonce_index,
+				&counterparty_public_nonce,
+			)
+		};
+		if let Some(signature) =
+			self.simple_taproot_sent_commitment_signatures.get(funding_txid, signing_nonce_index)
+		{
+			return Ok(Some(signature));
+		}
 		let nonce_counterparty_funding_pubkey = if nonce_index == INITIAL_COMMITMENT_NUMBER {
 			self.simple_taproot_initial_nonce_counterparty_funding_pubkey(funding)
 		} else {
@@ -6624,7 +6639,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 			.simple_taproot_musig_counter_nonce_pair(
 				nonce_counterparty_funding_pubkey,
 				nonce_funding_txid,
-				nonce_index,
+				signing_nonce_index,
 				SimpleTaprootNonceScope::CounterpartyCommitment,
 				SIMPLE_TAPROOT_COUNTERPARTY_COMMITMENT_NONCE_PREIMAGE,
 				funding.channel_transaction_parameters.splice_parent_funding_txid,
@@ -6647,7 +6662,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 				&public_nonces,
 				&message,
 				nonce_funding_txid,
-				nonce_index,
+				signing_nonce_index,
 				SimpleTaprootNonceScope::CounterpartyCommitment,
 				funding.channel_transaction_parameters.splice_parent_funding_txid,
 				funding.channel_transaction_parameters.simple_taproot_tapscript_root,
@@ -6660,7 +6675,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 		self.simple_taproot_sent_commitment_signatures.upsert(
 			SimpleTaprootSentCommitmentSignature {
 				funding_txid,
-				nonce_index,
+				nonce_index: signing_nonce_index,
 				partial_signature_with_nonce: signature,
 			},
 		);
@@ -12540,20 +12555,12 @@ where
 						return None;
 					},
 				};
-				let simple_taproot_next_local_nonce =
-					simple_taproot_next_local_nonces.as_ref().and_then(|nonces| {
-						if nonces.0.len() == 1 {
-							Some(nonces.0[0].public_nonce)
-						} else {
-							None
-						}
-					});
 				return Some(msgs::RevokeAndACK {
 					channel_id: self.context.channel_id,
 					per_commitment_secret,
 					next_per_commitment_point: self.holder_commitment_point.next_point(),
 					release_htlc_message_paths,
-					simple_taproot_next_local_nonce,
+					simple_taproot_next_local_nonce: None,
 					simple_taproot_next_local_nonces,
 				});
 			}
@@ -15357,14 +15364,6 @@ where
 				None
 			},
 		};
-		let simple_taproot_next_local_nonce =
-			simple_taproot_next_local_nonces.as_ref().and_then(|nonces| {
-				if nonces.0.len() == 1 {
-					Some(nonces.0[0].public_nonce)
-				} else {
-					None
-				}
-			});
 		msgs::ChannelReestablish {
 			channel_id: self.context.channel_id(),
 			// The protocol has two different commitment number concepts - the "commitment
@@ -15389,7 +15388,7 @@ where
 			my_current_per_commitment_point: dummy_pubkey,
 			next_funding: self.maybe_get_next_funding(),
 			my_current_funding_locked,
-			simple_taproot_next_local_nonce,
+			simple_taproot_next_local_nonce: None,
 			simple_taproot_next_local_nonces,
 		}
 	}
@@ -20447,6 +20446,7 @@ mod tests {
 	use crate::ln::simple_taproot::{
 		simple_taproot_to_local_spend_info, simple_taproot_to_local_spend_info_with_aux_leaf,
 		simple_taproot_to_remote_spend_info, simple_taproot_to_remote_spend_info_with_aux_leaf,
+		Musig2PublicNonce, SimpleTaprootNextLocalNonces, SimpleTaprootNonceEntry,
 	};
 	#[cfg(feature = "simple_taproot_musig2")]
 	use crate::ln::taproot_asset::{
@@ -20834,6 +20834,217 @@ mod tests {
 		assert_eq!(msg.next_local_commitment_number, 1); // now called next_commitment_number
 		assert_eq!(msg.next_remote_commitment_number, 0); // now called next_revocation_number
 		assert_eq!(msg.your_last_per_commitment_secret, [0; 32]);
+	}
+
+	#[test]
+	#[cfg(feature = "simple_taproot_musig2")]
+	fn simple_taproot_type22_nonce_maps_are_authoritative_for_reconnect() {
+		let test_est = TestFeeEstimator::new(15000);
+		let feeest = LowerBoundedFeeEstimator::new(&test_est);
+		let logger = TestLogger::new();
+		let secp_ctx = Secp256k1::new();
+		let seed = [42; 32];
+		let network = Network::Testnet;
+		let best_block = BlockLocator::from_network(network);
+		let mut keys_provider = TestKeysInterface::new(&seed, network);
+		keys_provider.disable_all_state_policy_checks = true;
+		let node_b_node_id =
+			PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[42; 32]).unwrap());
+		let mut config = UserConfig::default();
+		config.channel_handshake_config.negotiate_taproot_asset_channels = true;
+		let features = channelmanager::provided_init_features(&config);
+		let mut outbound_chan = OutboundV1Channel::<&TestKeysInterface>::new(
+			&feeest,
+			&&keys_provider,
+			&&keys_provider,
+			node_b_node_id,
+			&features,
+			10000000,
+			100000,
+			42,
+			&config,
+			0,
+			42,
+			None,
+			&logger,
+			None,
+		)
+		.unwrap();
+		let open_channel_msg = outbound_chan
+			.get_open_channel(ChainHash::using_genesis_block(network), &&logger)
+			.unwrap();
+		let node_a_node_id =
+			PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[7; 32]).unwrap());
+		let mut inbound_chan = InboundV1Channel::<&TestKeysInterface>::new(
+			&feeest,
+			&&keys_provider,
+			&&keys_provider,
+			node_a_node_id,
+			&channelmanager::provided_channel_type_features(&config),
+			&features,
+			&open_channel_msg,
+			7,
+			&config,
+			0,
+			&&logger,
+			None,
+		)
+		.unwrap();
+		outbound_chan
+			.accept_channel(
+				&inbound_chan.get_accept_channel_message(&&logger).unwrap(),
+				&config.channel_handshake_limits,
+				&features,
+			)
+			.unwrap();
+		let tx = Transaction {
+			version: Version::ONE,
+			lock_time: LockTime::ZERO,
+			input: Vec::new(),
+			output: vec![TxOut {
+				value: Amount::from_sat(10000000),
+				script_pubkey: outbound_chan.funding.get_funding_redeemscript(),
+			}],
+		};
+		let funding_outpoint = OutPoint { txid: tx.compute_txid(), index: 0 };
+		let funding_created = outbound_chan
+			.get_funding_created(tx.clone(), funding_outpoint, false, &&logger)
+			.map_err(|_| ())
+			.unwrap()
+			.unwrap();
+		let (_, funding_signed_msg, _) = inbound_chan
+			.funding_created(&funding_created, best_block, &&keys_provider, &&logger)
+			.unwrap_or_else(|(_, e)| panic!("{}", e));
+		let funding_signed_res = outbound_chan.funding_signed(
+			&funding_signed_msg.unwrap(),
+			best_block,
+			&&keys_provider,
+			&&logger,
+		);
+		let (mut chan, _) = if let Ok(res) = funding_signed_res { res } else { panic!() };
+		assert!(chan.funding.get_channel_type().requires_taproot_asset_channel());
+
+		assert!(chan.remove_uncommitted_htlcs_and_mark_paused(&&logger).is_ok());
+		let reestablish = chan.get_channel_reestablish(&&logger);
+		assert!(reestablish.simple_taproot_next_local_nonce.is_none());
+		let reestablish_nonces = reestablish.simple_taproot_next_local_nonces.unwrap();
+		assert_eq!(reestablish_nonces.0.len(), 1);
+		assert_eq!(reestablish_nonces.0[0].funding_txid, funding_outpoint.txid);
+
+		chan.holder_commitment_point
+			.advance(&chan.context.holder_signer, &chan.context.secp_ctx, &&logger)
+			.unwrap();
+		chan.holder_commitment_point
+			.advance(&chan.context.holder_signer, &chan.context.secp_ctx, &&logger)
+			.unwrap();
+		let revoke_and_ack = chan.get_last_revoke_and_ack(|_| unreachable!(), &&logger).unwrap();
+		assert!(revoke_and_ack.simple_taproot_next_local_nonce.is_none());
+		let raa_nonces = revoke_and_ack.simple_taproot_next_local_nonces.unwrap();
+		assert_eq!(raa_nonces.0.len(), 1);
+		assert_eq!(raa_nonces.0[0].funding_txid, funding_outpoint.txid);
+
+		let first_nonce =
+			Musig2PublicNonce::from_points(&test_utils::pubkey(3), &test_utils::pubkey(4));
+		let second_nonce =
+			Musig2PublicNonce::from_points(&test_utils::pubkey(5), &test_utils::pubkey(6));
+		let first_map = SimpleTaprootNextLocalNonces(vec![SimpleTaprootNonceEntry {
+			funding_txid: funding_outpoint.txid,
+			public_nonce: first_nonce,
+		}]);
+		let second_map = SimpleTaprootNextLocalNonces(vec![SimpleTaprootNonceEntry {
+			funding_txid: funding_outpoint.txid,
+			public_nonce: second_nonce,
+		}]);
+		assert!(chan
+			.context
+			.simple_taproot_store_counterparty_next_local_nonces(
+				Some(first_nonce),
+				None,
+				&[funding_outpoint.txid],
+			)
+			.is_err());
+		assert!(chan
+			.context
+			.simple_taproot_store_counterparty_next_local_nonces(
+				Some(first_nonce),
+				Some(&first_map),
+				&[funding_outpoint.txid],
+			)
+			.is_err());
+		assert!(chan
+			.context
+			.simple_taproot_store_counterparty_next_local_nonces(
+				None,
+				None,
+				&[funding_outpoint.txid],
+			)
+			.is_err());
+		assert!(chan
+			.context
+			.simple_taproot_store_counterparty_next_local_nonces(
+				None,
+				Some(&SimpleTaprootNextLocalNonces(Vec::new())),
+				&[funding_outpoint.txid],
+			)
+			.is_err());
+		chan.context
+			.simple_taproot_store_counterparty_next_local_nonces(
+				None,
+				Some(&first_map),
+				&[funding_outpoint.txid],
+			)
+			.unwrap();
+
+		chan.context.counterparty_next_commitment_transaction_number =
+			super::INITIAL_COMMITMENT_NUMBER - 1;
+		chan.context.counterparty_next_commitment_point = Some(test_utils::pubkey(43));
+		let commitment_data = chan.context.build_commitment_transaction(
+			&chan.funding,
+			chan.context.counterparty_next_commitment_transaction_number,
+			&chan.context.counterparty_next_commitment_point.unwrap(),
+			false,
+			true,
+			&&logger,
+		);
+		let commitment_tx = commitment_data.tx.trust().built_transaction().transaction.clone();
+		let first_partial = chan
+			.context
+			.simple_taproot_sign_commitment_partial(
+				&chan.funding,
+				chan.context.counterparty_next_commitment_transaction_number,
+				&commitment_tx,
+			)
+			.unwrap()
+			.unwrap();
+
+		chan.context
+			.simple_taproot_store_counterparty_next_local_nonces(
+				None,
+				Some(&second_map),
+				&[funding_outpoint.txid],
+			)
+			.unwrap();
+		let second_partial = chan
+			.context
+			.simple_taproot_sign_commitment_partial(
+				&chan.funding,
+				chan.context.counterparty_next_commitment_transaction_number,
+				&commitment_tx,
+			)
+			.unwrap()
+			.unwrap();
+		assert_ne!(first_partial.public_nonce, second_partial.public_nonce);
+		assert_ne!(first_partial.partial_signature, second_partial.partial_signature);
+		let repeated_second_partial = chan
+			.context
+			.simple_taproot_sign_commitment_partial(
+				&chan.funding,
+				chan.context.counterparty_next_commitment_transaction_number,
+				&commitment_tx,
+			)
+			.unwrap()
+			.unwrap();
+		assert_eq!(second_partial, repeated_second_partial);
 	}
 
 	#[test]
