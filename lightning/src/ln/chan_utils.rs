@@ -49,7 +49,7 @@ use super::channel_keys::{
 #[cfg(feature = "simple_taproot_musig2")]
 use super::simple_taproot::{
 	simple_taproot_anchor_spend_info, simple_taproot_htlc_spend_info_with_aux_leaf_for_variant,
-	simple_taproot_second_level_htlc_spend_info, simple_taproot_to_local_spend_info,
+	simple_taproot_second_level_htlc_spend_info_with_aux_leaf, simple_taproot_to_local_spend_info,
 	simple_taproot_to_local_spend_info_with_aux_leaf, simple_taproot_to_remote_spend_info,
 	simple_taproot_to_remote_spend_info_with_aux_leaf, SimpleTaprootHtlcScriptVariant,
 	SimpleTaprootHtlcSpendInfo, SimpleTaprootKeyAggContext, SimpleTaprootMusigError,
@@ -774,6 +774,11 @@ pub struct HTLCOutputInCommitment {
 	/// This must be derived from the asset-channel commitment state that corresponds to the same
 	/// Lightning commitment number. Normal BTC-only HTLCs leave this unset.
 	pub simple_taproot_aux_leaf_script: Option<ScriptBuf>,
+	/// Optional Taproot Asset auxiliary leaf script committed into this HTLC's second-level output.
+	///
+	/// Lightning Labs derives a distinct second-level leaf once the commitment transaction is known.
+	/// Normal BTC-only HTLCs and asset HTLCs without second-level asset state leave this unset.
+	pub simple_taproot_second_level_aux_leaf_script: Option<ScriptBuf>,
 }
 
 impl HTLCOutputInCommitment {
@@ -792,6 +797,8 @@ impl HTLCOutputInCommitment {
 			&& self.cltv_expiry == other.cltv_expiry
 			&& self.payment_hash == other.payment_hash
 			&& self.simple_taproot_aux_leaf_script == other.simple_taproot_aux_leaf_script
+			&& self.simple_taproot_second_level_aux_leaf_script
+				== other.simple_taproot_second_level_aux_leaf_script
 	}
 }
 
@@ -802,6 +809,7 @@ impl_writeable_tlv_based!(HTLCOutputInCommitment, {
 	(6, payment_hash, required),
 	(8, transaction_output_index, option),
 	(10, simple_taproot_aux_leaf_script, option),
+	(12, simple_taproot_second_level_aux_leaf_script, option),
 });
 
 #[inline]
@@ -1031,11 +1039,12 @@ pub(crate) fn build_htlc_output(
 			#[cfg(feature = "simple_taproot_musig2")]
 			if requires_simple_taproot_outputs(channel_type_features) {
 				let secp_ctx = Secp256k1::verification_only();
-				simple_taproot_second_level_htlc_spend_info(
+				simple_taproot_second_level_htlc_spend_info_with_aux_leaf(
 					&secp_ctx,
 					&broadcaster_delayed_payment_key.to_public_key(),
 					&revocation_key.to_public_key(),
 					contest_delay,
+					htlc.simple_taproot_second_level_aux_leaf_script.as_deref(),
 				)
 				.expect("valid simple-taproot second-level HTLC output")
 				.script_pubkey
@@ -2715,6 +2724,7 @@ mod tests {
 	#[cfg(feature = "simple_taproot_musig2")]
 	use crate::ln::simple_taproot::{
 		simple_taproot_htlc_spend_info_with_aux_leaf_for_variant,
+		simple_taproot_second_level_htlc_spend_info_with_aux_leaf,
 		simple_taproot_to_local_spend_info, simple_taproot_to_local_spend_info_with_aux_leaf,
 		simple_taproot_to_remote_spend_info, simple_taproot_to_remote_spend_info_with_aux_leaf,
 		SimpleTaprootHtlcScriptVariant,
@@ -2877,6 +2887,7 @@ mod tests {
 			payment_hash: PaymentHash(Sha256::hash(&[preimage_byte; 32]).to_byte_array()),
 			transaction_output_index: None,
 			simple_taproot_aux_leaf_script: None,
+			simple_taproot_second_level_aux_leaf_script: None,
 		}
 	}
 
@@ -2939,6 +2950,7 @@ mod tests {
 			payment_hash: PaymentHash([42; 32]),
 			transaction_output_index: None,
 			simple_taproot_aux_leaf_script: None,
+			simple_taproot_second_level_aux_leaf_script: None,
 		};
 
 		let offered_htlc = HTLCOutputInCommitment {
@@ -2948,6 +2960,7 @@ mod tests {
 			payment_hash: PaymentHash([43; 32]),
 			transaction_output_index: None,
 			simple_taproot_aux_leaf_script: None,
+			simple_taproot_second_level_aux_leaf_script: None,
 		};
 
 		// Generate broadcaster output and received and offered HTLC outputs, w/o anchors
@@ -3284,6 +3297,7 @@ mod tests {
 			payment_hash,
 			transaction_output_index: None,
 			simple_taproot_aux_leaf_script: None,
+			simple_taproot_second_level_aux_leaf_script: None,
 		};
 		let offered_htlc = HTLCOutputInCommitment {
 			offered: true,
@@ -3292,6 +3306,7 @@ mod tests {
 			payment_hash,
 			transaction_output_index: None,
 			simple_taproot_aux_leaf_script: None,
+			simple_taproot_second_level_aux_leaf_script: None,
 		};
 		let tx = builder.build(6_988_000, 3_000_000, vec![accepted_htlc.clone(), offered_htlc.clone()]);
 		let outputs = &tx.built.transaction.output;
@@ -3364,9 +3379,12 @@ mod tests {
 		let mut builder = simple_taproot_vector_builder();
 		builder.feerate_per_kw = 644;
 		let aux_leaf = ScriptBuf::new_op_return(&[11; 32]);
+		let second_level_aux_leaf = ScriptBuf::new_op_return(&[22; 32]);
 		let plain_htlc = bolt_simple_taproot_htlc(false, 1_000_000, 500, 3);
 		let mut asset_htlc = plain_htlc.clone();
 		asset_htlc.simple_taproot_aux_leaf_script = Some(aux_leaf.clone());
+		asset_htlc.simple_taproot_second_level_aux_leaf_script =
+			Some(second_level_aux_leaf.clone());
 
 		let plain_tx = builder.build(6_988_000, 3_000_000, vec![plain_htlc]);
 		let asset_tx = builder.build(6_988_000, 3_000_000, vec![asset_htlc.clone()]);
@@ -3395,6 +3413,41 @@ mod tests {
 			asset_tx.nondust_htlcs()[0].simple_taproot_aux_leaf_script,
 			Some(aux_leaf.clone())
 		);
+		assert_eq!(
+			asset_tx.nondust_htlcs()[0].simple_taproot_second_level_aux_leaf_script,
+			Some(second_level_aux_leaf.clone())
+		);
+
+		let plain_htlc_tx = build_htlc_transaction(
+			&plain_tx.trust().txid(),
+			builder.feerate_per_kw,
+			builder.channel_parameters.holder_selected_contest_delay,
+			plain_tx.nondust_htlcs().first().unwrap(),
+			&builder.channel_parameters.channel_type_features,
+			&plain_tx.trust().keys().broadcaster_delayed_payment_key,
+			&plain_tx.trust().keys().revocation_key,
+		);
+		let asset_htlc_tx = build_htlc_transaction(
+			&asset_tx.trust().txid(),
+			builder.feerate_per_kw,
+			builder.channel_parameters.holder_selected_contest_delay,
+			asset_tx.nondust_htlcs().first().unwrap(),
+			&builder.channel_parameters.channel_type_features,
+			&keys.broadcaster_delayed_payment_key,
+			&keys.revocation_key,
+		);
+		let expected_second_level_script =
+			simple_taproot_second_level_htlc_spend_info_with_aux_leaf(
+				&builder.secp_ctx,
+				&keys.broadcaster_delayed_payment_key.to_public_key(),
+				&keys.revocation_key.to_public_key(),
+				builder.channel_parameters.holder_selected_contest_delay,
+				Some(second_level_aux_leaf.as_script()),
+			)
+			.unwrap()
+			.script_pubkey;
+		assert_eq!(asset_htlc_tx.output[0].script_pubkey, expected_second_level_script);
+		assert_ne!(plain_htlc_tx.output[0].script_pubkey, expected_second_level_script);
 		assert!(builder.verify(&asset_tx).is_ok());
 
 		let mut writer = test_utils::TestVecWriter(Vec::new());
@@ -3403,6 +3456,10 @@ mod tests {
 		assert_eq!(
 			read_tx.nondust_htlcs()[0].simple_taproot_aux_leaf_script,
 			Some(aux_leaf)
+		);
+		assert_eq!(
+			read_tx.nondust_htlcs()[0].simple_taproot_second_level_aux_leaf_script,
+			Some(second_level_aux_leaf)
 		);
 		assert!(builder.verify(&read_tx).is_ok());
 	}
@@ -3957,6 +4014,7 @@ mod tests {
 			payment_hash: PaymentHash([0xbb; 32]),
 			transaction_output_index: Some(0),
 			simple_taproot_aux_leaf_script: None,
+			simple_taproot_second_level_aux_leaf_script: None,
 		};
 
 		// Check amount sorting

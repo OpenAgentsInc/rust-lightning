@@ -1578,10 +1578,35 @@ pub fn simple_taproot_second_level_htlc_spend_info<C: Verification>(
 	secp_ctx: &Secp256k1<C>, local_delayed_pubkey: &PublicKey, revocation_pubkey: &PublicKey,
 	contest_delay: u16,
 ) -> Result<SimpleTaprootSingleLeafSpendInfo, SimpleTaprootMusigError> {
+	simple_taproot_second_level_htlc_spend_info_with_aux_leaf(
+		secp_ctx,
+		local_delayed_pubkey,
+		revocation_pubkey,
+		contest_delay,
+		None,
+	)
+}
+
+/// Returns all script-path spend data for a simple-taproot second-level HTLC output,
+/// optionally including a Taproot Asset auxiliary leaf.
+#[cfg(feature = "simple_taproot_musig2")]
+pub fn simple_taproot_second_level_htlc_spend_info_with_aux_leaf<C: Verification>(
+	secp_ctx: &Secp256k1<C>, local_delayed_pubkey: &PublicKey, revocation_pubkey: &PublicKey,
+	contest_delay: u16, auxiliary_leaf_script: Option<&Script>,
+) -> Result<SimpleTaprootSingleLeafSpendInfo, SimpleTaprootMusigError> {
 	let script = simple_taproot_to_local_delay_script(local_delayed_pubkey, contest_delay);
-	let spend_info = TaprootBuilder::new()
-		.add_leaf(0, script.clone())
-		.map_err(|_| SimpleTaprootMusigError::InvalidKey)?
+	let mut builder = TaprootBuilder::new();
+	if let Some(auxiliary_leaf_script) = auxiliary_leaf_script {
+		builder = builder
+			.add_leaf(1, script.clone())
+			.map_err(|_| SimpleTaprootMusigError::InvalidKey)?
+			.add_leaf(1, auxiliary_leaf_script.to_owned())
+			.map_err(|_| SimpleTaprootMusigError::InvalidKey)?;
+	} else {
+		builder =
+			builder.add_leaf(0, script.clone()).map_err(|_| SimpleTaprootMusigError::InvalidKey)?;
+	}
+	let spend_info = builder
 		.finalize(secp_ctx, xonly_key(revocation_pubkey))
 		.map_err(|_| SimpleTaprootMusigError::InvalidKey)?;
 	let script_pubkey = p2tr_script_pubkey(&spend_info);

@@ -81,7 +81,8 @@ use crate::ln::script::{self, ShutdownScript};
 #[cfg(feature = "simple_taproot_musig2")]
 use crate::ln::simple_taproot::{
 	simple_taproot_htlc_spend_info_with_aux_leaf_for_variant,
-	simple_taproot_schnorr_signature_from_htlc_wire_signature, simple_taproot_to_local_spend_info,
+	simple_taproot_schnorr_signature_from_htlc_wire_signature,
+	simple_taproot_second_level_htlc_spend_info, simple_taproot_to_local_spend_info,
 	simple_taproot_to_remote_spend_info, simple_taproot_verify_htlc_tapscript_signature,
 	SimpleTaprootNoncePair, SimpleTaprootNonceScope, SimpleTaprootSentCommitmentSignature,
 	SIMPLE_TAPROOT_COMMITMENT_NONCE_PREIMAGE, SIMPLE_TAPROOT_COOPERATIVE_CLOSE_NONCE_PREIMAGE,
@@ -6735,12 +6736,13 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 			.iter()
 			.map(|htlc| {
 				format!(
-					"offered={},amount_msat={},cltv={},output_index={:?},has_asset_aux={}",
+					"offered={},amount_msat={},cltv={},output_index={:?},has_asset_aux={},has_second_level_asset_aux={}",
 					htlc.offered,
 					htlc.amount_msat,
 					htlc.cltv_expiry,
 					htlc.transaction_output_index,
-					htlc.simple_taproot_aux_leaf_script.is_some()
+					htlc.simple_taproot_aux_leaf_script.is_some(),
+					htlc.simple_taproot_second_level_aux_leaf_script.is_some()
 				)
 			})
 			.collect::<Vec<_>>()
@@ -7267,15 +7269,32 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 						}
 						script
 					};
+					#[cfg(feature = "simple_taproot_musig2")]
+					let simple_taproot_second_level_aux_leaf_script = {
+						let script = self.taproot_asset_second_level_htlc_aux_leaf_script(
+							funding,
+							per_commitment_point,
+							local,
+							$htlc.taproot_asset_htlc_blob.as_ref(),
+							$htlc.htlc_id,
+						);
+						if script.is_some() {
+							simple_taproot_asset_full_htlc_present = true;
+						}
+						script
+					};
 					#[cfg(not(feature = "simple_taproot_musig2"))]
 					let simple_taproot_aux_leaf_script = None;
-				HTLCOutputInCommitment {
-					offered: $offered,
-					amount_msat: $htlc.amount_msat,
-					cltv_expiry: $htlc.cltv_expiry,
-					payment_hash: $htlc.payment_hash,
-					transaction_output_index: None,
+					#[cfg(not(feature = "simple_taproot_musig2"))]
+					let simple_taproot_second_level_aux_leaf_script = None;
+					HTLCOutputInCommitment {
+						offered: $offered,
+						amount_msat: $htlc.amount_msat,
+						cltv_expiry: $htlc.cltv_expiry,
+						payment_hash: $htlc.payment_hash,
+						transaction_output_index: None,
 						simple_taproot_aux_leaf_script,
+						simple_taproot_second_level_aux_leaf_script,
 					}
 				}
 			}
@@ -7519,6 +7538,67 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 			Some(TapNodeHash::from_byte_array(htlc_spend_info.tapscript_root)),
 		);
 		let output_xonly_key = Self::simple_taproot_script_pubkey_xonly_key(&htlc_script_pubkey)?;
+		derive_no_split_taproot_asset_aux_leaf_script(
+			template,
+			decoded.asset_amount,
+			output_xonly_key,
+		)
+		.ok()
+		.flatten()
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	fn taproot_asset_second_level_htlc_aux_leaf_script(
+		&self, funding: &FundingScope, per_commitment_point: &PublicKey, local: bool,
+		htlc_blob: Option<&Vec<u8>>, htlc_id: u64,
+	) -> Option<ScriptBuf> {
+		if !funding.get_channel_type().requires_taproot_asset_channel() {
+			return None;
+		}
+		let template = funding
+			.channel_transaction_parameters
+			.simple_taproot_asset_channel_template
+			.as_ref()?;
+		let decoded = decode_taproot_asset_htlc_blob(htlc_blob?.as_slice()).ok()?;
+		if decoded.asset_id != *template.asset_id()
+			|| decoded.asset_amount != template.total_amount()
+		{
+			return None;
+		}
+
+		let directed_parameters = if local {
+			funding.channel_transaction_parameters.as_holder_broadcastable()
+		} else {
+			funding.channel_transaction_parameters.as_counterparty_broadcastable()
+		};
+		let keys = TxCreationKeys::from_channel_static_keys(
+			per_commitment_point,
+			directed_parameters.broadcaster_pubkeys(),
+			directed_parameters.countersignatory_pubkeys(),
+			&self.secp_ctx,
+		);
+		let second_level_spend_info = simple_taproot_second_level_htlc_spend_info(
+			&self.secp_ctx,
+			&keys.broadcaster_delayed_payment_key.to_public_key(),
+			&keys.revocation_key.to_public_key(),
+			directed_parameters.contest_delay(),
+		)
+		.ok()?;
+
+		let tweak_value = if htlc_id == u64::MAX { 1 } else { htlc_id + 1 };
+		let mut tweak = [0u8; 32];
+		tweak[24..].copy_from_slice(&tweak_value.to_be_bytes());
+		let tweak = Scalar::from_be_bytes(tweak).ok()?;
+		let tweaked_internal_key =
+			keys.revocation_key.to_public_key().add_exp_tweak(&self.secp_ctx, &tweak).ok()?;
+		let (internal_xonly_key, _) = tweaked_internal_key.x_only_public_key();
+		let second_level_script_pubkey = ScriptBuf::new_p2tr(
+			&self.secp_ctx,
+			internal_xonly_key,
+			Some(TapNodeHash::from_byte_array(second_level_spend_info.tapscript_root)),
+		);
+		let output_xonly_key =
+			Self::simple_taproot_script_pubkey_xonly_key(&second_level_script_pubkey)?;
 		derive_no_split_taproot_asset_aux_leaf_script(
 			template,
 			decoded.asset_amount,

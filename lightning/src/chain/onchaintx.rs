@@ -1384,6 +1384,7 @@ mod tests {
 					payment_hash: hash,
 					transaction_output_index: Some(i as u32),
 					simple_taproot_aux_leaf_script: None,
+					simple_taproot_second_level_aux_leaf_script: None,
 				}
 			);
 		}
