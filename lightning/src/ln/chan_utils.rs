@@ -946,6 +946,7 @@ pub(crate) fn simple_taproot_htlc_sighash_type(
 ) -> bitcoin::sighash::TapSighashType {
 	if channel_type_features.supports_anchors_zero_fee_htlc_tx()
 		|| channel_type_features.supports_anchor_zero_fee_commitments()
+		|| requires_simple_taproot_outputs(channel_type_features)
 	{
 		bitcoin::sighash::TapSighashType::SinglePlusAnyoneCanPay
 	} else {
@@ -958,6 +959,7 @@ pub(crate) fn htlc_second_level_input_sequence(
 ) -> Sequence {
 	if channel_type_features.supports_anchors_zero_fee_htlc_tx()
 		|| channel_type_features.supports_anchor_zero_fee_commitments()
+		|| requires_simple_taproot_outputs(channel_type_features)
 	{
 		Sequence(1)
 	} else {
@@ -2742,7 +2744,8 @@ mod tests {
 	};
 	#[cfg(feature = "simple_taproot_musig2")]
 	use crate::ln::chan_utils::{
-		simple_taproot_htlc_script_variant, simple_taproot_to_remote_payment_key,
+		htlc_second_level_input_sequence, simple_taproot_htlc_script_variant,
+		simple_taproot_htlc_sighash_type, simple_taproot_to_remote_payment_key,
 	};
 	#[cfg(feature = "simple_taproot_musig2")]
 	use crate::ln::channel_keys::{DelayedPaymentBasepoint, HtlcBasepoint, RevocationBasepoint};
@@ -3390,7 +3393,19 @@ mod tests {
 			&tx.trust().keys().broadcaster_delayed_payment_key,
 			&tx.trust().keys().revocation_key,
 		);
-		assert_eq!(htlc_success.input[0].sequence, Sequence(0));
+		assert_eq!(htlc_success.input[0].sequence, Sequence(1));
+		assert_eq!(
+			simple_taproot_htlc_sighash_type(&builder.channel_parameters.channel_type_features),
+			bitcoin::sighash::TapSighashType::SinglePlusAnyoneCanPay
+		);
+		assert_eq!(
+			htlc_second_level_input_sequence(&ChannelTypeFeatures::taproot_asset_single_asset()),
+			Sequence(1)
+		);
+		assert_eq!(
+			simple_taproot_htlc_sighash_type(&ChannelTypeFeatures::taproot_asset_single_asset()),
+			bitcoin::sighash::TapSighashType::SinglePlusAnyoneCanPay
+		);
 		assert_eq!(htlc_success.output[0].value.to_sat(), 1_000);
 		assert_eq!(htlc_success.output[0].script_pubkey.as_bytes(), &<Vec<u8>>::from_hex("51205cf3964a0c10272a8fb62e9e1b87afb712265641eb89462f2df18cf1f43cf0c3").unwrap()[..]);
 
