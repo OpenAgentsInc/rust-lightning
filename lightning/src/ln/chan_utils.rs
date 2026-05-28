@@ -38,7 +38,7 @@ use crate::util::transaction_utils;
 
 use bitcoin::ecdsa::Signature as BitcoinSignature;
 use bitcoin::locktime::absolute::LockTime;
-use bitcoin::secp256k1::{ecdsa::Signature, Message, Secp256k1};
+use bitcoin::secp256k1::{ecdsa::Signature, schnorr, Message, Secp256k1};
 use bitcoin::secp256k1::{PublicKey, Scalar, SecretKey};
 use bitcoin::{secp256k1, Sequence, Witness};
 
@@ -1583,6 +1583,15 @@ pub struct HolderCommitmentTransaction {
 	pub counterparty_sig: Signature,
 	/// All non-dust counterparty HTLC signatures, in the order they appear in the transaction
 	pub counterparty_htlc_sigs: Vec<Signature>,
+	/// The final key-path MuSig2 signature for a simple-taproot funding output.
+	///
+	/// Legacy P2WSH channels leave this unset and build the 2-of-2 witness from
+	/// `counterparty_sig` plus the holder's ECDSA signature at broadcast time.
+	/// Simple-taproot channels must persist the aggregate Schnorr signature once
+	/// the peer partial verifies, otherwise force-close broadcast falls back to a
+	/// legacy witness that Bitcoin Core interprets as a malformed taproot
+	/// script-path spend.
+	simple_taproot_holder_signature: Option<schnorr::Signature>,
 	// Which order the signatures should go in when constructing the final commitment tx witness.
 	// The user should be able to reconstruct this themselves, so we don't bother to expose it.
 	holder_sig_first: bool,
@@ -1608,6 +1617,7 @@ impl_writeable_tlv_based!(HolderCommitmentTransaction, {
 	(2, counterparty_sig, required),
 	(4, holder_sig_first, required),
 	(6, counterparty_htlc_sigs, required_vec),
+	(8, simple_taproot_holder_signature, option),
 });
 
 impl HolderCommitmentTransaction {
@@ -1650,6 +1660,7 @@ impl HolderCommitmentTransaction {
 			inner,
 			counterparty_sig: dummy_sig,
 			counterparty_htlc_sigs,
+			simple_taproot_holder_signature: None,
 			holder_sig_first: false
 		}
 	}
@@ -1662,12 +1673,36 @@ impl HolderCommitmentTransaction {
 			inner: commitment_tx,
 			counterparty_sig,
 			counterparty_htlc_sigs,
+			simple_taproot_holder_signature: None,
 			holder_sig_first: holder_funding_key.serialize()[..] < counterparty_funding_key.serialize()[..],
 		}
 	}
 
+	/// Attach the final simple-taproot funding-output key-path signature.
+	pub(crate) fn with_simple_taproot_holder_signature(
+		mut self, signature: Option<schnorr::Signature>,
+	) -> Self {
+		self.simple_taproot_holder_signature = signature;
+		self
+	}
+
+	/// Returns a fully signed simple-taproot holder commitment transaction when
+	/// this commitment spends a P2TR funding output.
+	pub(crate) fn simple_taproot_signed_transaction(&self) -> Option<Transaction> {
+		self.simple_taproot_holder_signature.as_ref().map(|signature| {
+			let mut tx = self.inner.built.transaction.clone();
+			tx.input[0].witness = Witness::new();
+			tx.input[0].witness.push(signature.serialize().to_vec());
+			tx
+		})
+	}
+
 	#[rustfmt::skip]
 	pub(crate) fn add_holder_sig(&self, funding_redeemscript: &Script, holder_sig: Signature) -> Transaction {
+		if let Some(tx) = self.simple_taproot_signed_transaction() {
+			return tx;
+		}
+
 		// First push the multisig dummy, note that due to BIP147 (NULLDUMMY) it must be a zero-length element.
 		let mut tx = self.inner.built.transaction.clone();
 		tx.input[0].witness.push(Vec::new());
@@ -2753,7 +2788,7 @@ mod tests {
 		get_keyed_anchor_redeemscript, get_to_countersigner_keyed_anchor_redeemscript,
 		shared_anchor_script_pubkey, BuiltCommitmentTransaction, ChannelTransactionParameters,
 		CommitmentTransaction, CounterpartyChannelTransactionParameters, HTLCOutputInCommitment,
-		TrustedCommitmentTransaction,
+		HolderCommitmentTransaction, TrustedCommitmentTransaction,
 	};
 	#[cfg(feature = "simple_taproot_musig2")]
 	use crate::ln::chan_utils::{
@@ -2778,7 +2813,7 @@ mod tests {
 	use bitcoin::hashes::sha256::Hash as Sha256;
 	use bitcoin::hashes::Hash;
 	use bitcoin::hex::FromHex;
-	use bitcoin::secp256k1::{self, PublicKey, Secp256k1, SecretKey};
+	use bitcoin::secp256k1::{self, Keypair, Message, PublicKey, Secp256k1, SecretKey};
 	#[cfg(feature = "simple_taproot_musig2")]
 	use bitcoin::transaction::TxOut;
 	use bitcoin::PublicKey as BitcoinPublicKey;
@@ -2930,6 +2965,32 @@ mod tests {
 			simple_taproot_aux_leaf_script: None,
 			simple_taproot_second_level_aux_leaf_script: None,
 		}
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	#[test]
+	fn simple_taproot_holder_commitment_uses_key_path_witness() {
+		let builder = simple_taproot_vector_builder();
+		let commitment_tx = builder.build(1_000_000, 2_000_000, Vec::new());
+		let message = Message::from_digest([7; 32]);
+		let signing_key = SecretKey::from_slice(&[3; 32]).unwrap();
+		let counterparty_sig = builder.secp_ctx.sign_ecdsa(&message, &signing_key);
+		let holder_sig = builder.secp_ctx.sign_ecdsa(&message, &signing_key);
+		let keypair = Keypair::from_secret_key(&builder.secp_ctx, &signing_key);
+		let final_signature = builder.secp_ctx.sign_schnorr_no_aux_rand(&message, &keypair);
+		let holder_commitment_tx = HolderCommitmentTransaction::new(
+			commitment_tx,
+			counterparty_sig,
+			Vec::new(),
+			&builder.channel_parameters.holder_pubkeys.funding_pubkey,
+			&builder.counterparty_pubkeys.funding_pubkey,
+		)
+		.with_simple_taproot_holder_signature(Some(final_signature));
+
+		let tx = holder_commitment_tx
+			.add_holder_sig(&builder.channel_parameters.make_funding_redeemscript(), holder_sig);
+		assert_eq!(tx.input[0].witness.len(), 1);
+		assert_eq!(&tx.input[0].witness[0], final_signature.as_ref());
 	}
 
 	#[test]

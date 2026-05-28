@@ -738,6 +738,9 @@ impl HolderFundingOutput {
 			.unwrap_or(onchain_tx_handler.channel_parameters());
 		let commitment_tx = self.commitment_tx.as_ref()
 			.unwrap_or(onchain_tx_handler.current_holder_commitment_tx());
+		if let Some(signed_tx) = commitment_tx.simple_taproot_signed_transaction() {
+			return MaybeSignedTransaction(signed_tx);
+		}
 		let maybe_signed_tx = onchain_tx_handler.signer
 			.sign_holder_commitment(channel_parameters, commitment_tx, &onchain_tx_handler.secp_ctx)
 			.map(|holder_sig| {

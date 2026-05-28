@@ -22,7 +22,6 @@ use bitcoin::hashes::sha256d::Hash as Sha256d;
 use bitcoin::hashes::Hash;
 
 use bitcoin::secp256k1::constants::PUBLIC_KEY_SIZE;
-#[cfg(simple_close)]
 use bitcoin::secp256k1::schnorr;
 #[cfg(feature = "simple_taproot_musig2")]
 use bitcoin::secp256k1::Scalar;
@@ -3997,6 +3996,8 @@ trait InitialRemoteCommitmentReceiver<SP: SignerProvider> {
 
 	fn context_mut(&mut self) -> &mut ChannelContext<SP>;
 
+	fn context_and_funding_mut(&mut self) -> (&mut ChannelContext<SP>, &FundingScope);
+
 	fn funding(&self) -> &FundingScope;
 
 	fn funding_mut(&mut self) -> &mut FundingScope;
@@ -4059,26 +4060,39 @@ trait InitialRemoteCommitmentReceiver<SP: SignerProvider> {
 				panic!("unexpected error type from check_counterparty_commitment_signature {:?}", e);
 			}
 		};
-		let context = self.context();
-		let commitment_data = context.build_commitment_transaction(self.funding(),
-			context.counterparty_next_commitment_transaction_number,
-			&context.counterparty_next_commitment_point.unwrap(), false, false, logger);
+		let commitment_data = {
+			let context = self.context();
+			context.build_commitment_transaction(self.funding(),
+				context.counterparty_next_commitment_transaction_number,
+				&context.counterparty_next_commitment_point.unwrap(), false, false, logger)
+		};
 		let counterparty_initial_commitment_tx = commitment_data.tx;
 		let counterparty_trusted_tx = counterparty_initial_commitment_tx.trust();
 		let counterparty_initial_bitcoin_tx = counterparty_trusted_tx.built_transaction();
 
 		log_trace!(logger, "Initial counterparty tx for channel {} is: txid {} tx {}",
-			&context.channel_id(), counterparty_initial_bitcoin_tx.txid, encode::serialize_hex(&counterparty_initial_bitcoin_tx.transaction));
+			&self.context().channel_id(), counterparty_initial_bitcoin_tx.txid, encode::serialize_hex(&counterparty_initial_bitcoin_tx.transaction));
 
+		let initial_holder_bitcoin_tx = initial_commitment_tx.trust().built_transaction().transaction.clone();
+		let simple_taproot_holder_signature = {
+			let nonce_index = holder_commitment_point.next_transaction_number();
+			let (context, funding) = self.context_and_funding_mut();
+			context.simple_taproot_aggregate_holder_commitment_signature(
+				funding,
+				nonce_index,
+				&initial_holder_bitcoin_tx,
+				simple_taproot_partial_signature_with_nonce,
+			)?
+		};
 		let holder_commitment_tx = HolderCommitmentTransaction::new(
 			initial_commitment_tx,
 			counterparty_signature,
 			Vec::new(),
 			&self.funding().get_holder_pubkeys().funding_pubkey,
 			&self.funding().counterparty_funding_pubkey()
-		);
+		).with_simple_taproot_holder_signature(simple_taproot_holder_signature);
 
-		if context.holder_signer.validate_holder_commitment(&holder_commitment_tx, Vec::new()).is_err() {
+		if self.context().holder_signer.validate_holder_commitment(&holder_commitment_tx, Vec::new()).is_err() {
 			return Err(ChannelError::close("Failed to validate our commitment".to_owned()));
 		}
 
@@ -4140,6 +4154,10 @@ impl<SP: SignerProvider> InitialRemoteCommitmentReceiver<SP> for OutboundV1Chann
 		&mut self.context
 	}
 
+	fn context_and_funding_mut(&mut self) -> (&mut ChannelContext<SP>, &FundingScope) {
+		(&mut self.context, &self.funding)
+	}
+
 	fn funding(&self) -> &FundingScope {
 		&self.funding
 	}
@@ -4166,6 +4184,10 @@ impl<SP: SignerProvider> InitialRemoteCommitmentReceiver<SP> for InboundV1Channe
 		&mut self.context
 	}
 
+	fn context_and_funding_mut(&mut self) -> (&mut ChannelContext<SP>, &FundingScope) {
+		(&mut self.context, &self.funding)
+	}
+
 	fn funding(&self) -> &FundingScope {
 		&self.funding
 	}
@@ -4190,6 +4212,10 @@ impl<SP: SignerProvider> InitialRemoteCommitmentReceiver<SP> for FundedChannel<S
 
 	fn context_mut(&mut self) -> &mut ChannelContext<SP> {
 		&mut self.context
+	}
+
+	fn context_and_funding_mut(&mut self) -> (&mut ChannelContext<SP>, &FundingScope) {
+		(&mut self.context, &self.funding)
 	}
 
 	fn funding(&self) -> &FundingScope {
@@ -6742,6 +6768,144 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 		Ok(())
 	}
 
+	#[cfg(feature = "simple_taproot_musig2")]
+	fn simple_taproot_aggregate_holder_commitment_signature(
+		&mut self, funding: &FundingScope, nonce_index: u64, transaction: &Transaction,
+		partial_signature_with_nonce: Option<&SimpleTaprootPartialSignatureWithNonce>,
+	) -> Result<Option<schnorr::Signature>, ChannelError> {
+		if !Self::is_simple_taproot_funding(funding) {
+			return Ok(None);
+		}
+		let funding_txid = Self::simple_taproot_funding_txid(funding)?;
+		let partial_signature_with_nonce = partial_signature_with_nonce.ok_or_else(|| {
+			ChannelError::close(
+				"Peer omitted simple-taproot commitment partial signature".to_owned(),
+			)
+		})?;
+		let local_public_nonce = if nonce_index == INITIAL_COMMITMENT_NUMBER {
+			self.simple_taproot_initial_local_public_nonce(funding, nonce_index)?
+		} else {
+			self.simple_taproot_local_public_nonce(funding, nonce_index)?
+		}
+		.ok_or_else(|| {
+			ChannelError::close("Missing simple-taproot local commitment nonce".to_owned())
+		})?;
+		let nonce_counterparty_funding_pubkey = if nonce_index == INITIAL_COMMITMENT_NUMBER {
+			self.simple_taproot_initial_nonce_counterparty_funding_pubkey(funding)
+		} else {
+			*funding.counterparty_funding_pubkey()
+		};
+		let nonce_funding_txid = if nonce_index == INITIAL_COMMITMENT_NUMBER {
+			self.simple_taproot_initial_nonce_txid()?
+		} else {
+			funding_txid
+		};
+		let local_nonce_pair = self
+			.holder_signer
+			.simple_taproot_musig_counter_nonce_pair(
+				nonce_counterparty_funding_pubkey,
+				nonce_funding_txid,
+				nonce_index,
+				SimpleTaprootNonceScope::Commitment,
+				SIMPLE_TAPROOT_COMMITMENT_NONCE_PREIMAGE,
+				funding.channel_transaction_parameters.splice_parent_funding_txid,
+				funding.channel_transaction_parameters.simple_taproot_tapscript_root,
+				&self.secp_ctx,
+			)
+			.map_err(|_| {
+				ChannelError::close(
+					"Failed to derive simple-taproot holder commitment nonce".to_owned(),
+				)
+			})?;
+		if local_nonce_pair.public_nonce != local_public_nonce {
+			return Err(ChannelError::close(
+				"Signer returned mismatched simple-taproot holder commitment nonce".to_owned(),
+			));
+		}
+		let public_nonces =
+			[local_nonce_pair.public_nonce, partial_signature_with_nonce.public_nonce];
+		let message = Self::simple_taproot_commitment_sighash(funding, transaction)?;
+		let local_partial_with_nonce = self
+			.holder_signer
+			.simple_taproot_musig_sign_partial(
+				*funding.counterparty_funding_pubkey(),
+				local_nonce_pair.secret_nonce,
+				&public_nonces,
+				&message,
+				nonce_funding_txid,
+				nonce_index,
+				SimpleTaprootNonceScope::Commitment,
+				funding.channel_transaction_parameters.splice_parent_funding_txid,
+				funding.channel_transaction_parameters.simple_taproot_tapscript_root,
+				&self.secp_ctx,
+				&mut self.simple_taproot_nonce_state,
+			)
+			.map_err(|_| {
+				ChannelError::close(
+					"Failed to sign simple-taproot holder commitment partial".to_owned(),
+				)
+			})?;
+		if local_partial_with_nonce.public_nonce != local_nonce_pair.public_nonce {
+			return Err(ChannelError::close(
+				"Signer returned mismatched simple-taproot holder commitment signing nonce"
+					.to_owned(),
+			));
+		}
+		let key_agg_ctx = self
+			.holder_signer
+			.simple_taproot_musig_key_agg_context(
+				*funding.counterparty_funding_pubkey(),
+				funding.channel_transaction_parameters.splice_parent_funding_txid,
+				&self.secp_ctx,
+			)
+			.map_err(|_| {
+				ChannelError::close(
+					"Failed to build simple-taproot holder key aggregation context".to_owned(),
+				)
+			})?;
+		let final_signature = key_agg_ctx
+			.aggregate_final_signature_with_tapscript_root(
+				&[
+					local_partial_with_nonce.partial_signature,
+					partial_signature_with_nonce.partial_signature,
+				],
+				&public_nonces,
+				&message,
+				funding.channel_transaction_parameters.simple_taproot_tapscript_root,
+			)
+			.map_err(|_| {
+				ChannelError::close(
+					"Failed to aggregate simple-taproot holder commitment signature".to_owned(),
+				)
+			})?;
+		key_agg_ctx
+			.verify_final_signature_with_tapscript_root(
+				&final_signature,
+				&message,
+				funding.channel_transaction_parameters.simple_taproot_tapscript_root,
+			)
+			.map_err(|_| {
+				ChannelError::close(
+					"Invalid aggregate simple-taproot holder commitment signature".to_owned(),
+				)
+			})?;
+		Ok(Some(final_signature))
+	}
+
+	#[cfg(not(feature = "simple_taproot_musig2"))]
+	fn simple_taproot_aggregate_holder_commitment_signature(
+		&mut self, funding: &FundingScope, _nonce_index: u64, _transaction: &Transaction,
+		_partial_signature_with_nonce: Option<&SimpleTaprootPartialSignatureWithNonce>,
+	) -> Result<Option<schnorr::Signature>, ChannelError> {
+		if Self::is_simple_taproot_funding(funding) {
+			return Err(ChannelError::close(
+				"simple_taproot_musig2 feature is required for simple-taproot channel signing"
+					.to_owned(),
+			));
+		}
+		Ok(None)
+	}
+
 	fn simple_taproot_commitment_debug(
 		&self, funding: &FundingScope, commitment_data: &CommitmentData<'_>,
 	) -> String {
@@ -6782,10 +6946,10 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 	}
 
 	fn validate_commitment_signed<F: FeeEstimator, L: Logger>(
-		&self, funding: &FundingScope, transaction_number: u64, commitment_point: PublicKey,
+		&mut self, funding: &FundingScope, transaction_number: u64, commitment_point: PublicKey,
 		msg: &msgs::CommitmentSigned, fee_estimator: &LowerBoundedFeeEstimator<F>, logger: &L,
 	) -> Result<
-		(HolderCommitmentTransaction, Vec<(HTLCOutputInCommitment, Option<&HTLCSource>)>),
+		(HolderCommitmentTransaction, Vec<(HTLCOutputInCommitment, Option<HTLCSource>)>),
 		ChannelError,
 	> {
 		let funding_script = funding.get_funding_redeemscript();
@@ -7083,22 +7247,34 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 			}
 		}
 
+		let CommitmentData { tx, htlcs_included, outbound_htlc_preimages, .. } = commitment_data;
+		let htlcs_included = htlcs_included
+			.into_iter()
+			.map(|(htlc, source)| (htlc, source.cloned()))
+			.collect::<Vec<_>>();
+		let holder_bitcoin_tx = tx.trust().built_transaction().transaction.clone();
+		let simple_taproot_holder_signature = self
+			.simple_taproot_aggregate_holder_commitment_signature(
+				funding,
+				transaction_number,
+				&holder_bitcoin_tx,
+				msg.simple_taproot_partial_signature_with_nonce.as_ref(),
+			)?;
+
 		let holder_commitment_tx = HolderCommitmentTransaction::new(
-			commitment_data.tx,
+			tx,
 			msg.signature,
 			msg.htlc_signatures.clone(),
 			&funding.get_holder_pubkeys().funding_pubkey,
 			funding.counterparty_funding_pubkey(),
-		);
+		)
+		.with_simple_taproot_holder_signature(simple_taproot_holder_signature);
 
 		self.holder_signer
-			.validate_holder_commitment(
-				&holder_commitment_tx,
-				commitment_data.outbound_htlc_preimages,
-			)
+			.validate_holder_commitment(&holder_commitment_tx, outbound_htlc_preimages)
 			.map_err(|_| ChannelError::close("Failed to validate our commitment".to_owned()))?;
 
-		Ok((holder_commitment_tx, commitment_data.htlcs_included))
+		Ok((holder_commitment_tx, htlcs_included))
 	}
 
 	fn can_send_update_fee<F: FeeEstimator, L: Logger>(
@@ -10537,7 +10713,7 @@ where
 	}
 
 	fn get_commitment_htlc_data<'a>(
-		htlcs_included: &'a [(HTLCOutputInCommitment, Option<&HTLCSource>)],
+		htlcs_included: &'a [(HTLCOutputInCommitment, Option<HTLCSource>)],
 	) -> (
 		impl Iterator<Item = HTLCSource> + 'a,
 		impl Iterator<Item = (HTLCOutputInCommitment, Option<HTLCSource>)> + 'a,
@@ -10545,11 +10721,11 @@ where
 		let nondust_htlc_sources = htlcs_included
 			.iter()
 			.filter(|(htlc, _)| htlc.transaction_output_index.is_some() && htlc.offered)
-			.map(|(_, source_opt)| source_opt.cloned().expect("Missing outbound HTLC source"));
+			.map(|(_, source_opt)| source_opt.clone().expect("Missing outbound HTLC source"));
 		let dust_htlcs = htlcs_included
 			.iter()
 			.filter(|(htlc, _)| htlc.transaction_output_index.is_none())
-			.map(|(htlc, source_opt)| (htlc.clone(), source_opt.cloned()));
+			.map(|(htlc, source_opt)| (htlc.clone(), source_opt.clone()));
 		(nondust_htlc_sources, dust_htlcs)
 	}
 
@@ -10627,7 +10803,17 @@ where
 		// pending splice transaction has confirmed since receiving the batch.
 		let mut commitment_txs = Vec::with_capacity(self.pending_funding().len() + 1);
 		let mut htlc_data = None;
-		for funding in core::iter::once(&self.funding).chain(self.pending_funding().iter()) {
+		let pending_funding_len = self.pending_funding().len();
+		for funding_idx in 0..=pending_funding_len {
+			let funding = if funding_idx == 0 {
+				&self.funding
+			} else {
+				&self
+					.pending_splice
+					.as_ref()
+					.expect("pending funding must come from pending splice")
+					.negotiated_candidates[funding_idx - 1]
+			};
 			let funding_txid =
 				funding.get_funding_txid().expect("Funding txid must be known for pending scope");
 			let msg = messages.get(&funding_txid).ok_or_else(|| {

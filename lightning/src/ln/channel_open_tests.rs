@@ -303,12 +303,29 @@ fn test_simple_taproot_funding_generation_uses_p2tr_and_rejects_wrong_script() {
 			script_pubkey: output_script,
 		}],
 	};
+	let funding_outpoint = OutPoint { txid: funding_tx.compute_txid(), index: 0 };
 	nodes[0]
 		.node
 		.funding_transaction_generated(temporary_channel_id, node_b_id, funding_tx)
 		.unwrap();
 	let funding_created = get_event_msg!(nodes[0], MessageSendEvent::SendFundingCreated, node_b_id);
 	assert_eq!(funding_created.temporary_channel_id, temporary_channel_id);
+	nodes[1].node.handle_funding_created(node_a_id, &funding_created);
+	check_added_monitors(&nodes[1], 1);
+	let funding_signed = get_event_msg!(nodes[1], MessageSendEvent::SendFundingSigned, node_a_id);
+	nodes[0].node.handle_funding_signed(node_b_id, &funding_signed);
+	check_added_monitors(&nodes[0], 1);
+	let channel_id = ChannelId::v1_from_funding_outpoint(funding_outpoint);
+	let mut holder_commitment_txs = get_monitor!(nodes[0], channel_id)
+		.unsafe_get_latest_holder_commitment_txn(&nodes[0].logger);
+	assert_eq!(holder_commitment_txs.len(), 1);
+	let holder_commitment_tx = holder_commitment_txs.pop().unwrap();
+	assert_eq!(holder_commitment_tx.input[0].previous_output.txid, funding_outpoint.txid);
+	assert_eq!(holder_commitment_tx.input[0].previous_output.vout, funding_outpoint.index as u32);
+	assert_eq!(holder_commitment_tx.input[0].witness.len(), 1);
+	assert_eq!(holder_commitment_tx.input[0].witness[0].len(), 64);
+	nodes[0].node.get_and_clear_pending_events();
+	nodes[1].node.get_and_clear_pending_events();
 
 	nodes[0].node.create_channel(node_b_id, 1_000_000, 0, 43, None, None).unwrap();
 	let open_channel_msg = get_event_msg!(nodes[0], MessageSendEvent::SendOpenChannel, node_b_id);
