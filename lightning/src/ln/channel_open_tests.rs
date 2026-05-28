@@ -20,8 +20,8 @@ use crate::ln::channel::{
 	UNFUNDED_CHANNEL_AGE_LIMIT_TICKS,
 };
 use crate::ln::channelmanager::{
-	self, TrustedChannelFeatures, BREAKDOWN_TIMEOUT, MAX_UNFUNDED_CHANNEL_PEERS,
-	MAX_UNFUNDED_CHANS_PER_PEER,
+	self, RAACommitmentOrder, TrustedChannelFeatures, BREAKDOWN_TIMEOUT,
+	MAX_UNFUNDED_CHANNEL_PEERS, MAX_UNFUNDED_CHANS_PER_PEER,
 };
 use crate::ln::msgs::{
 	AcceptChannel, BaseMessageHandler, ChannelMessageHandler, ErrorAction, ErrorMessage,
@@ -381,6 +381,102 @@ fn test_simple_taproot_funding_generation_uses_p2tr_and_rejects_wrong_script() {
 		},
 		_ => panic!("Expected channel close after invalid funding script"),
 	}
+}
+
+#[cfg(feature = "simple_taproot_musig2")]
+#[test]
+fn simple_taproot_btc_only_conformance_gate_open_pay_reestablish_and_force_close() {
+	let mut simple_taproot_config = UserConfig::default();
+	simple_taproot_config.channel_handshake_config.negotiate_simple_taproot_channels = true;
+
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(
+		2,
+		&node_cfgs,
+		&[Some(simple_taproot_config.clone()), Some(simple_taproot_config)],
+	);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node.get_our_node_id();
+	let (_, funding_tx) =
+		create_unannounced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 100_000_000);
+	let channel_id = nodes[0].node.list_channels()[0].channel_id;
+	let expected_channel_type = ChannelTypeFeatures::simple_taproot_staging();
+	for node in nodes.iter() {
+		let details = node.node.list_channels();
+		assert_eq!(details.len(), 1);
+		let channel_type = details[0].channel_type.as_ref().unwrap();
+		assert_eq!(channel_type, &expected_channel_type);
+		assert!(!channel_type.requires_taproot_asset_channel());
+	}
+	assert!(funding_tx.output.iter().any(|output| output.script_pubkey.is_p2tr()));
+	assert!(!funding_tx.output.iter().any(|output| output.script_pubkey.is_p2wsh()));
+
+	send_payment(&nodes[0], &[&nodes[1]], 100_000);
+
+	nodes[0].node.peer_disconnected(node_b_id);
+	nodes[1].node.peer_disconnected(node_a_id);
+	connect_nodes(&nodes[0], &nodes[1]);
+	let node_0_reestablish = get_chan_reestablish_msgs!(nodes[0], nodes[1]);
+	let node_1_reestablish = get_chan_reestablish_msgs!(nodes[1], nodes[0]);
+	assert_eq!(node_0_reestablish.len(), 1);
+	assert_eq!(node_1_reestablish.len(), 1);
+	for reestablish in node_0_reestablish.iter().chain(node_1_reestablish.iter()) {
+		assert!(reestablish.simple_taproot_next_local_nonce.is_none());
+		let nonces = reestablish.simple_taproot_next_local_nonces.as_ref().unwrap();
+		assert_eq!(nonces.0.len(), 1);
+		assert_eq!(nonces.0[0].funding_txid, funding_tx.compute_txid());
+	}
+	nodes[1].node.handle_channel_reestablish(node_a_id, &node_0_reestablish[0]);
+	handle_chan_reestablish_msgs!(nodes[1], nodes[0]);
+	check_added_monitors(&nodes[1], 0);
+	nodes[0].node.handle_channel_reestablish(node_b_id, &node_1_reestablish[0]);
+	handle_chan_reestablish_msgs!(nodes[0], nodes[1]);
+	check_added_monitors(&nodes[0], 0);
+
+	send_payment(&nodes[1], &[&nodes[0]], 100_000);
+
+	let message = "simple taproot btc-only conformance force close".to_owned();
+	nodes[0]
+		.node
+		.force_close_broadcasting_latest_txn(&channel_id, &node_b_id, message.clone())
+		.unwrap();
+	let msg_events = nodes[0].node.get_and_clear_pending_msg_events();
+	assert_eq!(msg_events.len(), 1);
+	match &msg_events[0] {
+		MessageSendEvent::HandleError {
+			action: ErrorAction::SendErrorMessage { msg },
+			node_id,
+		} => {
+			assert_eq!(*node_id, node_b_id);
+			assert_eq!(msg.channel_id, channel_id);
+			assert_eq!(msg.data, "simple taproot btc-only conformance force close");
+		},
+		other => panic!("unexpected force-close message event: {:?}", other),
+	}
+	check_added_monitors(&nodes[0], 1);
+	let reason = ClosureReason::HolderForceClosed { broadcasted_latest_txn: Some(true), message };
+	check_closed_event(&nodes[0], 1, reason, &[node_b_id], 1_000_000);
+	let node_txn = nodes[0].tx_broadcaster.unique_txn_broadcast();
+	assert_eq!(node_txn.len(), 1);
+	check_spends!(node_txn[0], funding_tx);
+	assert_eq!(node_txn[0].input[0].witness.len(), 1);
+	assert_eq!(node_txn[0].input[0].witness[0].len(), 64);
+
+	let legacy_chanmon_cfgs = create_chanmon_cfgs(2);
+	let legacy_node_cfgs = create_node_cfgs(2, &legacy_chanmon_cfgs);
+	let legacy_node_chanmgrs = create_node_chanmgrs(2, &legacy_node_cfgs, &[None, None]);
+	let legacy_nodes = create_network(2, &legacy_node_cfgs, &legacy_node_chanmgrs);
+	let (_, legacy_funding_tx) =
+		create_unannounced_chan_between_nodes_with_value(&legacy_nodes, 0, 1, 1_000_000, 0);
+	let legacy_channel_type =
+		legacy_nodes[0].node.list_channels()[0].channel_type.as_ref().unwrap().clone();
+	assert!(!legacy_channel_type.requires_simple_taproot());
+	assert!(!legacy_channel_type.requires_simple_taproot_staging());
+	assert!(!legacy_channel_type.requires_taproot_asset_channel());
+	assert!(legacy_funding_tx.output.iter().any(|output| output.script_pubkey.is_p2wsh()));
+	send_payment(&legacy_nodes[0], &[&legacy_nodes[1]], 100_000);
 }
 
 #[cfg(feature = "simple_taproot_musig2")]
