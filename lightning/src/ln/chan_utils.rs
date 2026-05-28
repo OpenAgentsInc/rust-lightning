@@ -940,6 +940,31 @@ pub(crate) fn simple_taproot_htlc_script_variant(
 	}
 }
 
+#[cfg(feature = "simple_taproot_musig2")]
+pub(crate) fn simple_taproot_htlc_sighash_type(
+	channel_type_features: &ChannelTypeFeatures,
+) -> bitcoin::sighash::TapSighashType {
+	if channel_type_features.supports_anchors_zero_fee_htlc_tx()
+		|| channel_type_features.supports_anchor_zero_fee_commitments()
+	{
+		bitcoin::sighash::TapSighashType::SinglePlusAnyoneCanPay
+	} else {
+		bitcoin::sighash::TapSighashType::All
+	}
+}
+
+pub(crate) fn htlc_second_level_input_sequence(
+	channel_type_features: &ChannelTypeFeatures,
+) -> Sequence {
+	if channel_type_features.supports_anchors_zero_fee_htlc_tx()
+		|| channel_type_features.supports_anchor_zero_fee_commitments()
+	{
+		Sequence(1)
+	} else {
+		Sequence(0)
+	}
+}
+
 /// Returns the simple-taproot spend tree for a commitment HTLC using the same
 /// keys and optional aux leaf used to construct the commitment output.
 #[cfg(feature = "simple_taproot_musig2")]
@@ -1012,7 +1037,7 @@ pub(crate) fn build_htlc_input(commitment_txid: &Txid, htlc: &HTLCOutputInCommit
 			vout: htlc.transaction_output_index.expect("Can't build an HTLC transaction for a dust output"),
 		},
 		script_sig: ScriptBuf::new(),
-		sequence: Sequence(if channel_type_features.supports_anchors_zero_fee_htlc_tx() || requires_simple_taproot_outputs(channel_type_features) { 1 } else { 0 }),
+		sequence: htlc_second_level_input_sequence(channel_type_features),
 		witness: Witness::new(),
 	}
 }
@@ -3365,7 +3390,7 @@ mod tests {
 			&tx.trust().keys().broadcaster_delayed_payment_key,
 			&tx.trust().keys().revocation_key,
 		);
-		assert_eq!(htlc_success.input[0].sequence, Sequence(1));
+		assert_eq!(htlc_success.input[0].sequence, Sequence(0));
 		assert_eq!(htlc_success.output[0].value.to_sat(), 1_000);
 		assert_eq!(htlc_success.output[0].script_pubkey.as_bytes(), &<Vec<u8>>::from_hex("51205cf3964a0c10272a8fb62e9e1b87afb712265641eb89462f2df18cf1f43cf0c3").unwrap()[..]);
 

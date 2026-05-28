@@ -1620,34 +1620,54 @@ pub fn simple_taproot_second_level_htlc_spend_info_with_aux_leaf<C: Verification
 #[cfg(feature = "simple_taproot_musig2")]
 pub fn simple_taproot_htlc_tapscript_sighash(
 	htlc_tx: &Transaction, input_index: usize, previous_output: TxOut,
-	leaf: &SimpleTaprootLeafSpendInfo,
+	leaf: &SimpleTaprootLeafSpendInfo, sighash_type: TapSighashType,
 ) -> Result<[u8; 32], SimpleTaprootMusigError> {
 	let prevouts = [previous_output];
 	let prevouts = sighash::Prevouts::All(&prevouts);
 	let leaf_hash = TapLeafHash::from_script(&leaf.script, LeafVersion::TapScript);
 	let sighash = SighashCache::new(htlc_tx)
-		.taproot_script_spend_signature_hash(
-			input_index,
-			&prevouts,
-			leaf_hash,
-			TapSighashType::SinglePlusAnyoneCanPay,
-		)
+		.taproot_script_spend_signature_hash(input_index, &prevouts, leaf_hash, sighash_type)
 		.map_err(|_| SimpleTaprootMusigError::InvalidSignature)?;
 	Ok(sighash.to_byte_array())
 }
 
 /// Signs a second-level simple-taproot HTLC transaction with a BIP340 tapscript signature.
 #[cfg(feature = "simple_taproot_musig2")]
+pub fn simple_taproot_sign_htlc_tapscript_with_sighash_type<C: Signing>(
+	secp_ctx: &Secp256k1<C>, htlc_tx: &Transaction, input_index: usize, previous_output: TxOut,
+	leaf: &SimpleTaprootLeafSpendInfo, signer_secret_key: &SecretKey, aux_rand: &[u8; 32],
+	sighash_type: TapSighashType,
+) -> Result<TaprootSignature, SimpleTaprootMusigError> {
+	let sighash = simple_taproot_htlc_tapscript_sighash(
+		htlc_tx,
+		input_index,
+		previous_output,
+		leaf,
+		sighash_type,
+	)?;
+	let message = Message::from_digest(sighash);
+	let keypair = Keypair::from_secret_key(secp_ctx, signer_secret_key);
+	let signature = secp_ctx.sign_schnorr_with_aux_rand(&message, &keypair, aux_rand);
+	Ok(TaprootSignature { signature, sighash_type })
+}
+
+/// Signs a second-level simple-taproot HTLC transaction with the anchor-style
+/// BIP342 sighash used by BOLT anchor HTLC transactions.
+#[cfg(feature = "simple_taproot_musig2")]
 pub fn simple_taproot_sign_htlc_tapscript<C: Signing>(
 	secp_ctx: &Secp256k1<C>, htlc_tx: &Transaction, input_index: usize, previous_output: TxOut,
 	leaf: &SimpleTaprootLeafSpendInfo, signer_secret_key: &SecretKey, aux_rand: &[u8; 32],
 ) -> Result<TaprootSignature, SimpleTaprootMusigError> {
-	let sighash =
-		simple_taproot_htlc_tapscript_sighash(htlc_tx, input_index, previous_output, leaf)?;
-	let message = Message::from_digest(sighash);
-	let keypair = Keypair::from_secret_key(secp_ctx, signer_secret_key);
-	let signature = secp_ctx.sign_schnorr_with_aux_rand(&message, &keypair, aux_rand);
-	Ok(TaprootSignature { signature, sighash_type: TapSighashType::SinglePlusAnyoneCanPay })
+	simple_taproot_sign_htlc_tapscript_with_sighash_type(
+		secp_ctx,
+		htlc_tx,
+		input_index,
+		previous_output,
+		leaf,
+		signer_secret_key,
+		aux_rand,
+		TapSighashType::SinglePlusAnyoneCanPay,
+	)
 }
 
 /// Verifies a BIP340 tapscript signature for a second-level simple-taproot HTLC transaction.
@@ -1656,11 +1676,13 @@ pub fn simple_taproot_verify_htlc_tapscript_signature<C: Verification>(
 	secp_ctx: &Secp256k1<C>, htlc_tx: &Transaction, input_index: usize, previous_output: TxOut,
 	leaf: &SimpleTaprootLeafSpendInfo, signer_pubkey: &PublicKey, signature: &TaprootSignature,
 ) -> Result<(), SimpleTaprootMusigError> {
-	if signature.sighash_type != TapSighashType::SinglePlusAnyoneCanPay {
-		return Err(SimpleTaprootMusigError::InvalidSignature);
-	}
-	let sighash =
-		simple_taproot_htlc_tapscript_sighash(htlc_tx, input_index, previous_output, leaf)?;
+	let sighash = simple_taproot_htlc_tapscript_sighash(
+		htlc_tx,
+		input_index,
+		previous_output,
+		leaf,
+		signature.sighash_type,
+	)?;
 	let message = Message::from_digest(sighash);
 	secp_ctx
 		.verify_schnorr(&signature.signature, &message, &xonly_key(signer_pubkey))
@@ -1781,6 +1803,7 @@ pub fn simple_taproot_sign_htlc_spend<C: Signing + Verification>(
 		input_index,
 		TxOut { value: previous_amount, script_pubkey: previous_spend_info.script_pubkey.clone() },
 		leaf,
+		TapSighashType::SinglePlusAnyoneCanPay,
 	)?;
 	let witness = simple_taproot_htlc_input_witness(
 		spend_path,

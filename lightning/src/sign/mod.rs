@@ -62,7 +62,8 @@ use crate::ln::simple_taproot::{
 };
 #[cfg(feature = "simple_taproot_musig2")]
 use crate::ln::simple_taproot::{
-	simple_taproot_schnorr_signature_to_htlc_wire_signature, simple_taproot_sign_htlc_tapscript,
+	simple_taproot_schnorr_signature_to_htlc_wire_signature,
+	simple_taproot_sign_htlc_tapscript_with_sighash_type,
 };
 use crate::offers::invoice::UnsignedBolt12Invoice;
 use crate::types::features::ChannelTypeFeatures;
@@ -1917,7 +1918,7 @@ impl EcdsaChannelSigner for InMemorySigner {
 						.script_pubkey
 						.clone(),
 				};
-				let taproot_signature = simple_taproot_sign_htlc_tapscript(
+				let taproot_signature = simple_taproot_sign_htlc_tapscript_with_sighash_type(
 					secp_ctx,
 					&htlc_tx,
 					0,
@@ -1925,6 +1926,7 @@ impl EcdsaChannelSigner for InMemorySigner {
 					leaf,
 					&holder_htlc_key,
 					&self.get_secure_random_bytes(),
+					chan_utils::simple_taproot_htlc_sighash_type(chan_type),
 				)
 				.map_err(|_| ())?;
 				htlc_sigs.push(
@@ -2142,7 +2144,7 @@ impl EcdsaChannelSigner for InMemorySigner {
 				value: htlc_descriptor.htlc.to_bitcoin_amount(),
 				script_pubkey: spend_info.script_pubkey,
 			};
-			let taproot_signature = simple_taproot_sign_htlc_tapscript(
+			let taproot_signature = simple_taproot_sign_htlc_tapscript_with_sighash_type(
 				secp_ctx,
 				htlc_tx,
 				input,
@@ -2150,6 +2152,9 @@ impl EcdsaChannelSigner for InMemorySigner {
 				leaf,
 				&our_htlc_private_key,
 				&self.get_secure_random_bytes(),
+				chan_utils::simple_taproot_htlc_sighash_type(
+					channel_params.channel_type_features(),
+				),
 			)
 			.map_err(|_| ())?;
 			return simple_taproot_schnorr_signature_to_htlc_wire_signature(

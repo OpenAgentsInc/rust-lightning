@@ -6954,7 +6954,9 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 						})?;
 				let taproot_sig = bitcoin::taproot::Signature {
 					signature: schnorr_sig,
-					sighash_type: bitcoin::sighash::TapSighashType::SinglePlusAnyoneCanPay,
+					sighash_type: chan_utils::simple_taproot_htlc_sighash_type(
+						funding.get_channel_type(),
+					),
 				};
 				log_trace!(logger, "Checking simple-taproot HTLC signature {} by key {} against tx {} with leaf {} in channel {}.",
 					log_bytes!(counterparty_sig.serialize_compact()[..]),
