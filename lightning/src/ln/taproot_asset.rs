@@ -1141,6 +1141,12 @@ pub fn decode_taproot_asset_commitment_sig_blob(
 	Ok(TaprootAssetCommitmentSigBlob { htlc_sigs })
 }
 
+/// Encodes the Lightning Labs Taproot Asset commitment signature blob value
+/// for a commitment state with no non-dust asset HTLCs.
+pub fn empty_taproot_asset_commitment_sig_blob() -> Vec<u8> {
+	vec![0]
+}
+
 fn read_taproot_asset_commitment_aux_bigsize(
 	payload: &[u8], offset: &mut usize,
 ) -> Result<u64, TaprootAssetCommitmentAuxLeavesError> {
@@ -3082,6 +3088,15 @@ mod tests {
 			decode_taproot_asset_htlc_blob(&bad_asset_id_len),
 			Err(TaprootAssetHtlcBlobError::MalformedAssetId)
 		);
+	}
+
+	#[test]
+	fn decodes_empty_taproot_asset_commitment_sig_blob() {
+		let encoded = empty_taproot_asset_commitment_sig_blob();
+		assert_eq!(encoded, vec![0]);
+
+		let decoded = decode_taproot_asset_commitment_sig_blob(&encoded).unwrap();
+		assert!(decoded.htlc_sigs.is_empty());
 	}
 
 	#[test]

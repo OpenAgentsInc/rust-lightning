@@ -99,6 +99,7 @@ use crate::ln::simple_taproot::{
 use crate::ln::simple_taproot::{SimpleTaprootClosingOutputSet, SimpleTaprootPartialSignature};
 use crate::ln::taproot_asset::{
 	decode_taproot_asset_commitment_sig_blob, decode_taproot_asset_htlc_blob,
+	empty_taproot_asset_commitment_sig_blob,
 };
 #[cfg(feature = "simple_taproot_musig2")]
 use crate::ln::taproot_asset::{
@@ -8391,13 +8392,21 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 				debug_assert!(htlc_signatures.is_empty());
 			}
 			self.signer_pending_funding = false;
+			let taproot_asset_commitment_sig_blob =
+				if funding.get_channel_type().requires_taproot_asset_channel()
+					&& htlc_signatures.is_empty()
+				{
+					Some(empty_taproot_asset_commitment_sig_blob())
+				} else {
+					None
+				};
 			Some(msgs::CommitmentSigned {
 				channel_id: self.channel_id,
 				htlc_signatures,
 				signature,
 				funding_txid: funding.get_funding_txo().map(|funding_txo| funding_txo.txid),
 				simple_taproot_partial_signature_with_nonce: None,
-				taproot_asset_commitment_sig_blob: None,
+				taproot_asset_commitment_sig_blob,
 			})
 		} else {
 			log_debug!(
@@ -16700,6 +16709,14 @@ where
 					&counterparty_commitment_tx.trust().built_transaction().transaction,
 				)?
 			};
+		let taproot_asset_commitment_sig_blob =
+			if funding.get_channel_type().requires_taproot_asset_channel()
+				&& htlc_signatures.is_empty()
+			{
+				Some(empty_taproot_asset_commitment_sig_blob())
+			} else {
+				None
+			};
 
 		Ok(msgs::CommitmentSigned {
 			channel_id: context.channel_id,
@@ -16707,7 +16724,7 @@ where
 			htlc_signatures,
 			funding_txid: funding.get_funding_txo().map(|funding_txo| funding_txo.txid),
 			simple_taproot_partial_signature_with_nonce,
-			taproot_asset_commitment_sig_blob: None,
+			taproot_asset_commitment_sig_blob,
 		})
 	}
 
