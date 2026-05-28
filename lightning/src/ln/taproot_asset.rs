@@ -678,6 +678,13 @@ fn compressed_even_key_from_xonly(xonly_key: [u8; 32]) -> [u8; 33] {
 	script_key
 }
 
+pub(crate) fn htlc_index_script_key_tweak_bytes(htlc_index: u64) -> [u8; 32] {
+	let tweak_value = if htlc_index == u64::MAX { 1 } else { htlc_index + 1 };
+	let mut tweak = [0u8; 32];
+	tweak[24..].copy_from_slice(&tweak_value.to_be_bytes());
+	tweak
+}
+
 fn no_split_asset_commitment_key(
 	template: &TaprootAssetChannelAssetTemplate, output_xonly_key: [u8; 32],
 ) -> [u8; 32] {
@@ -2665,6 +2672,16 @@ mod tests {
 		]
 	}
 
+	fn live_litd_2026_05_28_htlc_blob() -> Vec<u8> {
+		hex_bytes(
+			"012c0020c246de3d8fd2ac23f5608a6e787d6cd3601c2d62cdbc3640d1b0dbab084e1df50108000000000000007d",
+		)
+	}
+
+	fn live_litd_2026_05_28_asset_id() -> [u8; TAPROOT_ASSET_ID_LEN] {
+		hex_32("c246de3d8fd2ac23f5608a6e787d6cd3601c2d62cdbc3640d1b0dbab084e1df5")
+	}
+
 	fn live_litd_commitment_sig_blob() -> Vec<u8> {
 		Vec::<u8>::from_hex(
 			"016e006c016a002047395f31d459f3e4137dc88ddaa6a2c363c6114160a4a82d65863bf401b1d14c014091778f0a6f36e5f5c77f3dccbd5a86be9e40edee21ad92e6446ac68cfdca593adf1baf8249071bec2024a993376800cea46ab788e5a0c50f325df223970b6572020400000083",
@@ -2837,6 +2854,18 @@ mod tests {
 		out
 	}
 
+	fn taproot_asset_v2_leaf_root_and_sum(script: &[u8]) -> ([u8; 32], u64) {
+		let script = if script.len() == 74 && script[0] == 73 { &script[1..] } else { script };
+		assert_eq!(script.len(), 73);
+		assert_eq!(&script[..32], &Sha256::hash(b"taproot-assets:194243").to_byte_array());
+		assert_eq!(script[32], 2);
+		let mut root_hash = [0u8; 32];
+		root_hash.copy_from_slice(&script[33..65]);
+		let mut sum_bytes = [0u8; 8];
+		sum_bytes.copy_from_slice(&script[65..73]);
+		(root_hash, u64::from_be_bytes(sum_bytes))
+	}
+
 	fn live_litd_payment_template_with_previous_witness() -> TaprootAssetChannelAssetTemplate {
 		let asset_id = hex_32("5e87032040d404d176e8ef042b9121f3146ce703cdcb60c70eb340b2f2921d7d");
 		TaprootAssetChannelAssetTemplate::new_with_previous_tx_witness(
@@ -2914,6 +2943,53 @@ mod tests {
 				.to_byte_array(),
 			hex_32("c16883462240be3a21602150d41b4c01b08f180cdc930de88213c5c89e9f8bdf")
 		);
+	}
+
+	#[test]
+	fn captures_live_litd_2026_05_28_second_level_transcript_mismatch() {
+		let decoded = decode_taproot_asset_htlc_blob(&live_litd_2026_05_28_htlc_blob()).unwrap();
+		assert_eq!(decoded.asset_id, live_litd_2026_05_28_asset_id());
+		assert_eq!(decoded.asset_amount, 125);
+
+		assert_eq!(
+			htlc_index_script_key_tweak_bytes(0),
+			hex_32("0000000000000000000000000000000000000000000000000000000000000001")
+		);
+		assert_eq!(
+			htlc_index_script_key_tweak_bytes(u64::MAX),
+			hex_32("0000000000000000000000000000000000000000000000000000000000000001")
+		);
+		assert_eq!(
+			htlc_index_script_key_tweak_bytes(7),
+			hex_32("0000000000000000000000000000000000000000000000000000000000000008")
+		);
+
+		let rust_second_level_aux_leaf = hex_bytes(
+			"496a47e8543f2ab163faf693971a653e54efe3d8056c52164c6b8bbf597b6ddb280288dbd45e53728ca954abfa2e522f44d22f6b74f5b7dd460bb800ee58ddc99876000000000000007d",
+		);
+		let (rust_output_commitment_root, rust_sum) =
+			taproot_asset_v2_leaf_root_and_sum(&rust_second_level_aux_leaf);
+		assert_eq!(rust_sum, 125);
+		assert_eq!(
+			rust_output_commitment_root,
+			hex_32("88dbd45e53728ca954abfa2e522f44d22f6b74f5b7dd460bb800ee58ddc99876")
+		);
+
+		let lightning_labs_tweaked_second_level_script_key =
+			hex_32("f12638d93f43df7ce215f8669a3db27f37ab155b9591fc68f400655666815f96");
+		// The live allocation's commitment key is not the simplified
+		// no-split hash over the tweaked script key alone.
+		assert_ne!(
+			Sha256::hash(&lightning_labs_tweaked_second_level_script_key).to_byte_array(),
+			hex_32("cfc3784d78ad19d8fab58aa122f9f38f574620b278d75d2c290107733224d79c")
+		);
+
+		let lightning_labs_output_commitment_root =
+			hex_32("879e7097820ec7ed9f065c91d6482bdefaec33ed5d30f70fbf4cff5d5d7cf12f");
+		let target_second_level_aux_leaf =
+			taproot_asset_v2_leaf_script(lightning_labs_output_commitment_root, 125);
+		assert_ne!(&rust_second_level_aux_leaf[1..], target_second_level_aux_leaf.as_slice());
+		assert_ne!(rust_output_commitment_root, lightning_labs_output_commitment_root);
 	}
 
 	#[test]

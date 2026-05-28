@@ -102,7 +102,8 @@ use crate::ln::taproot_asset::{
 };
 #[cfg(feature = "simple_taproot_musig2")]
 use crate::ln::taproot_asset::{
-	derive_no_split_taproot_asset_aux_leaf_script, TaprootAssetChannelAssetTemplate,
+	derive_no_split_taproot_asset_aux_leaf_script, htlc_index_script_key_tweak_bytes,
+	TaprootAssetChannelAssetTemplate,
 };
 use crate::ln::types::ChannelId;
 use crate::offers::static_invoice::StaticInvoice;
@@ -7633,10 +7634,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 		)
 		.ok()?;
 
-		let tweak_value = if htlc_id == u64::MAX { 1 } else { htlc_id + 1 };
-		let mut tweak = [0u8; 32];
-		tweak[24..].copy_from_slice(&tweak_value.to_be_bytes());
-		let tweak = Scalar::from_be_bytes(tweak).ok()?;
+		let tweak = Scalar::from_be_bytes(htlc_index_script_key_tweak_bytes(htlc_id)).ok()?;
 		let tweaked_internal_key =
 			keys.revocation_key.to_public_key().add_exp_tweak(&self.secp_ctx, &tweak).ok()?;
 		let (internal_xonly_key, _) = tweaked_internal_key.x_only_public_key();
@@ -7693,10 +7691,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 		)
 		.ok()?;
 
-		let tweak_value = if htlc_id == u64::MAX { 1 } else { htlc_id + 1 };
-		let mut tweak = [0u8; 32];
-		tweak[24..].copy_from_slice(&tweak_value.to_be_bytes());
-		let tweak = Scalar::from_be_bytes(tweak).ok()?;
+		let tweak = Scalar::from_be_bytes(htlc_index_script_key_tweak_bytes(htlc_id)).ok()?;
 		let tweaked_internal_key =
 			keys.revocation_key.to_public_key().add_exp_tweak(&self.secp_ctx, &tweak).ok()?;
 		let (internal_xonly_key, _) = tweaked_internal_key.x_only_public_key();
@@ -7772,10 +7767,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 		)
 		.ok()?;
 
-		let tweak_value = if htlc_id == u64::MAX { 1 } else { htlc_id + 1 };
-		let mut tweak = [0u8; 32];
-		tweak[24..].copy_from_slice(&tweak_value.to_be_bytes());
-		let tweak = Scalar::from_be_bytes(tweak).ok()?;
+		let tweak = Scalar::from_be_bytes(htlc_index_script_key_tweak_bytes(htlc_id)).ok()?;
 		let tweaked_internal_key =
 			keys.revocation_key.to_public_key().add_exp_tweak(&self.secp_ctx, &tweak).ok()?;
 		let (internal_xonly_key, _) = tweaked_internal_key.x_only_public_key();
@@ -7833,10 +7825,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 		)
 		.ok()?;
 
-		let tweak_value = if htlc_id == u64::MAX { 1 } else { htlc_id + 1 };
-		let mut tweak = [0u8; 32];
-		tweak[24..].copy_from_slice(&tweak_value.to_be_bytes());
-		let tweak = Scalar::from_be_bytes(tweak).ok()?;
+		let tweak = Scalar::from_be_bytes(htlc_index_script_key_tweak_bytes(htlc_id)).ok()?;
 		let tweaked_internal_key =
 			keys.revocation_key.to_public_key().add_exp_tweak(&self.secp_ctx, &tweak).ok()?;
 		let (internal_xonly_key, _) = tweaked_internal_key.x_only_public_key();
