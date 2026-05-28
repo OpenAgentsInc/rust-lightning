@@ -408,7 +408,11 @@ pub struct FundingCreated {
 	pub funding_txid: Txid,
 	/// The specific output index funding this channel
 	pub funding_output_index: u16,
-	/// The signature of the channel initiator (funder) on the initial commitment transaction
+	/// The signature of the channel initiator (funder) on the initial commitment transaction.
+	///
+	/// For simple-taproot channels, the wire field is the BOLT-required 64-byte zero
+	/// placeholder and the real signature is carried in
+	/// [`Self::simple_taproot_partial_signature_with_nonce`].
 	pub signature: Signature,
 	/// The simple-taproot MuSig2 partial signature and signing nonce.
 	pub simple_taproot_partial_signature_with_nonce: Option<SimpleTaprootPartialSignatureWithNonce>,
@@ -423,7 +427,11 @@ pub struct FundingCreated {
 pub struct FundingSigned {
 	/// The channel ID
 	pub channel_id: ChannelId,
-	/// The signature of the channel acceptor (fundee) on the initial commitment transaction
+	/// The signature of the channel acceptor (fundee) on the initial commitment transaction.
+	///
+	/// For simple-taproot channels, the wire field is the BOLT-required 64-byte zero
+	/// placeholder and the real signature is carried in
+	/// [`Self::simple_taproot_partial_signature_with_nonce`].
 	pub signature: Signature,
 	/// The simple-taproot MuSig2 partial signature and signing nonce.
 	pub simple_taproot_partial_signature_with_nonce: Option<SimpleTaprootPartialSignatureWithNonce>,
@@ -922,7 +930,11 @@ pub struct UpdateFailMalformedHTLC {
 pub struct CommitmentSigned {
 	/// The channel ID
 	pub channel_id: ChannelId,
-	/// A signature on the commitment transaction
+	/// A signature on the commitment transaction.
+	///
+	/// For simple-taproot channels, the wire field is the BOLT-required 64-byte zero
+	/// placeholder and the real signature is carried in
+	/// [`Self::simple_taproot_partial_signature_with_nonce`].
 	pub signature: Signature,
 	/// Signatures on the HTLC transactions
 	pub htlc_signatures: Vec<Signature>,
@@ -3281,15 +3293,85 @@ impl_writeable!(ClosingSignedFeeRange, {
 	max_fee_satoshis
 });
 
-impl_writeable_msg!(CommitmentSigned, {
-	channel_id,
-	signature,
-	htlc_signatures
-}, {
-	(1, funding_txid, option),
-	(2, simple_taproot_partial_signature_with_nonce, option),
-	(65537, taproot_asset_commitment_sig_blob, (option, encoding: (Vec<u8>, WithoutLength))),
-});
+const SIMPLE_TAPROOT_LEGACY_SIGNATURE_ZERO: [u8; 64] = [0; 64];
+
+fn simple_taproot_legacy_signature_placeholder() -> Signature {
+	Signature::from_compact(&[1; 64]).expect("non-zero compact ECDSA placeholder is valid")
+}
+
+fn write_simple_taproot_legacy_signature<W: Writer>(
+	w: &mut W, signature: &Signature,
+	simple_taproot_partial_signature_with_nonce: Option<&SimpleTaprootPartialSignatureWithNonce>,
+) -> Result<(), io::Error> {
+	if simple_taproot_partial_signature_with_nonce.is_some() {
+		SIMPLE_TAPROOT_LEGACY_SIGNATURE_ZERO.write(w)
+	} else {
+		signature.write(w)
+	}
+}
+
+fn read_simple_taproot_legacy_signature(
+	signature_bytes: [u8; 64],
+	simple_taproot_partial_signature_with_nonce: Option<&SimpleTaprootPartialSignatureWithNonce>,
+) -> Result<Signature, DecodeError> {
+	if simple_taproot_partial_signature_with_nonce.is_some() {
+		if signature_bytes != SIMPLE_TAPROOT_LEGACY_SIGNATURE_ZERO {
+			return Err(DecodeError::InvalidValue);
+		}
+		Ok(simple_taproot_legacy_signature_placeholder())
+	} else {
+		Signature::from_compact(&signature_bytes).map_err(|_| DecodeError::InvalidValue)
+	}
+}
+
+impl Writeable for CommitmentSigned {
+	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
+		self.channel_id.write(w)?;
+		write_simple_taproot_legacy_signature(
+			w,
+			&self.signature,
+			self.simple_taproot_partial_signature_with_nonce.as_ref(),
+		)?;
+		self.htlc_signatures.write(w)?;
+		encode_tlv_stream!(w, {
+			(1, self.funding_txid, option),
+			(2, self.simple_taproot_partial_signature_with_nonce, option),
+			(65537, self.taproot_asset_commitment_sig_blob.as_ref().map(|b| WithoutLength(b)), option),
+		});
+		Ok(())
+	}
+}
+
+impl LengthReadable for CommitmentSigned {
+	fn read_from_fixed_length_buffer<R: LengthLimitedRead>(r: &mut R) -> Result<Self, DecodeError> {
+		let channel_id: ChannelId = Readable::read(r)?;
+		let signature_bytes: [u8; 64] = Readable::read(r)?;
+		let htlc_signatures: Vec<Signature> = Readable::read(r)?;
+
+		let mut funding_txid: Option<Txid> = None;
+		let mut simple_taproot_partial_signature_with_nonce: Option<
+			SimpleTaprootPartialSignatureWithNonce,
+		> = None;
+		let mut taproot_asset_commitment_sig_blob: Option<WithoutLength<Vec<u8>>> = None;
+		decode_tlv_stream!(r, {
+			(1, funding_txid, option),
+			(2, simple_taproot_partial_signature_with_nonce, option),
+			(65537, taproot_asset_commitment_sig_blob, option),
+		});
+		let signature = read_simple_taproot_legacy_signature(
+			signature_bytes,
+			simple_taproot_partial_signature_with_nonce.as_ref(),
+		)?;
+		Ok(Self {
+			channel_id,
+			signature,
+			htlc_signatures,
+			funding_txid,
+			simple_taproot_partial_signature_with_nonce,
+			taproot_asset_commitment_sig_blob: taproot_asset_commitment_sig_blob.map(|b| b.0),
+		})
+	}
+}
 
 impl_writeable!(DecodedOnionErrorPacket, {
 	hmac,
@@ -3297,21 +3379,83 @@ impl_writeable!(DecodedOnionErrorPacket, {
 	pad
 });
 
-impl_writeable_msg!(FundingCreated, {
-	temporary_channel_id,
-	funding_txid,
-	funding_output_index,
-	signature
-}, {
-	(2, simple_taproot_partial_signature_with_nonce, option),
-});
+impl Writeable for FundingCreated {
+	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
+		self.temporary_channel_id.write(w)?;
+		self.funding_txid.write(w)?;
+		self.funding_output_index.write(w)?;
+		write_simple_taproot_legacy_signature(
+			w,
+			&self.signature,
+			self.simple_taproot_partial_signature_with_nonce.as_ref(),
+		)?;
+		encode_tlv_stream!(w, {
+			(2, self.simple_taproot_partial_signature_with_nonce, option),
+		});
+		Ok(())
+	}
+}
 
-impl_writeable_msg!(FundingSigned, {
-	channel_id,
-	signature
-}, {
-	(2, simple_taproot_partial_signature_with_nonce, option),
-});
+impl LengthReadable for FundingCreated {
+	fn read_from_fixed_length_buffer<R: LengthLimitedRead>(r: &mut R) -> Result<Self, DecodeError> {
+		let temporary_channel_id: ChannelId = Readable::read(r)?;
+		let funding_txid: Txid = Readable::read(r)?;
+		let funding_output_index: u16 = Readable::read(r)?;
+		let signature_bytes: [u8; 64] = Readable::read(r)?;
+
+		let mut simple_taproot_partial_signature_with_nonce: Option<
+			SimpleTaprootPartialSignatureWithNonce,
+		> = None;
+		decode_tlv_stream!(r, {
+			(2, simple_taproot_partial_signature_with_nonce, option),
+		});
+		let signature = read_simple_taproot_legacy_signature(
+			signature_bytes,
+			simple_taproot_partial_signature_with_nonce.as_ref(),
+		)?;
+		Ok(Self {
+			temporary_channel_id,
+			funding_txid,
+			funding_output_index,
+			signature,
+			simple_taproot_partial_signature_with_nonce,
+		})
+	}
+}
+
+impl Writeable for FundingSigned {
+	fn write<W: Writer>(&self, w: &mut W) -> Result<(), io::Error> {
+		self.channel_id.write(w)?;
+		write_simple_taproot_legacy_signature(
+			w,
+			&self.signature,
+			self.simple_taproot_partial_signature_with_nonce.as_ref(),
+		)?;
+		encode_tlv_stream!(w, {
+			(2, self.simple_taproot_partial_signature_with_nonce, option),
+		});
+		Ok(())
+	}
+}
+
+impl LengthReadable for FundingSigned {
+	fn read_from_fixed_length_buffer<R: LengthLimitedRead>(r: &mut R) -> Result<Self, DecodeError> {
+		let channel_id: ChannelId = Readable::read(r)?;
+		let signature_bytes: [u8; 64] = Readable::read(r)?;
+
+		let mut simple_taproot_partial_signature_with_nonce: Option<
+			SimpleTaprootPartialSignatureWithNonce,
+		> = None;
+		decode_tlv_stream!(r, {
+			(2, simple_taproot_partial_signature_with_nonce, option),
+		});
+		let signature = read_simple_taproot_legacy_signature(
+			signature_bytes,
+			simple_taproot_partial_signature_with_nonce.as_ref(),
+		)?;
+		Ok(Self { channel_id, signature, simple_taproot_partial_signature_with_nonce })
+	}
+}
 
 impl_writeable_msg!(ChannelReady, {
 	channel_id,
@@ -4673,6 +4817,9 @@ impl_writeable_msg!(GossipTimestampFilter, {
 
 #[cfg(test)]
 mod tests {
+	use super::{
+		simple_taproot_legacy_signature_placeholder, SIMPLE_TAPROOT_LEGACY_SIGNATURE_ZERO,
+	};
 	use crate::ln::msgs::SocketAddress;
 	use crate::ln::msgs::{
 		self, CommonAcceptChannelFields, CommonOpenChannelFields, DecodeError, FinalOnionHopData,
@@ -4708,12 +4855,13 @@ mod tests {
 	use bitcoin::script::Builder;
 	use bitcoin::transaction::Version;
 
-	use bitcoin::secp256k1::{Message, Secp256k1};
+	use bitcoin::secp256k1::{ecdsa::Signature, Message, Secp256k1};
 	use bitcoin::secp256k1::{PublicKey, SecretKey};
 
 	use crate::chain::transaction::OutPoint;
 	use crate::io::{self, Cursor};
 	use crate::prelude::*;
+	use core::fmt::Debug;
 	use core::str::FromStr;
 
 	use crate::blinded_path::payment::{BlindedPayInfo, BlindedPaymentPath};
@@ -5068,7 +5216,7 @@ mod tests {
 
 	#[test]
 	fn simple_taproot_lifecycle_tlvs_round_trip_in_native_messages() {
-		let sig = sample_signature();
+		let zero_legacy_sig = simple_taproot_legacy_signature_placeholder();
 		let nonce = sample_musig2_nonce();
 		let partial_sig = sample_partial_signature(7);
 		let partial_sig_with_nonce = sample_partial_signature_with_nonce(9);
@@ -5149,7 +5297,7 @@ mod tests {
 			temporary_channel_id: ChannelId::from_bytes([2; 32]),
 			funding_txid,
 			funding_output_index: 0,
-			signature: sig,
+			signature: zero_legacy_sig,
 			simple_taproot_partial_signature_with_nonce: Some(partial_sig_with_nonce),
 		};
 		assert_eq!(
@@ -5159,7 +5307,7 @@ mod tests {
 
 		let funding_signed = msgs::FundingSigned {
 			channel_id: ChannelId::from_bytes([3; 32]),
-			signature: sig,
+			signature: zero_legacy_sig,
 			simple_taproot_partial_signature_with_nonce: Some(partial_sig_with_nonce),
 		};
 		assert_eq!(
@@ -5218,7 +5366,7 @@ mod tests {
 
 		let commitment_signed = msgs::CommitmentSigned {
 			channel_id: ChannelId::from_bytes([3; 32]),
-			signature: sig,
+			signature: zero_legacy_sig,
 			htlc_signatures: Vec::new(),
 			funding_txid: Some(funding_txid),
 			simple_taproot_partial_signature_with_nonce: Some(partial_sig_with_nonce),
@@ -5265,6 +5413,77 @@ mod tests {
 			round_trip_message(&channel_reestablish).simple_taproot_next_local_nonces,
 			Some(next_local_nonces)
 		);
+	}
+
+	#[test]
+	fn simple_taproot_legacy_signature_fields_are_zeroed_and_enforced() {
+		fn assert_rejects_nonzero_legacy_signature<T: Debug + LengthReadable>(
+			encoded: &[u8], legacy_signature_offset: usize, nonzero_signature: &Signature,
+		) {
+			let mut nonzero_legacy_signature = encoded.to_vec();
+			nonzero_legacy_signature[legacy_signature_offset..legacy_signature_offset + 64]
+				.copy_from_slice(&nonzero_signature.serialize_compact());
+			assert_eq!(
+				T::read_from_fixed_length_buffer(&mut &nonzero_legacy_signature[..]).unwrap_err(),
+				DecodeError::InvalidValue
+			);
+		}
+
+		let sig = sample_signature();
+		let partial_sig_with_nonce = sample_partial_signature_with_nonce(9);
+		let funding_txid =
+			Txid::from_str("c2d4449afa8d26140898dd54d3390b057ba2a5afcf03ba29d7dc0d8b9ffe966e")
+				.unwrap();
+
+		let funding_created = msgs::FundingCreated {
+			temporary_channel_id: ChannelId::from_bytes([2; 32]),
+			funding_txid,
+			funding_output_index: 0,
+			signature: sig,
+			simple_taproot_partial_signature_with_nonce: Some(partial_sig_with_nonce),
+		};
+		let encoded = funding_created.encode();
+		assert_eq!(&encoded[66..130], &SIMPLE_TAPROOT_LEGACY_SIGNATURE_ZERO);
+		let decoded: msgs::FundingCreated =
+			LengthReadable::read_from_fixed_length_buffer(&mut &encoded[..]).unwrap();
+		assert_eq!(
+			decoded.simple_taproot_partial_signature_with_nonce,
+			Some(partial_sig_with_nonce)
+		);
+		assert_rejects_nonzero_legacy_signature::<msgs::FundingCreated>(&encoded, 66, &sig);
+
+		let funding_signed = msgs::FundingSigned {
+			channel_id: ChannelId::from_bytes([3; 32]),
+			signature: sig,
+			simple_taproot_partial_signature_with_nonce: Some(partial_sig_with_nonce),
+		};
+		let encoded = funding_signed.encode();
+		assert_eq!(&encoded[32..96], &SIMPLE_TAPROOT_LEGACY_SIGNATURE_ZERO);
+		let decoded: msgs::FundingSigned =
+			LengthReadable::read_from_fixed_length_buffer(&mut &encoded[..]).unwrap();
+		assert_eq!(
+			decoded.simple_taproot_partial_signature_with_nonce,
+			Some(partial_sig_with_nonce)
+		);
+		assert_rejects_nonzero_legacy_signature::<msgs::FundingSigned>(&encoded, 32, &sig);
+
+		let commitment_signed = msgs::CommitmentSigned {
+			channel_id: ChannelId::from_bytes([3; 32]),
+			signature: sig,
+			htlc_signatures: Vec::new(),
+			funding_txid: Some(funding_txid),
+			simple_taproot_partial_signature_with_nonce: Some(partial_sig_with_nonce),
+			taproot_asset_commitment_sig_blob: None,
+		};
+		let encoded = commitment_signed.encode();
+		assert_eq!(&encoded[32..96], &SIMPLE_TAPROOT_LEGACY_SIGNATURE_ZERO);
+		let decoded: msgs::CommitmentSigned =
+			LengthReadable::read_from_fixed_length_buffer(&mut &encoded[..]).unwrap();
+		assert_eq!(
+			decoded.simple_taproot_partial_signature_with_nonce,
+			Some(partial_sig_with_nonce)
+		);
+		assert_rejects_nonzero_legacy_signature::<msgs::CommitmentSigned>(&encoded, 32, &sig);
 	}
 
 	#[test]
