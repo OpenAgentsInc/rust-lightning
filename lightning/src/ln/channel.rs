@@ -7731,7 +7731,6 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 			per_commitment_point,
 			local,
 			pays_holder,
-			true,
 		) else {
 			return;
 		};
@@ -7767,7 +7766,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 	#[cfg(feature = "simple_taproot_musig2")]
 	fn taproot_asset_non_htlc_base_output_key(
 		&self, funding: &FundingScope, per_commitment_point: &PublicKey, local: bool,
-		pays_holder: bool, for_asset_script_key: bool,
+		pays_holder: bool,
 	) -> Option<[u8; 32]> {
 		if !funding.get_channel_type().requires_taproot_asset_channel() {
 			return None;
@@ -7785,13 +7784,11 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 		);
 		let pays_broadcaster = pays_holder == local;
 		let script_pubkey = if pays_broadcaster {
-			let contest_delay =
-				if for_asset_script_key { 0 } else { directed_parameters.contest_delay() };
 			simple_taproot_to_local_spend_info(
 				&self.secp_ctx,
 				&keys.broadcaster_delayed_payment_key.to_public_key(),
 				&keys.revocation_key.to_public_key(),
-				contest_delay,
+				directed_parameters.contest_delay(),
 			)
 			.ok()?
 			.script_pubkey
@@ -21416,7 +21413,7 @@ mod tests {
 			&chan.context.secp_ctx,
 			&holder_keys.broadcaster_delayed_payment_key.to_public_key(),
 			&holder_keys.revocation_key.to_public_key(),
-			0,
+			holder_directed_parameters.contest_delay(),
 		)
 		.unwrap()
 		.script_pubkey;
