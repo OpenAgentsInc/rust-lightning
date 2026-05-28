@@ -427,6 +427,8 @@ pub struct PendingHTLCInfo {
 	/// An experimental field indicating whether our node's reputation would be held accountable
 	/// for the timely resolution of the received HTLC.
 	pub incoming_accountable: bool,
+	/// Opaque Taproot Asset HTLC data carried by the inbound `update_add_htlc`.
+	pub taproot_asset_htlc_blob: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug)] // See FundedChannel::revoke_and_ack for why, tl;dr: Rust bug
@@ -489,6 +491,7 @@ impl PendingAddHTLCInfo {
 			trampoline_shared_secret,
 			blinded_failure: self.forward_info.routing.blinded_failure(),
 			cltv_expiry: self.forward_info.routing.incoming_cltv_expiry(),
+			taproot_asset_htlc_blob: self.forward_info.taproot_asset_htlc_blob.clone(),
 		}
 	}
 }
@@ -606,6 +609,7 @@ impl From<&ClaimableHTLC> for events::ClaimedHTLC {
 			cltv_expiry: val.mpp_part.cltv_expiry,
 			value_msat: val.mpp_part.value,
 			counterparty_skimmed_fee_msat: val.counterparty_skimmed_fee_msat.unwrap_or(0),
+			taproot_asset_htlc_blob: val.mpp_part.prev_hop.taproot_asset_htlc_blob.clone(),
 		}
 	}
 }
@@ -929,6 +933,7 @@ mod fuzzy_channelmanager {
 		/// Used to preserve our backwards channel by failing back in case an HTLC claim in the forward
 		/// channel remains unconfirmed for too long.
 		pub cltv_expiry: Option<u32>,
+		pub taproot_asset_htlc_blob: Option<Vec<u8>>,
 	}
 
 	impl From<&HTLCPreviousHopData> for events::HTLCLocator {
@@ -5430,7 +5435,7 @@ impl<
 				let current_height: u32 = self.best_block.read().unwrap().height;
 				create_recv_pending_htlc_info(decoded_hop, shared_secret, msg.payment_hash,
 					msg.amount_msat, msg.cltv_expiry, None, allow_underpay, msg.skimmed_fee_msat,
-					msg.accountable.unwrap_or(false), current_height)
+					msg.accountable.unwrap_or(false), msg.taproot_asset_htlc_blob.clone(), current_height)
 			},
 			onion_utils::Hop::Forward { .. } | onion_utils::Hop::BlindedForward { .. } => {
 				create_fwd_pending_htlc_info(msg, decoded_hop, shared_secret, next_packet_pubkey_opt)
@@ -8085,6 +8090,7 @@ impl<
 								false,
 								None,
 								incoming_accountable,
+								payment.forward_info.taproot_asset_htlc_blob.clone(),
 								current_height,
 							);
 							match create_res {
@@ -8682,6 +8688,7 @@ impl<
 						trampoline_shared_secret,
 						blinded_failure,
 						cltv_expiry: Some(cltv_expiry),
+						taproot_asset_htlc_blob: prev_hop.taproot_asset_htlc_blob.clone(),
 					});
 					let claimable_htlc = ClaimableHTLC {
 						mpp_part: MppPart {
@@ -18240,6 +18247,7 @@ impl_writeable_tlv_based!(PendingHTLCInfo, {
 	(9, incoming_amt_msat, option),
 	(10, skimmed_fee_msat, option),
 	(11, incoming_accountable, (default_value, false)),
+	(13, taproot_asset_htlc_blob, option),
 });
 
 impl Writeable for HTLCFailureMsg {
@@ -18340,6 +18348,7 @@ impl_writeable_tlv_based!(HTLCPreviousHopData, {
 	(9, channel_id, (default_value, ChannelId::v1_from_funding_outpoint(outpoint.0.unwrap()))),
 	(11, counterparty_node_id, option),
 	(13, trampoline_shared_secret, option),
+	(15, taproot_asset_htlc_blob, option),
 });
 
 fn write_claimable_htlc<W: Writer>(
@@ -21289,7 +21298,7 @@ fn reconcile_pending_htlcs_with_monitor(
 
 #[cfg(test)]
 mod tests {
-	use crate::events::{ClosureReason, Event, HTLCHandlingFailureType};
+	use crate::events::{ClaimedHTLC, ClosureReason, Event, HTLCHandlingFailureType};
 	use crate::ln::channelmanager::{
 		create_recv_pending_htlc_info, inbound_payment, InterceptId, PaymentId,
 		RecipientOnionFields,
@@ -21306,6 +21315,7 @@ mod tests {
 	use crate::util::config::{ChannelConfig, ChannelConfigUpdate};
 	use crate::util::errors::APIError;
 	use crate::util::test_utils;
+	use bitcoin::hashes::Hash;
 	use bitcoin::secp256k1::ecdh::SharedSecret;
 	use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
 	use core::sync::atomic::Ordering;
@@ -22163,7 +22173,7 @@ mod tests {
 		if let Err(crate::ln::channelmanager::InboundHTLCErr { reason, .. }) =
 			create_recv_pending_htlc_info(hop_data, [0; 32], PaymentHash([0; 32]),
 				sender_intended_amt_msat - extra_fee_msat - 1, 42, None, true, Some(extra_fee_msat),
-				false, current_height)
+				false, None, current_height)
 		{
 			assert_eq!(reason, LocalHTLCFailureReason::FinalIncorrectHTLCAmount);
 		} else { panic!(); }
@@ -22186,7 +22196,67 @@ mod tests {
 		let current_height: u32 = node[0].node.best_block.read().unwrap().height;
 		assert!(create_recv_pending_htlc_info(hop_data, [0; 32], PaymentHash([0; 32]),
 			sender_intended_amt_msat - extra_fee_msat, 42, None, true, Some(extra_fee_msat),
-			false, current_height).is_ok());
+			false, None, current_height).is_ok());
+	}
+
+	#[test]
+	#[rustfmt::skip]
+	fn taproot_asset_htlc_blob_survives_claimed_htlc_conversion() {
+		let chanmon_cfg = create_chanmon_cfgs(1);
+		let node_cfg = create_node_cfgs(1, &chanmon_cfg);
+		let node_chanmgr = create_node_chanmgrs(1, &node_cfg, &[None]);
+		let node = create_network(1, &node_cfg, &node_chanmgr);
+		let current_height: u32 = node[0].node.best_block.read().unwrap().height;
+		let taproot_asset_htlc_blob = vec![1, 44, 0, 32, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 1, 8, 0, 0, 0, 0, 0, 0, 0, 125];
+		let payment_preimage = PaymentPreimage([2; 32]);
+		let payment_hash = PaymentHash(super::Sha256::hash(&payment_preimage.0).to_byte_array());
+		let hop_data = onion_utils::Hop::Receive {
+			hop_data: msgs::InboundOnionReceivePayload {
+				sender_intended_htlc_amt_msat: 100,
+				cltv_expiry_height: 42,
+				payment_metadata: None,
+				keysend_preimage: Some(payment_preimage),
+				payment_data: None,
+				custom_tlvs: Vec::new(),
+			},
+			shared_secret: SharedSecret::from_bytes([0; 32]),
+		};
+		let pending = create_recv_pending_htlc_info(
+			hop_data, [0; 32], payment_hash, 100, 42, None, true, None, false,
+			Some(taproot_asset_htlc_blob.clone()), current_height,
+		).unwrap();
+		assert_eq!(pending.taproot_asset_htlc_blob, Some(taproot_asset_htlc_blob.clone()));
+
+		let secp_ctx = Secp256k1::new();
+		let prev_counterparty_node_id = PublicKey::from_secret_key(
+			&secp_ctx, &SecretKey::from_slice(&[42; 32]).unwrap(),
+		);
+		let pending_add = super::PendingAddHTLCInfo {
+			forward_info: pending,
+			prev_outbound_scid_alias: 42,
+			prev_htlc_id: 0,
+			prev_counterparty_node_id,
+			prev_channel_id: ChannelId::from_bytes([3; 32]),
+			prev_funding_outpoint: super::OutPoint { txid: super::Txid::from_byte_array([4; 32]), index: 0 },
+			prev_user_channel_id: 5,
+		};
+		let prev_hop = pending_add.htlc_previous_hop_data();
+		assert_eq!(prev_hop.taproot_asset_htlc_blob, Some(taproot_asset_htlc_blob.clone()));
+
+		let claimable = super::ClaimableHTLC {
+			mpp_part: super::MppPart {
+				prev_hop,
+				cltv_expiry: 42,
+				value: 100,
+				sender_intended_value: 100,
+				timer_ticks: 0,
+				total_value_received: Some(100),
+			},
+			onion_payload: super::OnionPayload::Spontaneous(payment_preimage),
+			counterparty_skimmed_fee_msat: None,
+		};
+		let claimed = ClaimedHTLC::from(&claimable);
+		assert_eq!(claimed.taproot_asset_htlc_blob, Some(taproot_asset_htlc_blob));
 	}
 
 	#[test]
@@ -22211,7 +22281,7 @@ mod tests {
 				custom_tlvs: Vec::new(),
 			},
 			shared_secret: SharedSecret::from_bytes([0; 32]),
-		}, [0; 32], PaymentHash([0; 32]), 100, TEST_FINAL_CLTV + 1, None, true, None, false, current_height);
+		}, [0; 32], PaymentHash([0; 32]), 100, TEST_FINAL_CLTV + 1, None, true, None, false, None, current_height);
 
 		// Should not return an error as this condition:
 		// https://github.com/lightning/bolts/blob/4dcc377209509b13cf89a4b91fde7d478f5b46d8/04-onion-routing.md?plain=1#L334

@@ -390,6 +390,9 @@ pub struct ClaimedHTLC {
 	/// This value will always be 0 for [`ClaimedHTLC`]s serialized with LDK versions prior to
 	/// 0.0.119.
 	pub counterparty_skimmed_fee_msat: u64,
+	/// Opaque Taproot Asset HTLC data carried by the inbound `update_add_htlc`, if this HTLC was
+	/// received over an experimental Taproot Asset channel.
+	pub taproot_asset_htlc_blob: Option<Vec<u8>>,
 }
 impl_writeable_tlv_based!(ClaimedHTLC, {
 	(0, channel_id, required),
@@ -398,6 +401,7 @@ impl_writeable_tlv_based!(ClaimedHTLC, {
 	(3, counterparty_node_id, option),
 	(4, cltv_expiry, required),
 	(6, value_msat, required),
+	(7, taproot_asset_htlc_blob, option),
 });
 
 /// When the payment path failure took place and extra details about it. [`PathFailure::OnPath`] may

@@ -9956,6 +9956,7 @@ where
 					outpoint,
 					counterparty_node_id: Some(counterparty_node_id),
 					cltv_expiry: Some(htlc.cltv_expiry),
+					taproot_asset_htlc_blob: None,
 				};
 				Some((htlc.payment_hash, prev_hop_data, *outbound_hop))
 			},

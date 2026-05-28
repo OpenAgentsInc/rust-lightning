@@ -274,6 +274,7 @@ pub(super) fn create_fwd_pending_htlc_info(
 		outgoing_cltv_value,
 		skimmed_fee_msat: None,
 		incoming_accountable: msg.accountable.unwrap_or(false),
+		taproot_asset_htlc_blob: msg.taproot_asset_htlc_blob.clone(),
 	})
 }
 
@@ -281,7 +282,8 @@ pub(super) fn create_fwd_pending_htlc_info(
 pub(super) fn create_recv_pending_htlc_info(
 	hop_data: onion_utils::Hop, shared_secret: [u8; 32], payment_hash: PaymentHash,
 	amt_msat: u64, cltv_expiry: u32, phantom_shared_secret: Option<[u8; 32]>, allow_underpay: bool,
-	counterparty_skimmed_fee_msat: Option<u64>, incoming_accountable: bool, current_height: u32
+	counterparty_skimmed_fee_msat: Option<u64>, incoming_accountable: bool,
+	taproot_asset_htlc_blob: Option<Vec<u8>>, current_height: u32
 ) -> Result<PendingHTLCInfo, InboundHTLCErr> {
 	let (
 		payment_data, keysend_preimage, custom_tlvs, onion_amt_msat, onion_cltv_expiry,
@@ -472,6 +474,7 @@ pub(super) fn create_recv_pending_htlc_info(
 		outgoing_cltv_value: onion_cltv_expiry,
 		skimmed_fee_msat: counterparty_skimmed_fee_msat,
 		incoming_accountable,
+		taproot_asset_htlc_blob,
 	})
 }
 
@@ -556,7 +559,7 @@ pub fn peel_payment_onion<NS: NodeSigner, L: Logger, T: secp256k1::Verification>
 			create_recv_pending_htlc_info(
 				hop, shared_secret, msg.payment_hash, msg.amount_msat, msg.cltv_expiry,
 				None, allow_skimmed_fees, msg.skimmed_fee_msat,
-				msg.accountable.unwrap_or(false), cur_height,
+				msg.accountable.unwrap_or(false), msg.taproot_asset_htlc_blob.clone(), cur_height,
 			)?
 		}
 	})
