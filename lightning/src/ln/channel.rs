@@ -3914,6 +3914,8 @@ pub(super) struct ChannelContext<SP: SignerProvider> {
 	simple_taproot_counterparty_closee_nonce: Option<SimpleTaprootCloseeNonceState>,
 	/// Sent `closing_complete` partial retained for returned `closing_sig` validation.
 	simple_taproot_sent_closing_complete: Option<SimpleTaprootSentClosingComplete>,
+	/// Current owner of the full Taproot Asset balance for dynamic non-HTLC aux leaves.
+	simple_taproot_asset_balance_holder: Option<bool>,
 
 	/// An option set when we wish to track how many ticks have elapsed while waiting for a response
 	/// from our counterparty after entering specific states. If the peer has yet to respond after
@@ -4218,8 +4220,8 @@ impl<SP: SignerProvider> InitialRemoteCommitmentReceiver<SP> for FundedChannel<S
 
 #[cfg(feature = "simple_taproot_musig2")]
 #[derive(Clone, Copy)]
-struct TaprootAssetClaimedHtlc<'a> {
-	htlc_blob: &'a Vec<u8>,
+struct TaprootAssetClaimedHtlc {
+	asset_amount: u64,
 	claimed_by_holder: bool,
 }
 
@@ -4683,6 +4685,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 			simple_taproot_local_closee_nonce_index: 0,
 			simple_taproot_counterparty_closee_nonce: None,
 			simple_taproot_sent_closing_complete: None,
+			simple_taproot_asset_balance_holder: None,
 			sent_message_awaiting_response: None,
 
 			latest_inbound_scid_alias: None,
@@ -5009,6 +5012,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 			simple_taproot_local_closee_nonce_index: 0,
 			simple_taproot_counterparty_closee_nonce: None,
 			simple_taproot_sent_closing_complete: None,
+			simple_taproot_asset_balance_holder: None,
 			sent_message_awaiting_response: None,
 
 			latest_inbound_scid_alias: None,
@@ -7414,9 +7418,12 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 					inbound_htlc_preimages.push(preimage);
 					value_to_self_claimed_msat += htlc.amount_msat;
 					#[cfg(feature = "simple_taproot_musig2")]
-					if self.taproot_asset_full_amount_htlc_blob(funding, htlc.taproot_asset_htlc_blob.as_ref()).is_some() {
+					if let Some(asset_amount) = Self::taproot_asset_full_amount_htlc_blob_for_funding(
+						funding,
+						htlc.taproot_asset_htlc_blob.as_ref(),
+					) {
 						simple_taproot_asset_claimed_htlc = Some(TaprootAssetClaimedHtlc {
-							htlc_blob: htlc.taproot_asset_htlc_blob.as_ref().unwrap(),
+							asset_amount,
 							claimed_by_holder: true,
 						});
 					}
@@ -7436,9 +7443,12 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 				if htlc.state.preimage().is_some() {
 					value_to_remote_claimed_msat += htlc.amount_msat;
 					#[cfg(feature = "simple_taproot_musig2")]
-					if self.taproot_asset_full_amount_htlc_blob(funding, htlc.taproot_asset_htlc_blob.as_ref()).is_some() {
+					if let Some(asset_amount) = Self::taproot_asset_full_amount_htlc_blob_for_funding(
+						funding,
+						htlc.taproot_asset_htlc_blob.as_ref(),
+					) {
 						simple_taproot_asset_claimed_htlc = Some(TaprootAssetClaimedHtlc {
-							htlc_blob: htlc.taproot_asset_htlc_blob.as_ref().unwrap(),
+							asset_amount,
 							claimed_by_holder: false,
 						});
 					}
@@ -7463,6 +7473,21 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 				per_commitment_point,
 				local,
 				claimed_htlc,
+			);
+		} else if let Some(asset_balance_holder) = self.simple_taproot_asset_balance_holder {
+			let asset_amount = funding
+				.channel_transaction_parameters
+				.simple_taproot_asset_channel_template
+				.as_ref()
+				.map(|template| template.total_amount())
+				.unwrap_or(0);
+			self.apply_taproot_asset_balance_aux_leaf(
+				funding,
+				&mut channel_transaction_parameters,
+				per_commitment_point,
+				local,
+				asset_balance_holder,
+				asset_amount,
 			);
 		}
 		#[cfg(not(feature = "simple_taproot_musig2"))]
@@ -7637,8 +7662,8 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 	}
 
 	#[cfg(feature = "simple_taproot_musig2")]
-	fn taproot_asset_full_amount_htlc_blob(
-		&self, funding: &FundingScope, htlc_blob: Option<&Vec<u8>>,
+	fn taproot_asset_full_amount_htlc_blob_for_funding(
+		funding: &FundingScope, htlc_blob: Option<&Vec<u8>>,
 	) -> Option<u64> {
 		if !funding.get_channel_type().requires_taproot_asset_channel() {
 			return None;
@@ -7674,7 +7699,23 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 	fn apply_taproot_asset_claimed_balance_aux_leaf(
 		&self, funding: &FundingScope,
 		channel_transaction_parameters: &mut ChannelTransactionParameters,
-		per_commitment_point: &PublicKey, local: bool, claimed_htlc: TaprootAssetClaimedHtlc<'_>,
+		per_commitment_point: &PublicKey, local: bool, claimed_htlc: TaprootAssetClaimedHtlc,
+	) {
+		self.apply_taproot_asset_balance_aux_leaf(
+			funding,
+			channel_transaction_parameters,
+			per_commitment_point,
+			local,
+			claimed_htlc.claimed_by_holder,
+			claimed_htlc.asset_amount,
+		);
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	fn apply_taproot_asset_balance_aux_leaf(
+		&self, funding: &FundingScope,
+		channel_transaction_parameters: &mut ChannelTransactionParameters,
+		per_commitment_point: &PublicKey, local: bool, pays_holder: bool, asset_amount: u64,
 	) {
 		Self::clear_taproot_asset_non_htlc_aux_leaves(channel_transaction_parameters);
 		let Some(template) =
@@ -7682,16 +7723,14 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 		else {
 			return;
 		};
-		let Some(asset_amount) =
-			self.taproot_asset_full_amount_htlc_blob(funding, Some(claimed_htlc.htlc_blob))
-		else {
+		if asset_amount != template.total_amount() {
 			return;
-		};
+		}
 		let Some(output_xonly_key) = self.taproot_asset_non_htlc_base_output_key(
 			funding,
 			per_commitment_point,
 			local,
-			claimed_htlc.claimed_by_holder,
+			pays_holder,
 			true,
 		) else {
 			return;
@@ -7704,7 +7743,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 			return;
 		};
 
-		match (local, claimed_htlc.claimed_by_holder) {
+		match (local, pays_holder) {
 			(true, true) => {
 				channel_transaction_parameters
 					.simple_taproot_holder_commitment_to_holder_aux_leaf_script = Some(aux_leaf_script);
@@ -11143,6 +11182,10 @@ where
 		let mut static_invoices = Vec::new();
 		let mut require_commitment = false;
 		let mut value_to_self_msat_diff: i64 = 0;
+		#[cfg(feature = "simple_taproot_musig2")]
+		let mut simple_taproot_asset_balance_holder = self.context.simple_taproot_asset_balance_holder;
+		#[cfg(not(feature = "simple_taproot_musig2"))]
+		let simple_taproot_asset_balance_holder = self.context.simple_taproot_asset_balance_holder;
 
 		{
 			// Take references explicitly so that we can hold multiple references to self.context.
@@ -11157,6 +11200,15 @@ where
 					log_trace!(logger, " ...removing inbound LocalRemoved {}", &htlc.payment_hash);
 					if let &InboundHTLCRemovalReason::Fulfill { .. } = reason {
 						value_to_self_msat_diff += htlc.amount_msat as i64;
+						#[cfg(feature = "simple_taproot_musig2")]
+						if ChannelContext::<SP>::taproot_asset_full_amount_htlc_blob_for_funding(
+							&self.funding,
+							htlc.taproot_asset_htlc_blob.as_ref(),
+						)
+						.is_some()
+						{
+							simple_taproot_asset_balance_holder = Some(true);
+						}
 					}
 					*expecting_peer_commitment_signed = true;
 					false
@@ -11186,6 +11238,15 @@ where
 							finalized_claimed_htlcs.push((htlc.source.clone(), attribution_data));
 							// They fulfilled, so we sent them money
 							value_to_self_msat_diff -= htlc.amount_msat as i64;
+							#[cfg(feature = "simple_taproot_musig2")]
+							if ChannelContext::<SP>::taproot_asset_full_amount_htlc_blob_for_funding(
+								&self.funding,
+								htlc.taproot_asset_htlc_blob.as_ref(),
+							)
+							.is_some()
+							{
+								simple_taproot_asset_balance_holder = Some(false);
+							}
 						},
 					}
 					false
@@ -11312,6 +11373,7 @@ where
 			funding.value_to_self_msat =
 				(funding.value_to_self_msat as i64 + value_to_self_msat_diff) as u64;
 		}
+		self.context.simple_taproot_asset_balance_holder = simple_taproot_asset_balance_holder;
 
 		if let Some((feerate, update_state)) = self.context.pending_update_fee {
 			match update_state {
@@ -19071,6 +19133,7 @@ impl<SP: SignerProvider> Writeable for FundedChannel<SP> {
 		let simple_taproot_local_closee_nonce_index =
 			(self.context.simple_taproot_local_closee_nonce_index != 0)
 				.then_some(self.context.simple_taproot_local_closee_nonce_index);
+		let simple_taproot_asset_balance_holder = self.context.simple_taproot_asset_balance_holder;
 
 		write_tlv_fields!(writer, {
 			(0, self.context.announcement_sigs, option),
@@ -19141,6 +19204,7 @@ impl<SP: SignerProvider> Writeable for FundedChannel<SP> {
 			(95, pending_inbound_taproot_asset_htlc_blobs, optional_vec),
 			(97, pending_outbound_taproot_asset_htlc_blobs, optional_vec),
 			(99, holding_cell_taproot_asset_htlc_blobs, optional_vec),
+			(101, simple_taproot_asset_balance_holder, option),
 		});
 
 		Ok(())
@@ -19548,6 +19612,7 @@ impl<'a, 'b, 'c, ES: EntropySource, SP: SignerProvider>
 			None;
 		let mut simple_taproot_sent_closing_complete: Option<SimpleTaprootSentClosingComplete> =
 			None;
+		let mut simple_taproot_asset_balance_holder: Option<bool> = None;
 
 		read_tlv_fields!(reader, {
 			(0, announcement_sigs, option),
@@ -19612,6 +19677,7 @@ impl<'a, 'b, 'c, ES: EntropySource, SP: SignerProvider>
 			(95, pending_inbound_taproot_asset_htlc_blobs_opt, optional_vec),
 			(97, pending_outbound_taproot_asset_htlc_blobs_opt, optional_vec),
 			(99, holding_cell_taproot_asset_htlc_blobs_opt, optional_vec),
+			(101, simple_taproot_asset_balance_holder, option),
 		});
 
 		let holder_signer = signer_provider.derive_channel_signer(channel_keys_id);
@@ -20086,6 +20152,7 @@ impl<'a, 'b, 'c, ES: EntropySource, SP: SignerProvider>
 					.unwrap_or(0),
 				simple_taproot_counterparty_closee_nonce,
 				simple_taproot_sent_closing_complete,
+				simple_taproot_asset_balance_holder,
 				sent_message_awaiting_response: None,
 
 				latest_inbound_scid_alias,
@@ -20161,8 +20228,8 @@ mod tests {
 	use crate::ln::script::ShutdownScript;
 	#[cfg(feature = "simple_taproot_musig2")]
 	use crate::ln::simple_taproot::{
-		simple_taproot_to_local_spend_info, simple_taproot_to_remote_spend_info,
-		simple_taproot_to_remote_spend_info_with_aux_leaf,
+		simple_taproot_to_local_spend_info, simple_taproot_to_local_spend_info_with_aux_leaf,
+		simple_taproot_to_remote_spend_info, simple_taproot_to_remote_spend_info_with_aux_leaf,
 	};
 	#[cfg(feature = "simple_taproot_musig2")]
 	use crate::ln::taproot_asset::{
@@ -21322,6 +21389,73 @@ mod tests {
 		assert_ne!(holder_output.script_pubkey, base_holder_script);
 		assert_eq!(holder_output.script_pubkey, expected_holder_script);
 		assert_eq!(counterparty_output.script_pubkey, base_counterparty_script);
+
+		chan.funding.value_to_self_msat += 20_000_000;
+		chan.context.pending_inbound_htlcs.clear();
+		chan.context.simple_taproot_asset_balance_holder = Some(true);
+
+		let holder_commitment_point = chan.holder_commitment_point.next_point();
+		let holder_commitment_data = chan.context.build_commitment_transaction(
+			&chan.funding,
+			chan.holder_commitment_point.next_transaction_number(),
+			&holder_commitment_point,
+			true,
+			false,
+			&&logger,
+		);
+		assert!(holder_commitment_data.tx.nondust_htlcs().is_empty());
+		let holder_directed_parameters =
+			chan.funding.channel_transaction_parameters.as_holder_broadcastable();
+		let holder_keys = chan_utils::TxCreationKeys::from_channel_static_keys(
+			&holder_commitment_point,
+			holder_directed_parameters.broadcaster_pubkeys(),
+			holder_directed_parameters.countersignatory_pubkeys(),
+			&chan.context.secp_ctx,
+		);
+		let holder_base_asset_script = simple_taproot_to_local_spend_info(
+			&chan.context.secp_ctx,
+			&holder_keys.broadcaster_delayed_payment_key.to_public_key(),
+			&holder_keys.revocation_key.to_public_key(),
+			0,
+		)
+		.unwrap()
+		.script_pubkey;
+		let holder_base_asset_xonly_key =
+			ChannelContext::<&TestKeysInterface>::simple_taproot_script_pubkey_xonly_key(
+				&holder_base_asset_script,
+			)
+			.unwrap();
+		let expected_persisted_holder_aux_leaf = derive_no_split_taproot_asset_aux_leaf_script(
+			chan.funding
+				.channel_transaction_parameters
+				.simple_taproot_asset_channel_template
+				.as_ref()
+				.unwrap(),
+			1,
+			holder_base_asset_xonly_key,
+		)
+		.unwrap()
+		.unwrap();
+		let expected_persisted_holder_script = simple_taproot_to_local_spend_info_with_aux_leaf(
+			&chan.context.secp_ctx,
+			&holder_keys.broadcaster_delayed_payment_key.to_public_key(),
+			&holder_keys.revocation_key.to_public_key(),
+			holder_directed_parameters.contest_delay(),
+			Some(expected_persisted_holder_aux_leaf.as_script()),
+		)
+		.unwrap()
+		.script_pubkey;
+		let holder_commitment_tx =
+			holder_commitment_data.tx.trust().built_transaction().transaction.clone();
+		let persisted_holder_output = holder_commitment_tx
+			.output
+			.iter()
+			.find(|output| {
+				output.value.to_sat() == holder_commitment_data.tx.to_broadcaster_value_sat()
+			})
+			.unwrap();
+		assert_ne!(persisted_holder_output.script_pubkey, holder_base_asset_script);
+		assert_eq!(persisted_holder_output.script_pubkey, expected_persisted_holder_script);
 	}
 
 	#[test]
