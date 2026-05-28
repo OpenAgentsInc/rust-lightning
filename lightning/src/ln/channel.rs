@@ -102,7 +102,8 @@ use crate::ln::taproot_asset::{
 };
 #[cfg(feature = "simple_taproot_musig2")]
 use crate::ln::taproot_asset::{
-	derive_no_split_taproot_asset_aux_leaf_script, htlc_index_script_key_tweak_bytes,
+	derive_no_split_taproot_asset_aux_leaf_script,
+	derive_no_split_taproot_asset_aux_leaf_script_with_locks, htlc_index_script_key_tweak_bytes,
 	TaprootAssetChannelAssetTemplate,
 };
 use crate::ln::types::ChannelId;
@@ -7358,6 +7359,8 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 							local,
 							$htlc.taproot_asset_htlc_blob.as_ref(),
 							$htlc.htlc_id,
+							$offered,
+							$htlc.cltv_expiry,
 						);
 						if script.is_some() {
 							simple_taproot_asset_full_htlc_present = true;
@@ -7778,10 +7781,15 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 		);
 		let output_xonly_key =
 			Self::simple_taproot_script_pubkey_xonly_key(&second_level_script_pubkey)?;
-		derive_no_split_taproot_asset_aux_leaf_script(
+		let lock_time = if offered { u64::from(cltv_expiry) } else { 0 };
+		let relative_lock_time =
+			u64::from(chan_utils::htlc_second_level_input_sequence(funding.get_channel_type()).0);
+		derive_no_split_taproot_asset_aux_leaf_script_with_locks(
 			&previous_output_template,
 			decoded.asset_amount,
 			output_xonly_key,
+			lock_time,
+			relative_lock_time,
 		)
 		.ok()
 		.flatten()
@@ -7790,7 +7798,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 	#[cfg(feature = "simple_taproot_musig2")]
 	fn taproot_asset_second_level_htlc_aux_leaf_script(
 		&self, funding: &FundingScope, per_commitment_point: &PublicKey, local: bool,
-		htlc_blob: Option<&Vec<u8>>, htlc_id: u64,
+		htlc_blob: Option<&Vec<u8>>, htlc_id: u64, offered: bool, cltv_expiry: u32,
 	) -> Option<ScriptBuf> {
 		if !funding.get_channel_type().requires_taproot_asset_channel() {
 			return None;
@@ -7836,10 +7844,15 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 		);
 		let output_xonly_key =
 			Self::simple_taproot_script_pubkey_xonly_key(&second_level_script_pubkey)?;
-		derive_no_split_taproot_asset_aux_leaf_script(
+		let lock_time = if offered { u64::from(cltv_expiry) } else { 0 };
+		let relative_lock_time =
+			u64::from(chan_utils::htlc_second_level_input_sequence(funding.get_channel_type()).0);
+		derive_no_split_taproot_asset_aux_leaf_script_with_locks(
 			template,
 			decoded.asset_amount,
 			output_xonly_key,
+			lock_time,
+			relative_lock_time,
 		)
 		.ok()
 		.flatten()

@@ -649,6 +649,25 @@ pub fn decode_taproot_asset_htlc_blob(
 pub fn derive_no_split_taproot_asset_aux_leaf_script(
 	template: &TaprootAssetChannelAssetTemplate, asset_amount: u64, output_xonly_key: [u8; 32],
 ) -> Result<Option<ScriptBuf>, TaprootAssetChannelAssetTemplateError> {
+	derive_no_split_taproot_asset_aux_leaf_script_with_locks(
+		template,
+		asset_amount,
+		output_xonly_key,
+		0,
+		0,
+	)
+}
+
+/// Derives the Taproot Asset aux leaf script for a full-amount HTLC output with
+/// virtual-transaction lock-time fields.
+///
+/// Lightning Labs includes the HTLC second-level input sequence, and for timeout
+/// spends the HTLC CLTV, in the Taproot Asset virtual output. These fields are
+/// omitted for ordinary commitment and first-level HTLC outputs.
+pub fn derive_no_split_taproot_asset_aux_leaf_script_with_locks(
+	template: &TaprootAssetChannelAssetTemplate, asset_amount: u64, output_xonly_key: [u8; 32],
+	lock_time: u64, relative_lock_time: u64,
+) -> Result<Option<ScriptBuf>, TaprootAssetChannelAssetTemplateError> {
 	if asset_amount == 0 {
 		return Ok(None);
 	}
@@ -658,7 +677,13 @@ pub fn derive_no_split_taproot_asset_aux_leaf_script(
 	}
 
 	let script_key = compressed_even_key_from_xonly(output_xonly_key);
-	let asset_bytes = encode_no_split_channel_asset(template, asset_amount, script_key)?;
+	let asset_bytes = encode_no_split_channel_asset(
+		template,
+		asset_amount,
+		script_key,
+		lock_time,
+		relative_lock_time,
+	)?;
 	let asset_leaf = taproot_asset_mssmt_leaf(&asset_bytes, asset_amount);
 	let asset_commitment_key = no_split_asset_commitment_key(template, output_xonly_key);
 	let asset_root = taproot_asset_mssmt_single_leaf_root(asset_commitment_key, asset_leaf)?;
@@ -698,7 +723,8 @@ fn no_split_asset_commitment_key(
 }
 
 fn encode_no_split_channel_asset(
-	template: &TaprootAssetChannelAssetTemplate, amount: u64, script_key: [u8; 33],
+	template: &TaprootAssetChannelAssetTemplate, amount: u64, script_key: [u8; 33], lock_time: u64,
+	relative_lock_time: u64,
 ) -> Result<Vec<u8>, TaprootAssetChannelAssetTemplateError> {
 	let mut out = Vec::new();
 	encode_taproot_asset_record(0, &[1], &mut out)?;
@@ -706,6 +732,14 @@ fn encode_no_split_channel_asset(
 	encode_taproot_asset_record(4, &[template.asset_type], &mut out)?;
 	let amount_bytes = encode_taproot_asset_bigsize_to_vec(amount)?;
 	encode_taproot_asset_record(6, &amount_bytes, &mut out)?;
+	if lock_time > 0 {
+		let lock_time_bytes = encode_taproot_asset_bigsize_to_vec(lock_time)?;
+		encode_taproot_asset_record(7, &lock_time_bytes, &mut out)?;
+	}
+	if relative_lock_time > 0 {
+		let relative_lock_time_bytes = encode_taproot_asset_bigsize_to_vec(relative_lock_time)?;
+		encode_taproot_asset_record(9, &relative_lock_time_bytes, &mut out)?;
+	}
 	// Version 1 Taproot Asset leaves use the segwit-style leaf encoding, which
 	// preserves the previous asset ID but omits the previous transaction witness.
 	let prev_witnesses = encode_taproot_asset_prev_witnesses(template, false)?;
@@ -2917,6 +2951,28 @@ mod tests {
 			derive_no_split_taproot_asset_aux_leaf_script(&template, 1, [4; 32]),
 			Err(TaprootAssetChannelAssetTemplateError::UnsupportedSplitAmount)
 		);
+	}
+
+	#[test]
+	fn second_level_no_split_asset_leaf_encodes_virtual_lock_fields() {
+		let template = no_split_template(125);
+		let script_key = compressed_even_key_from_xonly([4; 32]);
+		let plain = encode_no_split_channel_asset(&template, 125, script_key, 0, 0).unwrap();
+		let locked = encode_no_split_channel_asset(&template, 125, script_key, 500, 1).unwrap();
+
+		assert_ne!(plain, locked);
+		assert!(locked.windows(5).any(|window| window == [7, 3, 0xfd, 0x01, 0xf4]));
+		assert!(locked.windows(3).any(|window| window == [9, 1, 1]));
+
+		let plain_script = derive_no_split_taproot_asset_aux_leaf_script(&template, 125, [4; 32])
+			.unwrap()
+			.unwrap();
+		let locked_script = derive_no_split_taproot_asset_aux_leaf_script_with_locks(
+			&template, 125, [4; 32], 500, 1,
+		)
+		.unwrap()
+		.unwrap();
+		assert_ne!(plain_script, locked_script);
 	}
 
 	#[test]
