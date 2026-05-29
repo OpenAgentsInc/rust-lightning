@@ -6476,6 +6476,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 			));
 		}
 		let mut seen_funding_txids = Vec::new();
+		let mut seen_public_nonces = Vec::new();
 		for entry in next_local_nonces.0.iter() {
 			if !expected_funding_txids.iter().any(|txid| *txid == entry.funding_txid) {
 				return Err(ChannelError::close(
@@ -6487,7 +6488,13 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 					"Peer sent duplicate simple-taproot nonce for funding txid".to_owned(),
 				));
 			}
+			if seen_public_nonces.iter().any(|public_nonce| *public_nonce == entry.public_nonce) {
+				return Err(ChannelError::close(
+					"Peer reused simple-taproot nonce for multiple funding txids".to_owned(),
+				));
+			}
 			seen_funding_txids.push(entry.funding_txid);
+			seen_public_nonces.push(entry.public_nonce);
 		}
 		for expected_funding_txid in expected_funding_txids.iter() {
 			if !seen_funding_txids.iter().any(|txid| txid == expected_funding_txid) {
@@ -20549,12 +20556,13 @@ mod tests {
 	use crate::types::payment::{PaymentHash, PaymentPreimage};
 	use crate::util::config::UserConfig;
 	use crate::util::errors::APIError;
-	use crate::util::ser::{ReadableArgs, Writeable};
+	use crate::util::ser::{Readable, ReadableArgs, Writeable};
 	use crate::util::test_utils::{
 		self, OnGetShutdownScriptpubkey, TestFeeEstimator, TestKeysInterface, TestLogger,
 	};
 	use bitcoin::amount::Amount;
 	use bitcoin::constants::ChainHash;
+	use bitcoin::hash_types::Txid;
 	use bitcoin::hashes::sha256::Hash as Sha256;
 	use bitcoin::hashes::Hash;
 	use bitcoin::hex::FromHex;
@@ -21219,6 +21227,163 @@ mod tests {
 			revoke_and_ack.simple_taproot_next_local_nonces.as_ref().unwrap().0[0].funding_txid,
 			funding_outpoint.txid
 		);
+
+		let first_splice = simple_taproot_test_splice_candidate(&chan.funding, 11);
+		let first_splice_txid = first_splice.get_funding_txid().unwrap();
+		let rbf_splice = simple_taproot_test_splice_candidate(&chan.funding, 12);
+		let rbf_splice_txid = rbf_splice.get_funding_txid().unwrap();
+		chan.pending_splice = Some(super::PendingFunding {
+			funding_negotiation: None,
+			negotiated_candidates: vec![first_splice, rbf_splice],
+			sent_funding_txid: None,
+			received_funding_txid: None,
+			last_funding_feerate_sat_per_1000_weight: Some(253),
+			contributions: Vec::new(),
+		});
+
+		let (scalar_nonce, nonce_map) = chan
+			.simple_taproot_next_local_nonce_fields(
+				chan.holder_commitment_point.next_transaction_number(),
+			)
+			.unwrap();
+		assert!(scalar_nonce.is_none());
+		let nonce_map = nonce_map.unwrap();
+		let expected_txids = [funding_outpoint.txid, first_splice_txid, rbf_splice_txid];
+		assert_eq!(nonce_map.0.len(), expected_txids.len());
+		for expected_txid in expected_txids {
+			assert!(nonce_map.0.iter().any(|entry| entry.funding_txid == expected_txid));
+		}
+		for (idx, entry) in nonce_map.0.iter().enumerate() {
+			assert!(nonce_map.0[idx + 1..]
+				.iter()
+				.all(|other| other.public_nonce != entry.public_nonce));
+		}
+
+		assert!(chan.simple_taproot_store_counterparty_next_local_nonces(None, None).is_err());
+		assert!(chan
+			.simple_taproot_store_counterparty_next_local_nonces(
+				None,
+				Some(&SimpleTaprootNextLocalNonces(Vec::new())),
+			)
+			.is_err());
+		assert!(chan
+			.simple_taproot_store_counterparty_next_local_nonces(
+				Some(simple_taproot_test_nonce(20)),
+				None,
+			)
+			.is_err());
+
+		let current_nonce = simple_taproot_test_nonce(21);
+		let first_splice_nonce = simple_taproot_test_nonce(22);
+		let rbf_splice_nonce = simple_taproot_test_nonce(23);
+		let valid_map = SimpleTaprootNextLocalNonces(vec![
+			SimpleTaprootNonceEntry {
+				funding_txid: funding_outpoint.txid,
+				public_nonce: current_nonce,
+			},
+			SimpleTaprootNonceEntry {
+				funding_txid: first_splice_txid,
+				public_nonce: first_splice_nonce,
+			},
+			SimpleTaprootNonceEntry {
+				funding_txid: rbf_splice_txid,
+				public_nonce: rbf_splice_nonce,
+			},
+		]);
+		let missing_rbf = SimpleTaprootNextLocalNonces(valid_map.0[..2].to_vec());
+		assert!(chan
+			.simple_taproot_store_counterparty_next_local_nonces(None, Some(&missing_rbf))
+			.is_err());
+		let duplicate_txid = SimpleTaprootNextLocalNonces(vec![
+			valid_map.0[0],
+			SimpleTaprootNonceEntry {
+				funding_txid: funding_outpoint.txid,
+				public_nonce: first_splice_nonce,
+			},
+			valid_map.0[2],
+		]);
+		assert!(chan
+			.simple_taproot_store_counterparty_next_local_nonces(None, Some(&duplicate_txid))
+			.is_err());
+		let unknown_txid = SimpleTaprootNextLocalNonces(vec![
+			valid_map.0[0],
+			SimpleTaprootNonceEntry {
+				funding_txid: simple_taproot_test_txid(99),
+				public_nonce: first_splice_nonce,
+			},
+			valid_map.0[2],
+		]);
+		assert!(chan
+			.simple_taproot_store_counterparty_next_local_nonces(None, Some(&unknown_txid))
+			.is_err());
+		let reused_public_nonce = SimpleTaprootNextLocalNonces(vec![
+			valid_map.0[0],
+			SimpleTaprootNonceEntry {
+				funding_txid: first_splice_txid,
+				public_nonce: current_nonce,
+			},
+			valid_map.0[2],
+		]);
+		assert!(chan
+			.simple_taproot_store_counterparty_next_local_nonces(None, Some(&reused_public_nonce))
+			.is_err());
+
+		chan.simple_taproot_store_counterparty_next_local_nonces(None, Some(&valid_map)).unwrap();
+		let mut encoded = Vec::new();
+		chan.write(&mut encoded).unwrap();
+		let supported_features = channelmanager::provided_channel_type_features(&config);
+		let mut restored: FundedChannel<&TestKeysInterface> = ReadableArgs::read(
+			&mut &encoded[..],
+			(&keys_provider, &&keys_provider, &supported_features),
+		)
+		.unwrap();
+		assert_eq!(
+			restored.context.simple_taproot_counterparty_next_local_nonces.get(first_splice_txid),
+			Some(first_splice_nonce)
+		);
+		assert_eq!(restored.pending_splice.as_ref().unwrap().negotiated_candidates.len(), 2);
+		let restored_reestablish = restored.get_channel_reestablish(&&logger);
+		let restored_nonces = restored_reestablish.simple_taproot_next_local_nonces.unwrap();
+		assert!(restored_reestablish.simple_taproot_next_local_nonce.is_none());
+		assert_eq!(restored_nonces.0.len(), 3);
+		assert!(restored_nonces.0.iter().any(|entry| entry.funding_txid == first_splice_txid));
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	fn simple_taproot_test_txid(seed: u8) -> Txid {
+		Txid::from_byte_array([seed; 32])
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	fn simple_taproot_test_nonce(seed: u8) -> Musig2PublicNonce {
+		Musig2PublicNonce::from_points(
+			&test_utils::pubkey(seed),
+			&test_utils::pubkey(seed.saturating_add(100)),
+		)
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	fn simple_taproot_test_splice_candidate(
+		current: &super::FundingScope, seed: u8,
+	) -> super::FundingScope {
+		let mut encoded = Vec::new();
+		current.write(&mut encoded).unwrap();
+		let mut candidate: super::FundingScope = Readable::read(&mut &encoded[..]).unwrap();
+		let txid = simple_taproot_test_txid(seed);
+		candidate.channel_transaction_parameters.funding_outpoint =
+			Some(OutPoint { txid, index: seed as u16 });
+		candidate.channel_transaction_parameters.splice_parent_funding_txid =
+			current.get_funding_txid();
+		candidate.funding_transaction = Some(Transaction {
+			version: Version::ONE,
+			lock_time: LockTime::ZERO,
+			input: Vec::new(),
+			output: vec![TxOut {
+				value: Amount::from_sat(candidate.get_value_satoshis()),
+				script_pubkey: candidate.get_funding_script_pubkey().unwrap(),
+			}],
+		});
+		candidate
 	}
 
 	#[test]
