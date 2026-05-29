@@ -5344,6 +5344,7 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 				"Channel Type in accept_channel didn't match the one sent in open_channel.",
 			)));
 		}
+		check_final_simple_taproot_dependencies(channel_type, their_features)?;
 		if channel_type_requires_simple_taproot_nonce(channel_type)
 			&& common_fields.simple_taproot_next_local_nonce.is_none()
 		{
@@ -18243,6 +18244,7 @@ impl<SP: SignerProvider> InboundV1Channel<SP> {
 		// support this channel type.
 		let channel_type =
 			channel_type_from_open_channel(&msg.common_fields, our_supported_features)?;
+		check_final_simple_taproot_dependencies(&channel_type, their_features)?;
 
 		let holder_selected_channel_reserve_satoshis =
 			get_holder_selected_channel_reserve_satoshis(
@@ -18879,6 +18881,9 @@ pub(super) fn get_initial_channel_type(
 	let negotiate_simple_taproot = cfg!(feature = "simple_taproot_musig2")
 		&& config.channel_handshake_config.negotiate_simple_taproot_channels
 		&& their_features.supports_simple_taproot_staging();
+	let negotiate_final_simple_taproot = cfg!(feature = "simple_taproot_musig2")
+		&& config.channel_handshake_config.negotiate_final_simple_taproot_channels
+		&& final_simple_taproot_dependencies_satisfied(their_features);
 	let negotiate_taproot_asset = config.channel_handshake_config.negotiate_taproot_asset_channels
 		&& cfg!(feature = "simple_taproot_musig2")
 		&& their_features.supports_simple_taproot_staging()
@@ -18888,6 +18893,11 @@ pub(super) fn get_initial_channel_type(
 		ret.clear_anchors_zero_fee_htlc_tx();
 		ret.clear_anchor_zero_fee_commitments();
 		ret.set_taproot_asset_channel_required();
+	} else if negotiate_final_simple_taproot {
+		ret.set_static_remote_key_required();
+		ret.clear_anchors_zero_fee_htlc_tx();
+		ret.clear_anchor_zero_fee_commitments();
+		ret.set_simple_taproot_required();
 	} else if negotiate_simple_taproot {
 		ret.set_static_remote_key_required();
 		ret.clear_anchors_zero_fee_htlc_tx();
@@ -18906,6 +18916,26 @@ fn channel_type_requires_simple_taproot_nonce(channel_type: &ChannelTypeFeatures
 	channel_type.requires_simple_taproot()
 		|| channel_type.requires_simple_taproot_staging()
 		|| channel_type.requires_taproot_asset_channel()
+}
+
+fn final_simple_taproot_dependencies_satisfied(their_features: &InitFeatures) -> bool {
+	cfg!(simple_close)
+		&& their_features.supports_channel_type()
+		&& their_features.supports_simple_close()
+		&& their_features.supports_simple_taproot()
+}
+
+fn check_final_simple_taproot_dependencies(
+	channel_type: &ChannelTypeFeatures, their_features: &InitFeatures,
+) -> Result<(), ChannelError> {
+	if channel_type.requires_simple_taproot()
+		&& !final_simple_taproot_dependencies_satisfied(their_features)
+	{
+		return Err(ChannelError::close(
+			"Final simple taproot requires option_channel_type, option_simple_close, and option_simple_taproot".to_owned(),
+		));
+	}
+	Ok(())
 }
 
 const SERIALIZATION_VERSION: u8 = 4;
@@ -21075,6 +21105,120 @@ mod tests {
 			.unwrap()
 			.unwrap();
 		assert_eq!(second_partial, repeated_second_partial);
+	}
+
+	#[test]
+	#[cfg(feature = "simple_taproot_musig2")]
+	fn final_simple_taproot_uses_nonce_maps() {
+		let test_est = TestFeeEstimator::new(15000);
+		let feeest = LowerBoundedFeeEstimator::new(&test_est);
+		let logger = TestLogger::new();
+		let secp_ctx = Secp256k1::new();
+		let seed = [42; 32];
+		let network = Network::Testnet;
+		let best_block = BlockLocator::from_network(network);
+		let mut keys_provider = TestKeysInterface::new(&seed, network);
+		keys_provider.disable_all_state_policy_checks = true;
+		let node_b_node_id =
+			PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[42; 32]).unwrap());
+		let mut config = UserConfig::default();
+		config.channel_handshake_config.negotiate_final_simple_taproot_channels = true;
+		let features = channelmanager::provided_init_features(&config);
+		let mut outbound_chan = OutboundV1Channel::<&TestKeysInterface>::new(
+			&feeest,
+			&&keys_provider,
+			&&keys_provider,
+			node_b_node_id,
+			&features,
+			10000000,
+			100000,
+			42,
+			&config,
+			0,
+			42,
+			None,
+			&logger,
+			None,
+		)
+		.unwrap();
+		let open_channel_msg = outbound_chan
+			.get_open_channel(ChainHash::using_genesis_block(network), &&logger)
+			.unwrap();
+		let node_a_node_id =
+			PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[7; 32]).unwrap());
+		let mut inbound_chan = InboundV1Channel::<&TestKeysInterface>::new(
+			&feeest,
+			&&keys_provider,
+			&&keys_provider,
+			node_a_node_id,
+			&channelmanager::provided_channel_type_features(&config),
+			&features,
+			&open_channel_msg,
+			7,
+			&config,
+			0,
+			&&logger,
+			None,
+		)
+		.unwrap();
+		outbound_chan
+			.accept_channel(
+				&inbound_chan.get_accept_channel_message(&&logger).unwrap(),
+				&config.channel_handshake_limits,
+				&features,
+			)
+			.unwrap();
+		let tx = Transaction {
+			version: Version::ONE,
+			lock_time: LockTime::ZERO,
+			input: Vec::new(),
+			output: vec![TxOut {
+				value: Amount::from_sat(10000000),
+				script_pubkey: outbound_chan.funding.get_funding_redeemscript(),
+			}],
+		};
+		let funding_outpoint = OutPoint { txid: tx.compute_txid(), index: 0 };
+		let funding_created = outbound_chan
+			.get_funding_created(tx.clone(), funding_outpoint, false, &&logger)
+			.map_err(|_| ())
+			.unwrap()
+			.unwrap();
+		let (_, funding_signed_msg, _) = inbound_chan
+			.funding_created(&funding_created, best_block, &&keys_provider, &&logger)
+			.unwrap_or_else(|(_, e)| panic!("{}", e));
+		let funding_signed_res = outbound_chan.funding_signed(
+			&funding_signed_msg.unwrap(),
+			best_block,
+			&&keys_provider,
+			&&logger,
+		);
+		let (mut chan, _) = if let Ok(res) = funding_signed_res { res } else { panic!() };
+		assert!(chan.funding.get_channel_type().requires_simple_taproot());
+		assert!(!chan.funding.get_channel_type().requires_simple_taproot_staging());
+		assert!(!chan.funding.get_channel_type().requires_taproot_asset_channel());
+
+		assert!(chan.remove_uncommitted_htlcs_and_mark_paused(&&logger).is_ok());
+		let reestablish = chan.get_channel_reestablish(&&logger);
+		assert!(reestablish.simple_taproot_next_local_nonce.is_none());
+		assert!(reestablish.simple_taproot_next_local_nonces.is_some());
+		assert_eq!(
+			reestablish.simple_taproot_next_local_nonces.as_ref().unwrap().0[0].funding_txid,
+			funding_outpoint.txid
+		);
+
+		chan.holder_commitment_point
+			.advance(&chan.context.holder_signer, &chan.context.secp_ctx, &&logger)
+			.unwrap();
+		chan.holder_commitment_point
+			.advance(&chan.context.holder_signer, &chan.context.secp_ctx, &&logger)
+			.unwrap();
+		let revoke_and_ack = chan.get_last_revoke_and_ack(|_| unreachable!(), &&logger).unwrap();
+		assert!(revoke_and_ack.simple_taproot_next_local_nonce.is_none());
+		assert!(revoke_and_ack.simple_taproot_next_local_nonces.is_some());
+		assert_eq!(
+			revoke_and_ack.simple_taproot_next_local_nonces.as_ref().unwrap().0[0].funding_txid,
+			funding_outpoint.txid
+		);
 	}
 
 	#[test]

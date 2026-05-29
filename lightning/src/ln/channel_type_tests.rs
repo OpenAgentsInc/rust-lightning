@@ -132,6 +132,62 @@ fn test_experimental_simple_taproot_staging_channel_initial() {
 
 #[cfg(feature = "simple_taproot_musig2")]
 #[test]
+fn test_final_simple_taproot_channel_initial() {
+	let mut expected_type = ChannelTypeFeatures::only_static_remote_key();
+	expected_type.set_simple_taproot_required();
+
+	do_test_get_initial_channel_type(
+		UserConfig::default(),
+		InitFeatures::empty(),
+		ChannelTypeFeatures::only_static_remote_key(),
+		|cfg: &mut UserConfig| {
+			cfg.channel_handshake_config.negotiate_final_simple_taproot_channels = true;
+		},
+		|their_features: &mut InitFeatures| {
+			their_features.set_channel_type_optional();
+			their_features.set_simple_close_optional();
+			their_features.set_simple_taproot_optional();
+		},
+		expected_type,
+	)
+}
+
+#[cfg(feature = "simple_taproot_musig2")]
+#[test]
+fn test_final_simple_taproot_initial_requires_simple_close() {
+	let mut config = UserConfig::default();
+	config.channel_handshake_config.negotiate_final_simple_taproot_channels = true;
+
+	let mut their_features = InitFeatures::empty();
+	their_features.set_channel_type_optional();
+	their_features.set_simple_taproot_optional();
+	assert_eq!(
+		get_initial_channel_type(&config, &their_features),
+		ChannelTypeFeatures::only_static_remote_key()
+	);
+
+	their_features.set_simple_close_optional();
+	assert_eq!(
+		get_initial_channel_type(&config, &their_features),
+		ChannelTypeFeatures::simple_taproot()
+	);
+}
+
+#[cfg(feature = "simple_taproot_musig2")]
+#[test]
+fn test_provided_init_features_advertises_final_simple_taproot_with_dependencies() {
+	let mut config = UserConfig::default();
+	config.channel_handshake_config.negotiate_final_simple_taproot_channels = true;
+
+	let features = channelmanager::provided_init_features(&config);
+	assert!(features.supports_channel_type());
+	assert!(features.supports_simple_close());
+	assert!(features.supports_simple_taproot());
+	assert!(!features.supports_simple_taproot_staging());
+}
+
+#[cfg(feature = "simple_taproot_musig2")]
+#[test]
 fn test_experimental_taproot_asset_channel_initial() {
 	let expected_type = ChannelTypeFeatures::taproot_asset_single_asset();
 
@@ -208,6 +264,21 @@ fn test_simple_taproot_public_announcement_request_is_cleared() {
 	assert_eq!(
 		open_channel_msg.common_fields.channel_type,
 		Some(ChannelTypeFeatures::simple_taproot_staging())
+	);
+}
+
+#[cfg(feature = "simple_taproot_musig2")]
+#[test]
+fn test_final_simple_taproot_public_announcement_request_is_cleared() {
+	let mut config = UserConfig::default();
+	config.channel_handshake_config.announce_for_forwarding = true;
+	config.channel_handshake_config.negotiate_final_simple_taproot_channels = true;
+
+	let open_channel_msg = outbound_open_channel_from_config(config);
+	assert_eq!(open_channel_msg.common_fields.channel_flags & 1, 0);
+	assert_eq!(
+		open_channel_msg.common_fields.channel_type,
+		Some(ChannelTypeFeatures::simple_taproot())
 	);
 }
 
@@ -740,6 +811,81 @@ fn test_supports_simple_taproot_staging_channel_type() {
 	expected_channel_type.set_simple_taproot_staging_required();
 
 	do_test_supports_channel_type(config, expected_channel_type)
+}
+
+#[cfg(feature = "simple_taproot_musig2")]
+#[test]
+fn test_supports_final_simple_taproot_channel_type() {
+	let mut config = UserConfig::default();
+	config.channel_handshake_config.negotiate_final_simple_taproot_channels = true;
+
+	let mut expected_channel_type = ChannelTypeFeatures::only_static_remote_key();
+	expected_channel_type.set_simple_taproot_required();
+
+	do_test_supports_channel_type(config, expected_channel_type)
+}
+
+#[cfg(feature = "simple_taproot_musig2")]
+#[test]
+fn test_rejects_final_simple_taproot_without_simple_close_dependency() {
+	let secp_ctx = Secp256k1::new();
+	let test_est = TestFeeEstimator::new(15000);
+	let fee_estimator = LowerBoundedFeeEstimator::new(&test_est);
+	let network = Network::Testnet;
+	let keys_provider = TestKeysInterface::new(&[42; 32], network);
+	let logger = TestLogger::new();
+
+	let node_id_a =
+		PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[1; 32]).unwrap());
+	let node_id_b =
+		PublicKey::from_secret_key(&secp_ctx, &SecretKey::from_slice(&[2; 32]).unwrap());
+
+	let mut config = UserConfig::default();
+	config.channel_handshake_config.negotiate_final_simple_taproot_channels = true;
+
+	let mut channel_a = OutboundV1Channel::<&TestKeysInterface>::new(
+		&fee_estimator,
+		&&keys_provider,
+		&&keys_provider,
+		node_id_b,
+		&channelmanager::provided_init_features(&config),
+		10000000,
+		100000,
+		42,
+		&config,
+		0,
+		42,
+		None,
+		&logger,
+		None,
+	)
+	.unwrap();
+
+	let open_channel_msg =
+		channel_a.get_open_channel(ChainHash::using_genesis_block(network), &&logger).unwrap();
+	assert_eq!(
+		open_channel_msg.common_fields.channel_type,
+		Some(ChannelTypeFeatures::simple_taproot())
+	);
+
+	let mut their_features_without_simple_close = InitFeatures::empty();
+	their_features_without_simple_close.set_channel_type_optional();
+	their_features_without_simple_close.set_simple_taproot_optional();
+	let channel_b = InboundV1Channel::<&TestKeysInterface>::new(
+		&fee_estimator,
+		&&keys_provider,
+		&&keys_provider,
+		node_id_a,
+		&channelmanager::provided_channel_type_features(&config),
+		&their_features_without_simple_close,
+		&open_channel_msg,
+		7,
+		&config,
+		0,
+		&&logger,
+		None,
+	);
+	assert!(channel_b.is_err());
 }
 
 #[test]

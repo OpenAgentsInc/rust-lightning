@@ -18193,6 +18193,12 @@ pub fn provided_init_features(config: &UserConfig) -> InitFeatures {
 
 	#[cfg(feature = "simple_taproot_musig2")]
 	{
+		if config.channel_handshake_config.negotiate_final_simple_taproot_channels
+			&& cfg!(simple_close)
+		{
+			features.set_simple_taproot_optional();
+		}
+
 		if config.channel_handshake_config.negotiate_simple_taproot_channels
 			|| config.channel_handshake_config.negotiate_taproot_asset_channels
 		{

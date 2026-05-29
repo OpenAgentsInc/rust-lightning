@@ -242,14 +242,26 @@ pub struct ChannelHandshakeConfig {
 	pub negotiate_anchor_zero_fee_commitments: bool,
 
 	/// If set, we advertise and attempt to negotiate BOLT simple taproot channel
-	/// support for future channels.
+	/// support for future channels using the draft staging feature bits.
 	///
-	/// This fork uses the BOLT draft's staging feature bits (`180/181`) for
-	/// negotiation. The final `80/81` bits are defined in `lightning-types`, but
-	/// are not advertised by this config flag until the draft is finalized.
+	/// This fork keeps the staging feature bits (`180/181`) separate from the
+	/// final `option_simple_taproot` bits so Lightning Labs staging interop cannot
+	/// accidentally satisfy a production feature-bit claim.
 	///
 	/// Default value: `false`
 	pub negotiate_simple_taproot_channels: bool,
+
+	/// If set, we advertise and attempt to negotiate BOLT simple taproot channel
+	/// support for future channels using the final `option_simple_taproot`
+	/// feature bits (`80/81`).
+	///
+	/// This option is only advertised when `option_simple_close` and
+	/// `option_channel_type` are available. Final simple taproot channels must be
+	/// explicit private channel-type channels; staging bits and Taproot Asset
+	/// overlay bits remain separate interop modes.
+	///
+	/// Default value: `false`
+	pub negotiate_final_simple_taproot_channels: bool,
 
 	/// If set, we advertise and attempt to negotiate the OpenAgentsInc experimental
 	/// Taproot Asset channel type for future channels.
@@ -295,6 +307,7 @@ impl Default for ChannelHandshakeConfig {
 			negotiate_anchors_zero_fee_htlc_tx: true,
 			negotiate_anchor_zero_fee_commitments: false,
 			negotiate_simple_taproot_channels: false,
+			negotiate_final_simple_taproot_channels: false,
 			negotiate_taproot_asset_channels: false,
 			our_max_accepted_htlcs: 50,
 		}
@@ -329,6 +342,7 @@ impl Readable for ChannelHandshakeConfig {
 			negotiate_anchors_zero_fee_htlc_tx: Readable::read(reader)?,
 			negotiate_anchor_zero_fee_commitments: Readable::read(reader)?,
 			negotiate_simple_taproot_channels: Readable::read(reader)?,
+			negotiate_final_simple_taproot_channels: Readable::read(reader)?,
 			negotiate_taproot_asset_channels: Readable::read(reader)?,
 			our_max_accepted_htlcs: Readable::read(reader)?,
 		})
