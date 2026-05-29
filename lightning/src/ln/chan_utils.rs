@@ -49,9 +49,11 @@ use super::channel_keys::{
 #[cfg(feature = "simple_taproot_musig2")]
 use super::simple_taproot::{
 	simple_taproot_anchor_spend_info, simple_taproot_htlc_spend_info_with_aux_leaf_for_variant,
-	simple_taproot_second_level_htlc_spend_info_with_aux_leaf, simple_taproot_to_local_spend_info,
-	simple_taproot_to_local_spend_info_with_aux_leaf, simple_taproot_to_remote_spend_info,
-	simple_taproot_to_remote_spend_info_with_aux_leaf, SimpleTaprootHtlcScriptVariant,
+	simple_taproot_second_level_htlc_spend_info_with_aux_leaf_for_variant,
+	simple_taproot_to_local_spend_info, simple_taproot_to_local_spend_info_for_variant,
+	simple_taproot_to_local_spend_info_with_aux_leaf_for_variant,
+	simple_taproot_to_remote_spend_info_for_variant,
+	simple_taproot_to_remote_spend_info_with_aux_leaf_for_variant, SimpleTaprootHtlcScriptVariant,
 	SimpleTaprootHtlcSpendInfo, SimpleTaprootKeyAggContext, SimpleTaprootMusigError,
 };
 use crate::chain;
@@ -726,9 +728,13 @@ pub fn get_countersigner_payment_script(
 	#[cfg(feature = "simple_taproot_musig2")]
 	if requires_simple_taproot_outputs(channel_type_features) {
 		let secp_ctx = Secp256k1::verification_only();
-		return simple_taproot_to_remote_spend_info(&secp_ctx, payment_key)
-			.expect("valid simple-taproot to_remote output")
-			.script_pubkey;
+		return simple_taproot_to_remote_spend_info_for_variant(
+			&secp_ctx,
+			payment_key,
+			simple_taproot_htlc_script_variant(channel_type_features),
+		)
+		.expect("valid simple-taproot to_remote output")
+		.script_pubkey;
 	}
 
 	if channel_type_features.supports_anchors_zero_fee_htlc_tx() {
@@ -1066,12 +1072,13 @@ pub(crate) fn build_htlc_output(
 			#[cfg(feature = "simple_taproot_musig2")]
 			if requires_simple_taproot_outputs(channel_type_features) {
 				let secp_ctx = Secp256k1::verification_only();
-				simple_taproot_second_level_htlc_spend_info_with_aux_leaf(
+				simple_taproot_second_level_htlc_spend_info_with_aux_leaf_for_variant(
 					&secp_ctx,
 					&broadcaster_delayed_payment_key.to_public_key(),
 					&revocation_key.to_public_key(),
 					contest_delay,
 					htlc.simple_taproot_second_level_aux_leaf_script.as_deref(),
+					simple_taproot_htlc_script_variant(channel_type_features),
 				)
 				.expect("valid simple-taproot second-level HTLC output")
 				.script_pubkey
@@ -2216,20 +2223,23 @@ impl CommitmentTransaction {
 			#[cfg(feature = "simple_taproot_musig2")]
 			let (script, sort_script) = if requires_simple_taproot_outputs(channel_type) {
 				let secp_ctx = Secp256k1::verification_only();
+				let script_variant = simple_taproot_htlc_script_variant(channel_type);
 				let countersignatory_payment_key = simple_taproot_to_remote_payment_key(
 					channel_type,
 					countersignatory_payment_point,
 				);
-				let script = simple_taproot_to_remote_spend_info_with_aux_leaf(
+				let script = simple_taproot_to_remote_spend_info_with_aux_leaf_for_variant(
 					&secp_ctx,
 					&countersignatory_payment_key,
 					channel_parameters.simple_taproot_to_countersignatory_aux_leaf_script(),
+					script_variant,
 				)
 				.expect("valid simple-taproot to_remote output")
 				.script_pubkey;
-				let sort_script = simple_taproot_to_remote_spend_info(
+				let sort_script = simple_taproot_to_remote_spend_info_for_variant(
 					&secp_ctx,
 					&countersignatory_payment_key,
+					script_variant,
 				)
 				.expect("valid simple-taproot to_remote sort output")
 				.script_pubkey;
@@ -2261,20 +2271,23 @@ impl CommitmentTransaction {
 			#[cfg(feature = "simple_taproot_musig2")]
 			let (script_pubkey, sort_script_pubkey) = if requires_simple_taproot_outputs(channel_type) {
 				let secp_ctx = Secp256k1::verification_only();
-				let script_pubkey = simple_taproot_to_local_spend_info_with_aux_leaf(
+				let script_variant = simple_taproot_htlc_script_variant(channel_type);
+				let script_pubkey = simple_taproot_to_local_spend_info_with_aux_leaf_for_variant(
 					&secp_ctx,
 					&keys.broadcaster_delayed_payment_key.to_public_key(),
 					&keys.revocation_key.to_public_key(),
 					channel_parameters.simple_taproot_to_broadcaster_contest_delay(),
 					channel_parameters.simple_taproot_to_broadcaster_aux_leaf_script(),
+					script_variant,
 				)
 				.expect("valid simple-taproot to_local output")
 				.script_pubkey;
-				let sort_script_pubkey = simple_taproot_to_local_spend_info(
+				let sort_script_pubkey = simple_taproot_to_local_spend_info_for_variant(
 					&secp_ctx,
 					&keys.broadcaster_delayed_payment_key.to_public_key(),
 					&keys.revocation_key.to_public_key(),
 					channel_parameters.simple_taproot_to_broadcaster_contest_delay(),
+					script_variant,
 				)
 				.expect("valid simple-taproot to_local sort output")
 				.script_pubkey;
@@ -2784,7 +2797,7 @@ mod tests {
 	use super::{ChannelPublicKeys, CounterpartyCommitmentSecrets};
 	use crate::chain;
 	use crate::ln::chan_utils::{
-		build_htlc_transaction, commit_tx_fee_sat, get_htlc_redeemscript,
+		build_htlc_transaction, commit_tx_fee_sat, derive_private_key, get_htlc_redeemscript,
 		get_keyed_anchor_redeemscript, get_to_countersigner_keyed_anchor_redeemscript,
 		shared_anchor_script_pubkey, BuiltCommitmentTransaction, ChannelTransactionParameters,
 		CommitmentTransaction, CounterpartyChannelTransactionParameters, HTLCOutputInCommitment,
@@ -2799,25 +2812,35 @@ mod tests {
 	use crate::ln::channel_keys::{DelayedPaymentBasepoint, HtlcBasepoint, RevocationBasepoint};
 	#[cfg(feature = "simple_taproot_musig2")]
 	use crate::ln::simple_taproot::{
-		simple_taproot_htlc_spend_info_with_aux_leaf_for_variant,
+		simple_taproot_anchor_spend_info, simple_taproot_htlc_spend_info_with_aux_leaf_for_variant,
 		simple_taproot_second_level_htlc_spend_info_with_aux_leaf,
-		simple_taproot_to_local_spend_info, simple_taproot_to_local_spend_info_with_aux_leaf,
-		simple_taproot_to_remote_spend_info, simple_taproot_to_remote_spend_info_with_aux_leaf,
-		SimpleTaprootHtlcScriptVariant,
+		simple_taproot_second_level_htlc_spend_info_with_aux_leaf_for_variant,
+		simple_taproot_sign_htlc_spend, simple_taproot_to_local_spend_info,
+		simple_taproot_to_local_spend_info_for_variant,
+		simple_taproot_to_local_spend_info_with_aux_leaf, simple_taproot_to_remote_spend_info,
+		simple_taproot_to_remote_spend_info_for_variant,
+		simple_taproot_to_remote_spend_info_with_aux_leaf, Musig2PublicNonce,
+		SimpleTaprootHtlcScriptVariant, SimpleTaprootHtlcSpendPath, SimpleTaprootKeyAggContext,
+		SimpleTaprootNonceScope, SimpleTaprootNonceState, SimpleTaprootNonceUse,
+		SimpleTaprootPartialSignature, SimpleTaprootSecretNonce,
 	};
 	use crate::sign::{ChannelSigner, SignerProvider};
 	use crate::types::features::ChannelTypeFeatures;
 	use crate::types::payment::PaymentHash;
 	use crate::util::ser::{Readable, Writeable};
 	use crate::util::test_utils;
+	#[cfg(feature = "simple_taproot_musig2")]
+	use bitcoin::consensus::encode::{deserialize, serialize};
 	use bitcoin::hashes::sha256::Hash as Sha256;
 	use bitcoin::hashes::Hash;
-	use bitcoin::hex::FromHex;
+	use bitcoin::hex::{DisplayHex, FromHex};
 	use bitcoin::secp256k1::{self, Keypair, Message, PublicKey, Secp256k1, SecretKey};
+	#[cfg(feature = "simple_taproot_musig2")]
+	use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
 	#[cfg(feature = "simple_taproot_musig2")]
 	use bitcoin::transaction::TxOut;
 	use bitcoin::PublicKey as BitcoinPublicKey;
-	use bitcoin::{CompressedPublicKey, Network, ScriptBuf, Sequence, Txid};
+	use bitcoin::{CompressedPublicKey, Network, ScriptBuf, Sequence, Transaction, Txid};
 
 	#[allow(unused_imports)]
 	use crate::prelude::*;
@@ -2889,6 +2912,131 @@ mod tests {
 	#[cfg(feature = "simple_taproot_musig2")]
 	fn vector_pubkey(hex: &str) -> PublicKey {
 		PublicKey::from_slice(&<Vec<u8>>::from_hex(hex).unwrap()).unwrap()
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	fn vector_secret_key(hex: &str) -> SecretKey {
+		SecretKey::from_slice(&<Vec<u8>>::from_hex(hex).unwrap()).unwrap()
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	fn vector_public_nonce(hex: &str) -> Musig2PublicNonce {
+		Musig2PublicNonce::from_slice(&<Vec<u8>>::from_hex(hex).unwrap()).unwrap()
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	fn vector_secret_nonce(hex: &str) -> SimpleTaprootSecretNonce {
+		let bytes: [u8; 97] = <Vec<u8>>::from_hex(hex).unwrap().try_into().unwrap();
+		SimpleTaprootSecretNonce::from_bytes(bytes).unwrap()
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	fn vector_partial_signature(hex: &str) -> SimpleTaprootPartialSignature {
+		SimpleTaprootPartialSignature::from_slice(&<Vec<u8>>::from_hex(hex).unwrap()).unwrap()
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	fn simple_taproot_final_vector_builder() -> TestCommitmentTxBuilder {
+		let mut builder = simple_taproot_vector_builder();
+		builder.channel_parameters.channel_type_features = ChannelTypeFeatures::simple_taproot();
+		builder.channel_parameters.is_outbound_from_holder = true;
+		builder.commitment_number = crate::ln::channel::INITIAL_COMMITMENT_NUMBER - 42;
+		let funding_tx: Transaction = deserialize(
+			&<Vec<u8>>::from_hex(
+				"02000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000018096980000000000225120d0ebb4909d563a7ae1213fddede4ae54132fba0ef0b97ee3f8469191fecd348e00000000",
+			)
+			.unwrap(),
+		)
+		.unwrap();
+		builder.channel_parameters.funding_outpoint =
+			Some(chain::transaction::OutPoint { txid: funding_tx.compute_txid(), index: 0 });
+		builder
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	fn signed_bolt_vector_commitment_transaction(
+		builder: &TestCommitmentTxBuilder, commitment_tx: CommitmentTransaction,
+		local_sec_nonce_hex: &str, local_nonce_hex: &str, remote_nonce_hex: &str,
+		remote_partial_sig_hex: &str,
+	) -> Transaction {
+		let local_secret =
+			vector_secret_key("20ae2d254ab29afd3dcbf8744a5b88d06070f55a4bd5532483a093ac4db91277");
+		let local_pubkey = builder.channel_parameters.holder_pubkeys.funding_pubkey;
+		let remote_pubkey = builder.counterparty_pubkeys.funding_pubkey;
+		let local_secret_nonce = vector_secret_nonce(local_sec_nonce_hex);
+		let local_nonce = vector_public_nonce(local_nonce_hex);
+		let remote_nonce = vector_public_nonce(remote_nonce_hex);
+		let remote_partial = vector_partial_signature(remote_partial_sig_hex);
+		assert_eq!(local_secret_nonce.public_nonce().unwrap(), local_nonce);
+
+		let funding_output = TxOut {
+			value: bitcoin::Amount::from_sat(10_000_000),
+			script_pubkey: ScriptBuf::from_hex(
+				"5120d0ebb4909d563a7ae1213fddede4ae54132fba0ef0b97ee3f8469191fecd348e",
+			)
+			.unwrap(),
+		};
+		let prevouts = [funding_output];
+		let sighash = SighashCache::new(&commitment_tx.built.transaction)
+			.taproot_key_spend_signature_hash(0, &Prevouts::All(&prevouts), TapSighashType::Default)
+			.unwrap()
+			.to_byte_array();
+		let key_agg_ctx = SimpleTaprootKeyAggContext::for_funding_keys(local_pubkey, remote_pubkey);
+		let nonce_use = SimpleTaprootNonceUse::new(
+			builder.channel_parameters.funding_outpoint.unwrap().txid,
+			builder.commitment_number,
+			SimpleTaprootNonceScope::Commitment,
+		);
+		let mut nonce_state = SimpleTaprootNonceState::new();
+		let local_partial = key_agg_ctx
+			.sign_partial(
+				&local_secret,
+				local_secret_nonce,
+				&[local_nonce, remote_nonce],
+				&sighash,
+				nonce_use,
+				&mut nonce_state,
+			)
+			.unwrap();
+		key_agg_ctx
+			.verify_partial(
+				&local_pubkey,
+				&local_nonce,
+				&local_partial.partial_signature,
+				&[local_nonce, remote_nonce],
+				&sighash,
+			)
+			.unwrap();
+		key_agg_ctx
+			.verify_partial(
+				&remote_pubkey,
+				&remote_nonce,
+				&remote_partial,
+				&[local_nonce, remote_nonce],
+				&sighash,
+			)
+			.unwrap();
+		let final_signature = key_agg_ctx
+			.aggregate_final_signature(
+				&[local_partial.partial_signature, remote_partial],
+				&[local_nonce, remote_nonce],
+				&sighash,
+			)
+			.unwrap();
+		key_agg_ctx.verify_final_signature(&final_signature, &sighash).unwrap();
+
+		let message = Message::from_digest([7; 32]);
+		let dummy_sig =
+			builder.secp_ctx.sign_ecdsa(&message, &SecretKey::from_slice(&[3; 32]).unwrap());
+		HolderCommitmentTransaction::new(
+			commitment_tx,
+			dummy_sig,
+			Vec::new(),
+			&local_pubkey,
+			&remote_pubkey,
+		)
+		.with_simple_taproot_holder_signature(Some(final_signature))
+		.add_holder_sig(&builder.channel_parameters.make_funding_redeemscript(), dummy_sig)
 	}
 
 	#[cfg(feature = "simple_taproot_musig2")]
@@ -3576,6 +3724,367 @@ mod tests {
 			Some(second_level_aux_leaf)
 		);
 		assert!(builder.verify(&read_tx).is_ok());
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	#[test]
+	fn final_bolt_spend_metadata_reconstructs_after_commitment_roundtrip() {
+		let mut builder = simple_taproot_final_vector_builder();
+		builder.feerate_per_kw = 644;
+		let htlcs = vec![
+			bolt_simple_taproot_htlc(true, 1_000_000, 500, 0),
+			bolt_simple_taproot_htlc(false, 3_000_000, 503, 3),
+		];
+		let tx = builder.build(6_986_163, 3_000_000, htlcs);
+		let keys = tx.trust().keys();
+		let script_variant =
+			simple_taproot_htlc_script_variant(&builder.channel_parameters.channel_type_features);
+		assert_eq!(script_variant, SimpleTaprootHtlcScriptVariant::Final);
+		let remote_payment_key = simple_taproot_to_remote_payment_key(
+			&builder.channel_parameters.channel_type_features,
+			&builder.counterparty_pubkeys.payment_point,
+		);
+		let to_local = simple_taproot_to_local_spend_info_for_variant(
+			&builder.secp_ctx,
+			&keys.broadcaster_delayed_payment_key.to_public_key(),
+			&keys.revocation_key.to_public_key(),
+			builder.channel_parameters.holder_selected_contest_delay,
+			script_variant,
+		)
+		.unwrap();
+		let to_remote = simple_taproot_to_remote_spend_info_for_variant(
+			&builder.secp_ctx,
+			&remote_payment_key,
+			script_variant,
+		)
+		.unwrap();
+		let local_anchor = simple_taproot_anchor_spend_info(
+			&builder.secp_ctx,
+			&keys.broadcaster_delayed_payment_key.to_public_key(),
+		)
+		.unwrap();
+		let remote_anchor =
+			simple_taproot_anchor_spend_info(&builder.secp_ctx, &remote_payment_key).unwrap();
+		let first_htlc = &tx.nondust_htlcs()[0];
+		let htlc = simple_taproot_htlc_spend_info_with_aux_leaf_for_variant(
+			&builder.secp_ctx,
+			first_htlc.offered,
+			&first_htlc.payment_hash,
+			first_htlc.cltv_expiry,
+			&keys.broadcaster_htlc_key.to_public_key(),
+			&keys.countersignatory_htlc_key.to_public_key(),
+			&keys.revocation_key.to_public_key(),
+			first_htlc.simple_taproot_aux_leaf_script.as_deref(),
+			script_variant,
+		)
+		.unwrap();
+		let second_level = simple_taproot_second_level_htlc_spend_info_with_aux_leaf_for_variant(
+			&builder.secp_ctx,
+			&keys.broadcaster_delayed_payment_key.to_public_key(),
+			&keys.revocation_key.to_public_key(),
+			builder.channel_parameters.holder_selected_contest_delay,
+			first_htlc.simple_taproot_second_level_aux_leaf_script.as_deref(),
+			script_variant,
+		)
+		.unwrap();
+
+		let mut writer = test_utils::TestVecWriter(Vec::new());
+		tx.write(&mut writer).unwrap();
+		let read_tx = CommitmentTransaction::read(&mut &writer.0[..]).unwrap();
+		assert!(builder.verify(&read_tx).is_ok());
+		assert_eq!(read_tx.nondust_htlcs(), tx.nondust_htlcs());
+		let read_keys = read_tx.trust().keys();
+		let read_remote_payment_key = simple_taproot_to_remote_payment_key(
+			&builder.channel_parameters.channel_type_features,
+			&builder.counterparty_pubkeys.payment_point,
+		);
+		assert_eq!(
+			simple_taproot_to_local_spend_info_for_variant(
+				&builder.secp_ctx,
+				&read_keys.broadcaster_delayed_payment_key.to_public_key(),
+				&read_keys.revocation_key.to_public_key(),
+				builder.channel_parameters.holder_selected_contest_delay,
+				script_variant,
+			)
+			.unwrap(),
+			to_local
+		);
+		assert_eq!(
+			simple_taproot_to_remote_spend_info_for_variant(
+				&builder.secp_ctx,
+				&read_remote_payment_key,
+				script_variant,
+			)
+			.unwrap(),
+			to_remote
+		);
+		assert_eq!(
+			simple_taproot_anchor_spend_info(
+				&builder.secp_ctx,
+				&read_keys.broadcaster_delayed_payment_key.to_public_key(),
+			)
+			.unwrap(),
+			local_anchor
+		);
+		assert_eq!(
+			simple_taproot_anchor_spend_info(&builder.secp_ctx, &read_remote_payment_key).unwrap(),
+			remote_anchor
+		);
+		let read_first_htlc = &read_tx.nondust_htlcs()[0];
+		assert_eq!(
+			simple_taproot_htlc_spend_info_with_aux_leaf_for_variant(
+				&builder.secp_ctx,
+				read_first_htlc.offered,
+				&read_first_htlc.payment_hash,
+				read_first_htlc.cltv_expiry,
+				&read_keys.broadcaster_htlc_key.to_public_key(),
+				&read_keys.countersignatory_htlc_key.to_public_key(),
+				&read_keys.revocation_key.to_public_key(),
+				read_first_htlc.simple_taproot_aux_leaf_script.as_deref(),
+				script_variant,
+			)
+			.unwrap(),
+			htlc
+		);
+		assert_eq!(
+			simple_taproot_second_level_htlc_spend_info_with_aux_leaf_for_variant(
+				&builder.secp_ctx,
+				&read_keys.broadcaster_delayed_payment_key.to_public_key(),
+				&read_keys.revocation_key.to_public_key(),
+				builder.channel_parameters.holder_selected_contest_delay,
+				read_first_htlc.simple_taproot_second_level_aux_leaf_script.as_deref(),
+				script_variant,
+			)
+			.unwrap(),
+			second_level
+		);
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	#[test]
+	#[rustfmt::skip]
+	fn simple_taproot_vector_no_htlc_commitment_tx_matches_bolt() {
+		let builder = simple_taproot_final_vector_builder();
+		let commitment_tx = builder.build(6_984_820, 3_000_000, Vec::new());
+		let mut expected_tx: Transaction = deserialize(
+			&<Vec<u8>>::from_hex(
+				"020000000001015474cba49124ab0c4327c244bb2907059585c4af3fa5f3469701534120fec0170000000000c5fe1780044a010000000000002251201249c50576fdf914caa14f9221370b986df520bdbc73f57d5056a86ee03e5ac44a01000000000000225120f67ab012701705f3203d132f909a6810ef18c5da4c11d986cb50818803b8344ec0c62d00000000002251203609bb705034e5629aa6ec05c5ca906ac89ac08b34c4583c259521ec3017440874946a00000000002251203e1fcbbd06c8a7414704612c72be9834a75d86ed85b29f0ef0c52e1950afaff30140a4a9eb512a2f4094efdd2c566f1f20cc8a6e2c307a4a44cc3f9fea7fa147dd7038f1b048aa43fa0b4009175c1c37c37b96c01058541f9e1b61110fce4e831d9f55dc1920",
+			)
+			.unwrap(),
+		)
+		.unwrap();
+		expected_tx.input[0].witness.clear();
+		assert_eq!(
+			serialize(&commitment_tx.built.transaction),
+			serialize(&expected_tx),
+			"unsigned commitment transaction must match the BOLT vector before witness signing"
+		);
+		let signed_tx = signed_bolt_vector_commitment_transaction(
+			&builder,
+			commitment_tx,
+			"22a453171ba4a634da1addcf660d63d8e23fb63169a2a7206f4e23290e4cc59bb3c3011fe3c31cb4f1192a2df56c2e52350ce0a82060fadf2404af9f81652c5f03b7203dec7c13896b6ff1f58b24f84458c441720a12b5a57426397e22f0a8c78b",
+			"025f2272ea289c5fe9d52d411f5a50a6d4882341bf0ecb201d5675850a2ba0b09d025bc489cf67752134ba81f8d7f1146d7455baf3190de75a6a661e2405212991a9",
+			"02d324627074522af8cf4287caf1e073a3493550b99aed2697e58f476ec402e272039c25fc616207e15917b7145cefcb4c9c702580baf255597d2fa115564a74a130",
+			"3fa93659d4c2d590eadbd422595a37597ed58607e026a91f4e6e19329134a931",
+		);
+		assert_eq!(
+			serialize(&signed_tx).as_hex().to_string(),
+			"020000000001015474cba49124ab0c4327c244bb2907059585c4af3fa5f3469701534120fec0170000000000c5fe1780044a010000000000002251201249c50576fdf914caa14f9221370b986df520bdbc73f57d5056a86ee03e5ac44a01000000000000225120f67ab012701705f3203d132f909a6810ef18c5da4c11d986cb50818803b8344ec0c62d00000000002251203609bb705034e5629aa6ec05c5ca906ac89ac08b34c4583c259521ec3017440874946a00000000002251203e1fcbbd06c8a7414704612c72be9834a75d86ed85b29f0ef0c52e1950afaff30140a4a9eb512a2f4094efdd2c566f1f20cc8a6e2c307a4a44cc3f9fea7fa147dd7038f1b048aa43fa0b4009175c1c37c37b96c01058541f9e1b61110fce4e831d9f55dc1920",
+		);
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	#[test]
+	#[rustfmt::skip]
+	fn simple_taproot_vector_five_htlc_commitment_tx_matches_bolt() {
+		let mut builder = simple_taproot_final_vector_builder();
+		builder.feerate_per_kw = 644;
+		let htlcs = vec![
+			bolt_simple_taproot_htlc(true, 1_000_000, 500, 0),
+			bolt_simple_taproot_htlc(true, 2_000_000, 501, 1),
+			bolt_simple_taproot_htlc(false, 2_000_000, 502, 2),
+			bolt_simple_taproot_htlc(false, 3_000_000, 503, 3),
+			bolt_simple_taproot_htlc(true, 4_000_000, 504, 4),
+		];
+		let commitment_tx = builder.build(6_986_163, 3_000_000, htlcs);
+		let mut expected_tx: Transaction = deserialize(
+			&<Vec<u8>>::from_hex(
+				"020000000001015474cba49124ab0c4327c244bb2907059585c4af3fa5f3469701534120fec0170000000000c5fe1780094a010000000000002251201249c50576fdf914caa14f9221370b986df520bdbc73f57d5056a86ee03e5ac44a01000000000000225120f67ab012701705f3203d132f909a6810ef18c5da4c11d986cb50818803b8344ee8030000000000002251209ce82cd1b1f6f975049d58019a7145a3ec9680079969cf929d7d2c4bc9b30637d0070000000000002251208937f8afbc80cf4ba773f1adc3d63ea26259f80f5a3ba622211906d2e7e6e23dd007000000000000225120bf9ae94dda9b5b88485cc67a966ec946b237d19626916dee034b789ebd7fd5fcb80b0000000000002251208fe2e1306e414e896dfd879475b5c1a6a01d4e79b32c0544aa185ccb73c392aaa00f000000000000225120d93389ba5cdde8570d3ba73487ff7fc9f8c3816645009e42110fe5239f5a3e62c0c62d00000000002251203609bb705034e5629aa6ec05c5ca906ac89ac08b34c4583c259521ec30174408b3996a00000000002251203e1fcbbd06c8a7414704612c72be9834a75d86ed85b29f0ef0c52e1950afaff301409dfe3b178022d975e4b86bd1f04bccfc7576363dbaf58f2ac682136ad89cbeb1a1d07eca1e0bc547b5c5c1133214565e5dfdc230bc7d4736aa7e1be3fb8269d355dc1920",
+			)
+			.unwrap(),
+		)
+		.unwrap();
+		expected_tx.input[0].witness.clear();
+		assert_eq!(
+			serialize(&commitment_tx.built.transaction),
+			serialize(&expected_tx),
+			"unsigned five-HTLC commitment transaction must match the BOLT vector before witness signing"
+		);
+		let signed_tx = signed_bolt_vector_commitment_transaction(
+			&builder,
+			commitment_tx,
+			"22a453171ba4a634da1addcf660d63d8e23fb63169a2a7206f4e23290e4cc59bb3c3011fe3c31cb4f1192a2df56c2e52350ce0a82060fadf2404af9f81652c5f03b7203dec7c13896b6ff1f58b24f84458c441720a12b5a57426397e22f0a8c78b",
+			"025f2272ea289c5fe9d52d411f5a50a6d4882341bf0ecb201d5675850a2ba0b09d025bc489cf67752134ba81f8d7f1146d7455baf3190de75a6a661e2405212991a9",
+			"038a4018a074b5ddfc1424551e871bd739259c4e209f47177eb67c70cfbdb1e57c03c75684ad3a42d8c86a3eddb83b8160d67ef272078b44f21a8f889ee25e2459d3",
+			"46efde50f08c128aa6472bbd50ea156fb9bde7b013f5e042f700729c94053613",
+		);
+		assert_eq!(
+			serialize(&signed_tx).as_hex().to_string(),
+			"020000000001015474cba49124ab0c4327c244bb2907059585c4af3fa5f3469701534120fec0170000000000c5fe1780094a010000000000002251201249c50576fdf914caa14f9221370b986df520bdbc73f57d5056a86ee03e5ac44a01000000000000225120f67ab012701705f3203d132f909a6810ef18c5da4c11d986cb50818803b8344ee8030000000000002251209ce82cd1b1f6f975049d58019a7145a3ec9680079969cf929d7d2c4bc9b30637d0070000000000002251208937f8afbc80cf4ba773f1adc3d63ea26259f80f5a3ba622211906d2e7e6e23dd007000000000000225120bf9ae94dda9b5b88485cc67a966ec946b237d19626916dee034b789ebd7fd5fcb80b0000000000002251208fe2e1306e414e896dfd879475b5c1a6a01d4e79b32c0544aa185ccb73c392aaa00f000000000000225120d93389ba5cdde8570d3ba73487ff7fc9f8c3816645009e42110fe5239f5a3e62c0c62d00000000002251203609bb705034e5629aa6ec05c5ca906ac89ac08b34c4583c259521ec30174408b3996a00000000002251203e1fcbbd06c8a7414704612c72be9834a75d86ed85b29f0ef0c52e1950afaff301409dfe3b178022d975e4b86bd1f04bccfc7576363dbaf58f2ac682136ad89cbeb1a1d07eca1e0bc547b5c5c1133214565e5dfdc230bc7d4736aa7e1be3fb8269d355dc1920",
+		);
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	#[test]
+	#[rustfmt::skip]
+	fn simple_taproot_vector_htlc_resolution_txs_match_bolt() {
+		let mut builder = simple_taproot_final_vector_builder();
+		builder.feerate_per_kw = 644;
+		let htlcs = vec![
+			bolt_simple_taproot_htlc(true, 1_000_000, 500, 0),
+			bolt_simple_taproot_htlc(true, 2_000_000, 501, 1),
+			bolt_simple_taproot_htlc(false, 2_000_000, 502, 2),
+			bolt_simple_taproot_htlc(false, 3_000_000, 503, 3),
+			bolt_simple_taproot_htlc(true, 4_000_000, 504, 4),
+		];
+		let commitment_tx = builder.build(6_986_163, 3_000_000, htlcs);
+		let keys = commitment_tx.trust().keys();
+		let local_htlc_secret = derive_private_key(
+			&builder.secp_ctx,
+			&builder.per_commitment_point,
+			&vector_secret_key("786eb5024e4851bea3ddc6e40036c81b1efcf50eeed440eedefe5245bde6fc14"),
+		);
+		let remote_htlc_secret = derive_private_key(
+			&builder.secp_ctx,
+			&builder.per_commitment_point,
+			&vector_secret_key("51c9b6cf8279def85e3925bc8f16fc0ff100ee7b03ce7c954149ca29c834b684"),
+		);
+		let expected = [
+			(
+				"fc97f7cfb97e1e48792b0ed174704cd98c886d368ede5adeb6288f0b350c8f88d076488973d0656da72d072e03eb9eb8b31737850894bca0924d8fdd63ddea69",
+				"02000000000101ec4c0a34c981864f9badcb8383bbe42ec6b32e68c2aa1a7c7c2e8422adde673f02000000000100000001e803000000000000225120df20bcec43daa75161f7d013254e401812e0fee8bc3369220b6a33672fc18ba00541fc97f7cfb97e1e48792b0ed174704cd98c886d368ede5adeb6288f0b350c8f88d076488973d0656da72d072e03eb9eb8b31737850894bca0924d8fdd63ddea6983405bd66541625ba684bb6ff0def3c542bb88d5195a760cb616a5d09dec6823238ccdde18c99d4f3634394d9c23d0e198babc609f464d9b4552664ca5d3b985758f2000000000000000000000000000000000000000000000000000000000000000005f82012088a914b8bcb07f6344b42ab04250c86a6e8b75d3fdbbc6882071e82ef65d5c667159036bfcf662cac2f6c41e38323d148bbbd00fdcd923739ead202deba21cf03c42362c9f912094f62ba045a040a2060882ba1ed3abf1f664a47dac41c0d4c77088d346bce67c13bbbf82ca112588f4b1c9595a1f8af3be9b2f95a109a0e5e8fd071b9ade6367122afbd8acacc1a6727ddb6d478612af30827590027e0300000000",
+				0u8,
+			),
+			(
+				"c99d8d1ca721d1d4b9796cde49698fd46bb3faddd2bc7215de291ae9bd85cd9b2ab9bf40e36c752b698098b0986abe92b3cb21de8d6a388d9a6988d468e981e5",
+				"02000000000101ec4c0a34c981864f9badcb8383bbe42ec6b32e68c2aa1a7c7c2e8422adde673f03000000000100000001d007000000000000225120df20bcec43daa75161f7d013254e401812e0fee8bc3369220b6a33672fc18ba00541c99d8d1ca721d1d4b9796cde49698fd46bb3faddd2bc7215de291ae9bd85cd9b2ab9bf40e36c752b698098b0986abe92b3cb21de8d6a388d9a6988d468e981e583406a52ec691b47371892192e7222a76d978c18038b3f12479977366a09d2db91e66091332158d8f0b4e125394e1bf2d7ab40ab564c49e0686ffad56eadd6a1297e2001010101010101010101010101010101010101010101010101010101010101015f82012088a9144b6b2e5444c2639cc0fb7bcea5afba3f3cdce239882071e82ef65d5c667159036bfcf662cac2f6c41e38323d148bbbd00fdcd923739ead202deba21cf03c42362c9f912094f62ba045a040a2060882ba1ed3abf1f664a47dac41c0d4c77088d346bce67c13bbbf82ca112588f4b1c9595a1f8af3be9b2f95a109a0127d1790461eff920f14ba7cff2093c44b8a83e6f0a959fa60e04cf8c435cf4b00000000",
+				1u8,
+			),
+			(
+				"b361ed8b70a09f4128fe610db649abcaafbc9b8600136e6f1b9735b4781cd65681faa32c29fef2a1485cc569c655b31b8eb75ab593749dd7f7d788fdec489133",
+				"02000000000101ec4c0a34c981864f9badcb8383bbe42ec6b32e68c2aa1a7c7c2e8422adde673f04000000000100000001d007000000000000225120df20bcec43daa75161f7d013254e401812e0fee8bc3369220b6a33672fc18ba00441b361ed8b70a09f4128fe610db649abcaafbc9b8600136e6f1b9735b4781cd65681faa32c29fef2a1485cc569c655b31b8eb75ab593749dd7f7d788fdec48913383403e94dbe70a26fc19b0d0053dfbf3da4c3e75dacf4abe337866645ffe21834a152f2edf7e520f352f104eef17fefa5a1535d692012cc766d36bd54f658c5c797f442071e82ef65d5c667159036bfcf662cac2f6c41e38323d148bbbd00fdcd923739ead202deba21cf03c42362c9f912094f62ba045a040a2060882ba1ed3abf1f664a47dac41c1d4c77088d346bce67c13bbbf82ca112588f4b1c9595a1f8af3be9b2f95a109a040b30263c4d7cd1fa6544e8bc8cd9efe857d7b5fd691c958936c3a2e0df2232ef6010000",
+				2u8,
+			),
+			(
+				"9d1193d1bae8793ec502aa705a43a140e9f4c46607b4b8b414f76923c746a81cc320ffef6575f4c1ba55795770b41885dc90ed19025522805b1d0f5f5d440ebd",
+				"02000000000101ec4c0a34c981864f9badcb8383bbe42ec6b32e68c2aa1a7c7c2e8422adde673f05000000000100000001b80b000000000000225120df20bcec43daa75161f7d013254e401812e0fee8bc3369220b6a33672fc18ba004419d1193d1bae8793ec502aa705a43a140e9f4c46607b4b8b414f76923c746a81cc320ffef6575f4c1ba55795770b41885dc90ed19025522805b1d0f5f5d440ebd8340b149f17aab590815fbe4b19796dfc98aa857e81cdc1d15c82d64a2b626f40af8ae2a884197d74071e9b5648c7b5380db1084ac8ed2a8ed54ca9d589e6b5f7d8a442071e82ef65d5c667159036bfcf662cac2f6c41e38323d148bbbd00fdcd923739ead202deba21cf03c42362c9f912094f62ba045a040a2060882ba1ed3abf1f664a47dac41c0d4c77088d346bce67c13bbbf82ca112588f4b1c9595a1f8af3be9b2f95a109a064c44563d1bd58fa25c5c3ca7303c75849b6b3d91bf2e28f27068db4319b4c2ff7010000",
+				3u8,
+			),
+			(
+				"58338a2d50a03ea615f0e0e295b12413308e6381412c14d276c4b39a2f1d17193a689cbe2ad0d33a63344cff36daa2edc94aa566d743ad6526ddb5cdb5819ea0",
+				"02000000000101ec4c0a34c981864f9badcb8383bbe42ec6b32e68c2aa1a7c7c2e8422adde673f06000000000100000001a00f000000000000225120df20bcec43daa75161f7d013254e401812e0fee8bc3369220b6a33672fc18ba0054158338a2d50a03ea615f0e0e295b12413308e6381412c14d276c4b39a2f1d17193a689cbe2ad0d33a63344cff36daa2edc94aa566d743ad6526ddb5cdb5819ea08340efcfcda15da18a2791a80700b2716d2386ea67649a5e43a505dbe22bd110cc2352e558d62e7abd7afe7640d2ee414affd88555378bfe05aa28d0fa289e8d1b542004040404040404040404040404040404040404040404040404040404040404045f82012088a91418bc1a114ccf9c052d3d23e28d3b0a9d12274342882071e82ef65d5c667159036bfcf662cac2f6c41e38323d148bbbd00fdcd923739ead202deba21cf03c42362c9f912094f62ba045a040a2060882ba1ed3abf1f664a47dac41c1d4c77088d346bce67c13bbbf82ca112588f4b1c9595a1f8af3be9b2f95a109a06c3390c812b2596986592f02c7f22e4f857fb553805ff9ac1c2bda361c47c3fb00000000",
+				4u8,
+			),
+		];
+
+		for (htlc, (expected_remote_signature, expected_tx_hex, preimage_byte)) in
+			commitment_tx.nondust_htlcs().iter().zip(expected.iter())
+		{
+			let htlc_tx = build_htlc_transaction(
+				&commitment_tx.trust().txid(),
+				builder.feerate_per_kw,
+				builder.channel_parameters.holder_selected_contest_delay,
+				htlc,
+				&builder.channel_parameters.channel_type_features,
+				&keys.broadcaster_delayed_payment_key,
+				&keys.revocation_key,
+			);
+			let spend_info = simple_taproot_htlc_spend_info_with_aux_leaf_for_variant(
+				&builder.secp_ctx,
+				htlc.offered,
+				&htlc.payment_hash,
+				htlc.cltv_expiry,
+				&keys.broadcaster_htlc_key.to_public_key(),
+				&keys.countersignatory_htlc_key.to_public_key(),
+				&keys.revocation_key.to_public_key(),
+				None,
+				simple_taproot_htlc_script_variant(&builder.channel_parameters.channel_type_features),
+			)
+			.unwrap();
+			let preimage = [*preimage_byte; 32];
+			let (spend_path, leaf, preimage) = if htlc.offered {
+				(SimpleTaprootHtlcSpendPath::OfferedTimeout, &spend_info.timeout, None)
+			} else {
+				(SimpleTaprootHtlcSpendPath::AcceptedSuccess, &spend_info.success, Some(&preimage))
+			};
+			let signed_spend = simple_taproot_sign_htlc_spend(
+				&builder.secp_ctx,
+				&htlc_tx,
+				0,
+				htlc.to_bitcoin_amount(),
+				&spend_info,
+				leaf,
+				spend_path,
+				Some(&local_htlc_secret),
+				Some(&remote_htlc_secret),
+				preimage,
+				&[0; 32],
+			)
+			.unwrap();
+			assert_eq!(
+				signed_spend
+					.remote_signature
+					.as_ref()
+					.unwrap()
+					.signature
+					.serialize()
+					.as_hex()
+					.to_string(),
+				*expected_remote_signature
+			);
+			let mut signed_tx = htlc_tx;
+			signed_tx.input[0].witness = signed_spend.witness;
+			let previous_output = TxOut {
+				value: htlc.to_bitcoin_amount(),
+				script_pubkey: spend_info.script_pubkey,
+			};
+			let previous_outpoint = signed_tx.input[0].previous_output;
+			signed_tx
+				.verify(|outpoint| {
+					if *outpoint == previous_outpoint {
+						Some(previous_output.clone())
+					} else {
+						None
+					}
+				})
+				.unwrap();
+			assert_eq!(serialize(&signed_tx).as_hex().to_string(), *expected_tx_hex);
+		}
+	}
+
+	#[cfg(feature = "simple_taproot_musig2")]
+	#[test]
+	#[rustfmt::skip]
+	fn simple_taproot_vector_trimmed_htlc_commitment_tx_matches_bolt() {
+		let mut builder = simple_taproot_final_vector_builder();
+		builder.feerate_per_kw = 644;
+		let htlcs = vec![
+			bolt_simple_taproot_htlc(false, 3_000_000, 503, 3),
+			bolt_simple_taproot_htlc(true, 4_000_000, 504, 4),
+		];
+		let commitment_tx = builder.build(6_986_496, 3_000_000, htlcs);
+		let signed_tx = signed_bolt_vector_commitment_transaction(
+			&builder,
+			commitment_tx,
+			"22a453171ba4a634da1addcf660d63d8e23fb63169a2a7206f4e23290e4cc59bb3c3011fe3c31cb4f1192a2df56c2e52350ce0a82060fadf2404af9f81652c5f03b7203dec7c13896b6ff1f58b24f84458c441720a12b5a57426397e22f0a8c78b",
+			"025f2272ea289c5fe9d52d411f5a50a6d4882341bf0ecb201d5675850a2ba0b09d025bc489cf67752134ba81f8d7f1146d7455baf3190de75a6a661e2405212991a9",
+			"03fd9fa808377737b105f7df362ed513e3946f2bb49dfbca5c2ce2be138ff0607502e4c73701eae82afa7a01993f62321648a6235ef0c958e35766a9e53e4eaf9d34",
+			"3e454598e0661188da0e4cf1b806b13c627adb7ab38bab27418cc976769771c3",
+		);
+		assert_eq!(
+			serialize(&signed_tx).as_hex().to_string(),
+			"020000000001015474cba49124ab0c4327c244bb2907059585c4af3fa5f3469701534120fec0170000000000c5fe1780064a010000000000002251201249c50576fdf914caa14f9221370b986df520bdbc73f57d5056a86ee03e5ac44a01000000000000225120f67ab012701705f3203d132f909a6810ef18c5da4c11d986cb50818803b8344eb80b0000000000002251208fe2e1306e414e896dfd879475b5c1a6a01d4e79b32c0544aa185ccb73c392aaa00f000000000000225120d93389ba5cdde8570d3ba73487ff7fc9f8c3816645009e42110fe5239f5a3e62c0c62d00000000002251203609bb705034e5629aa6ec05c5ca906ac89ac08b34c4583c259521ec30174408009b6a00000000002251203e1fcbbd06c8a7414704612c72be9834a75d86ed85b29f0ef0c52e1950afaff30140dfd9604ad0b4fed040382f4829e20a0ef4b5558d0189178a5e9c26a8b4bd8547fd563ee60884daf91c8a1ae71e08b452a93ad3bdf5c572f642d42606736dc5f755dc1920",
+		);
 	}
 
 	#[cfg(feature = "simple_taproot_musig2")]
