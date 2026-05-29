@@ -89,9 +89,10 @@ use crate::ln::simple_taproot::{
 	SIMPLE_TAPROOT_COUNTERPARTY_COMMITMENT_NONCE_PREIMAGE,
 };
 use crate::ln::simple_taproot::{
-	Musig2PublicNonce, SimpleTaprootCloseeNonceState, SimpleTaprootNextLocalNonces,
-	SimpleTaprootNonceEntries, SimpleTaprootNonceEntry, SimpleTaprootNonceState,
-	SimpleTaprootPartialSignatureWithNonce, SimpleTaprootSentClosingComplete,
+	Musig2PublicNonce, SimpleTaprootCloseeNonceState, SimpleTaprootCoopCloseTxids,
+	SimpleTaprootNextLocalNonces, SimpleTaprootNonceEntries, SimpleTaprootNonceEntry,
+	SimpleTaprootNonceState, SimpleTaprootPartialSignatureWithNonce,
+	SimpleTaprootReceivedClosingNonces, SimpleTaprootSentClosingComplete,
 	SimpleTaprootSentCommitmentSignatures,
 };
 #[cfg(simple_close)]
@@ -3913,6 +3914,13 @@ pub(super) struct ChannelContext<SP: SignerProvider> {
 	simple_taproot_counterparty_closee_nonce: Option<SimpleTaprootCloseeNonceState>,
 	/// Sent `closing_complete` partial retained for returned `closing_sig` validation.
 	simple_taproot_sent_closing_complete: Option<SimpleTaprootSentClosingComplete>,
+	/// Signed cooperative-close transactions that may confirm while close/RBF negotiation remains
+	/// available.
+	simple_taproot_signed_coop_close_txids: SimpleTaprootCoopCloseTxids,
+	/// Peer closer nonces consumed from inbound `closing_complete` messages.
+	simple_taproot_received_closing_nonces: SimpleTaprootReceivedClosingNonces,
+	/// User requested a new local RBF close proposal after a signed close transaction.
+	simple_taproot_close_rbf_requested: bool,
 	/// Current owner of the full Taproot Asset balance for dynamic non-HTLC aux leaves.
 	simple_taproot_asset_balance_holder: Option<bool>,
 
@@ -4716,6 +4724,9 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 			simple_taproot_local_closee_nonce_index: 0,
 			simple_taproot_counterparty_closee_nonce: None,
 			simple_taproot_sent_closing_complete: None,
+			simple_taproot_signed_coop_close_txids: SimpleTaprootCoopCloseTxids::default(),
+			simple_taproot_received_closing_nonces: SimpleTaprootReceivedClosingNonces::default(),
+			simple_taproot_close_rbf_requested: false,
 			simple_taproot_asset_balance_holder: None,
 			sent_message_awaiting_response: None,
 
@@ -5045,6 +5056,9 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 			simple_taproot_local_closee_nonce_index: 0,
 			simple_taproot_counterparty_closee_nonce: None,
 			simple_taproot_sent_closing_complete: None,
+			simple_taproot_signed_coop_close_txids: SimpleTaprootCoopCloseTxids::default(),
+			simple_taproot_received_closing_nonces: SimpleTaprootReceivedClosingNonces::default(),
+			simple_taproot_close_rbf_requested: false,
 			simple_taproot_asset_balance_holder: None,
 			sent_message_awaiting_response: None,
 
@@ -13235,7 +13249,9 @@ where
 		// some force-closure by old nodes, but we wanted to close the channel anyway.
 
 		if let Some(target_feerate) = self.context.target_closing_feerate_sats_per_kw {
-			let min_feerate = if self.funding.is_outbound() {
+			let min_feerate = if self.funding.is_outbound()
+				|| ChannelContext::<SP>::is_simple_taproot_funding(&self.funding)
+			{
 				target_feerate
 			} else {
 				cmp::min(self.context.feerate_per_kw, target_feerate)
@@ -13286,6 +13302,15 @@ where
 	/// an Err if no progress is being made and the channel should be force-closed instead.
 	/// Should be called on a one-minute timer.
 	pub fn timer_check_closing_negotiation_progress(&mut self) -> Result<(), ChannelError> {
+		#[cfg(all(simple_close, feature = "simple_taproot_musig2"))]
+		if ChannelContext::<SP>::is_simple_taproot_funding(&self.funding)
+			&& !self.context.simple_taproot_signed_coop_close_txids.is_empty()
+			&& self.context.simple_taproot_sent_closing_complete.is_none()
+			&& !self.context.simple_taproot_close_rbf_requested
+		{
+			self.context.closing_signed_in_flight = false;
+			return Ok(());
+		}
 		if self.closing_negotiation_ready() {
 			if self.context.closing_signed_in_flight {
 				return Err(ChannelError::close(
@@ -13310,8 +13335,12 @@ where
 		{
 			return Ok(None);
 		}
+		let initial_close = self.context.simple_taproot_signed_coop_close_txids.is_empty();
+		if !initial_close && !self.context.simple_taproot_close_rbf_requested {
+			return Ok(None);
+		}
 
-		if !self.funding.is_outbound() || self.context.expecting_peer_commitment_signed {
+		if !self.initiated_shutdown() || self.context.expecting_peer_commitment_signed {
 			return Ok(None);
 		}
 
@@ -13327,13 +13356,52 @@ where
 			&closing_tx,
 			SimpleTaprootClosingRole::LocalCloser,
 		)?;
-		self.get_simple_taproot_closing_complete_msg(
+		let msg = self.get_simple_taproot_closing_complete_msg(
 			&closing_tx,
 			total_fee_satoshis,
 			output_set,
 			entropy_source,
-		)
-		.map(Some)
+		)?;
+		self.context.simple_taproot_close_rbf_requested = false;
+		Ok(Some(msg))
+	}
+
+	#[cfg(all(simple_close, feature = "simple_taproot_musig2"))]
+	pub fn request_simple_taproot_close_rbf(
+		&mut self, target_feerate_sats_per_kw: Option<u32>,
+	) -> Result<(), APIError> {
+		if !ChannelContext::<SP>::is_simple_taproot_funding(&self.funding) {
+			return Err(APIError::APIMisuseError {
+				err: "simple-taproot close RBF is only available for simple-taproot channels"
+					.to_owned(),
+			});
+		}
+		if !self.context.channel_state.is_both_sides_shutdown() {
+			return Err(APIError::ChannelUnavailable {
+				err: "Cannot RBF simple-taproot close before both shutdown messages".to_owned(),
+			});
+		}
+		if self.context.channel_state.is_peer_disconnected() {
+			return Err(APIError::ChannelUnavailable {
+				err: "Cannot RBF simple-taproot close while peer is disconnected".to_owned(),
+			});
+		}
+		if self.context.simple_taproot_signed_coop_close_txids.is_empty() {
+			return Err(APIError::ChannelUnavailable {
+				err: "Cannot RBF simple-taproot close before a close transaction is signed"
+					.to_owned(),
+			});
+		}
+		if self.context.simple_taproot_sent_closing_complete.is_some() {
+			return Err(APIError::APIMisuseError {
+				err: "Cannot RBF simple-taproot close while awaiting closing_sig".to_owned(),
+			});
+		}
+		self.context.target_closing_feerate_sats_per_kw = target_feerate_sats_per_kw;
+		self.context.closing_fee_limits = None;
+		self.context.simple_taproot_close_rbf_requested = true;
+		self.context.update_time_counter += 1;
+		Ok(())
 	}
 
 	pub fn maybe_propose_closing_signed<F: FeeEstimator, L: Logger>(
@@ -14009,7 +14077,7 @@ where
 	#[cfg(all(simple_close, feature = "simple_taproot_musig2"))]
 	pub fn closing_complete<F: FeeEstimator>(
 		&mut self, fee_estimator: &LowerBoundedFeeEstimator<F>, msg: &msgs::ClosingComplete,
-	) -> Result<(Option<msgs::ClosingSig>, Option<(Transaction, ShutdownResult)>), ChannelError> {
+	) -> Result<(Option<msgs::ClosingSig>, Option<Transaction>), ChannelError> {
 		if !ChannelContext::<SP>::is_simple_taproot_funding(&self.funding) {
 			return Err(ChannelError::close(
 				"closing_complete is only supported for simple-taproot channels".to_owned(),
@@ -14102,6 +14170,15 @@ where
 			[counterparty_partial_with_nonce.public_nonce, local_nonce_pair.public_nonce];
 		let message =
 			ChannelContext::<SP>::simple_taproot_closing_sighash(&self.funding, &closing_tx)?;
+		let funding_txid = ChannelContext::<SP>::simple_taproot_funding_txid(&self.funding)?;
+		self.context
+			.simple_taproot_received_closing_nonces
+			.note(funding_txid, counterparty_partial_with_nonce.public_nonce, message)
+			.map_err(|_| {
+				ChannelError::close(
+					"Peer reused simple-taproot closing_complete closer nonce".to_owned(),
+				)
+			})?;
 		let key_agg_ctx = self
 			.context
 			.holder_signer
@@ -14174,8 +14251,8 @@ where
 		)?;
 		let tx =
 			self.build_signed_simple_taproot_closing_transaction(&closing_tx, &final_signature);
-		let shutdown_result = self.shutdown_result_coop_close();
-		self.context.channel_state = ChannelState::ShutdownComplete;
+		self.context.simple_taproot_signed_coop_close_txids.push(tx.compute_txid());
+		self.context.closing_signed_in_flight = false;
 		self.context.update_time_counter += 1;
 
 		let closing_sig = msgs::ClosingSig {
@@ -14198,13 +14275,13 @@ where
 				.then_some(local_partial_with_nonce.partial_signature),
 			simple_taproot_next_closee_nonce: Some(next_closee_nonce),
 		};
-		Ok((Some(closing_sig), Some((tx, shutdown_result))))
+		Ok((Some(closing_sig), Some(tx)))
 	}
 
 	#[cfg(all(simple_close, feature = "simple_taproot_musig2"))]
 	pub fn closing_sig(
 		&mut self, msg: &msgs::ClosingSig,
-	) -> Result<Option<(Transaction, ShutdownResult)>, ChannelError> {
+	) -> Result<Option<Transaction>, ChannelError> {
 		if !ChannelContext::<SP>::is_simple_taproot_funding(&self.funding) {
 			return Err(ChannelError::close(
 				"closing_sig is only supported for simple-taproot channels".to_owned(),
@@ -14328,6 +14405,7 @@ where
 				nonce_index: counterparty_closee_nonce.nonce_index + 1,
 				public_nonce: next_closee_nonce,
 			});
+		self.context.simple_taproot_sent_closing_complete = None;
 
 		let final_signature = self.aggregate_simple_taproot_closing_signature(
 			&closing_tx,
@@ -14339,10 +14417,10 @@ where
 		)?;
 		let tx =
 			self.build_signed_simple_taproot_closing_transaction(&closing_tx, &final_signature);
-		let shutdown_result = self.shutdown_result_coop_close();
-		self.context.channel_state = ChannelState::ShutdownComplete;
+		self.context.simple_taproot_signed_coop_close_txids.push(tx.compute_txid());
+		self.context.closing_signed_in_flight = false;
 		self.context.update_time_counter += 1;
-		Ok(Some((tx, shutdown_result)))
+		Ok(Some(tx))
 	}
 
 	#[rustfmt::skip]
@@ -14813,6 +14891,16 @@ where
 	) -> Result<(Option<FundingConfirmedMessage>, Option<msgs::AnnouncementSignatures>), ClosureReason> {
 		for &(index_in_block, tx) in txdata.iter() {
 			let mut confirmed_tx = ConfirmedTransaction::from(tx);
+
+			#[cfg(all(simple_close, feature = "simple_taproot_musig2"))]
+			if self.context.simple_taproot_signed_coop_close_txids.contains(&confirmed_tx.txid()) {
+				self.context.channel_state = ChannelState::ShutdownComplete;
+				self.context.update_time_counter += 1;
+				return Ok((
+					Some(FundingConfirmedMessage::CooperativeClose(self.shutdown_result_coop_close())),
+					None,
+				));
+			}
 
 			// If we allow 1-conf funding, we may need to check for channel_ready or splice_locked here
 			// and send it immediately instead of waiting for a best_block_updated call (which may have
@@ -19440,6 +19528,14 @@ impl<SP: SignerProvider> Writeable for FundedChannel<SP> {
 		let simple_taproot_local_closee_nonce_index =
 			(self.context.simple_taproot_local_closee_nonce_index != 0)
 				.then_some(self.context.simple_taproot_local_closee_nonce_index);
+		let simple_taproot_signed_coop_close_txids =
+			(!self.context.simple_taproot_signed_coop_close_txids.is_empty())
+				.then_some(&self.context.simple_taproot_signed_coop_close_txids);
+		let simple_taproot_received_closing_nonces =
+			(!self.context.simple_taproot_received_closing_nonces.is_empty())
+				.then_some(&self.context.simple_taproot_received_closing_nonces);
+		let simple_taproot_close_rbf_requested =
+			self.context.simple_taproot_close_rbf_requested.then_some(());
 		let simple_taproot_asset_balance_holder = self.context.simple_taproot_asset_balance_holder;
 
 		write_tlv_fields!(writer, {
@@ -19512,6 +19608,9 @@ impl<SP: SignerProvider> Writeable for FundedChannel<SP> {
 			(97, pending_outbound_taproot_asset_htlc_blobs, optional_vec),
 			(99, holding_cell_taproot_asset_htlc_blobs, optional_vec),
 			(101, simple_taproot_asset_balance_holder, option),
+			(103, simple_taproot_signed_coop_close_txids, option),
+			(105, simple_taproot_received_closing_nonces, option),
+			(107, simple_taproot_close_rbf_requested, option),
 		});
 
 		Ok(())
@@ -19919,6 +20018,10 @@ impl<'a, 'b, 'c, ES: EntropySource, SP: SignerProvider>
 			None;
 		let mut simple_taproot_sent_closing_complete: Option<SimpleTaprootSentClosingComplete> =
 			None;
+		let mut simple_taproot_signed_coop_close_txids: Option<SimpleTaprootCoopCloseTxids> = None;
+		let mut simple_taproot_received_closing_nonces: Option<SimpleTaprootReceivedClosingNonces> =
+			None;
+		let mut simple_taproot_close_rbf_requested: Option<()> = None;
 		let mut simple_taproot_asset_balance_holder: Option<bool> = None;
 
 		read_tlv_fields!(reader, {
@@ -19985,6 +20088,9 @@ impl<'a, 'b, 'c, ES: EntropySource, SP: SignerProvider>
 			(97, pending_outbound_taproot_asset_htlc_blobs_opt, optional_vec),
 			(99, holding_cell_taproot_asset_htlc_blobs_opt, optional_vec),
 			(101, simple_taproot_asset_balance_holder, option),
+			(103, simple_taproot_signed_coop_close_txids, option),
+			(105, simple_taproot_received_closing_nonces, option),
+			(107, simple_taproot_close_rbf_requested, option),
 		});
 
 		let holder_signer = signer_provider.derive_channel_signer(channel_keys_id);
@@ -20459,6 +20565,11 @@ impl<'a, 'b, 'c, ES: EntropySource, SP: SignerProvider>
 					.unwrap_or(0),
 				simple_taproot_counterparty_closee_nonce,
 				simple_taproot_sent_closing_complete,
+				simple_taproot_signed_coop_close_txids: simple_taproot_signed_coop_close_txids
+					.unwrap_or_default(),
+				simple_taproot_received_closing_nonces: simple_taproot_received_closing_nonces
+					.unwrap_or_default(),
+				simple_taproot_close_rbf_requested: simple_taproot_close_rbf_requested.is_some(),
 				simple_taproot_asset_balance_holder,
 				sent_message_awaiting_response: None,
 

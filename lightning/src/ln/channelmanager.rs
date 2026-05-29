@@ -4301,6 +4301,41 @@ impl<
 					}
 
 					if let Some(chan) = chan_entry.get_mut().as_funded_mut() {
+						#[cfg(all(simple_close, feature = "simple_taproot_musig2"))]
+						if chan.is_simple_taproot_channel() && chan.sent_shutdown() {
+							if override_shutdown_script.is_some() {
+								return Err(APIError::APIMisuseError {
+									err: "Cannot override shutdown script while RBFing simple-taproot close"
+										.to_owned(),
+								});
+							}
+							chan.request_simple_taproot_close_rbf(
+								target_feerate_sats_per_1000_weight,
+							)?;
+							match chan.maybe_propose_simple_taproot_closing_complete(
+								&self.fee_estimator,
+								&self.entropy_source,
+							) {
+								Ok(Some(msg)) => {
+									peer_state.pending_msg_events.push(
+										MessageSendEvent::SendClosingComplete {
+											node_id: *counterparty_node_id,
+											msg,
+										},
+									);
+								},
+								Ok(None) => {},
+								Err(err) => {
+									return Err(APIError::ChannelUnavailable {
+										err: format!(
+											"Failed to build simple-taproot close RBF proposal: {:?}",
+											err
+										),
+									})
+								},
+							}
+							return Ok(());
+						}
 						let funding_txo_opt = chan.funding.get_funding_txo();
 						let their_features = &peer_state.latest_features;
 						let (shutdown_msg, mut monitor_update_opt, htlcs, splice_funding_failed) =
@@ -12859,7 +12894,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 				)
 			})?;
 			let logger;
-			let tx_err: Option<(_, Result<Infallible, _>)> = {
+			let signed_close_tx_to_broadcast = {
 				let mut peer_state_lock = peer_state_mutex.lock().unwrap();
 				let peer_state = &mut *peer_state_lock;
 				match peer_state.channel_by_id.entry(msg.channel_id.clone()) {
@@ -12867,9 +12902,8 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 						if let Some(chan) = chan_entry.get_mut().as_funded_mut() {
 							logger = WithChannelContext::from(&self.logger, &chan.context, None);
 							let res = chan.closing_complete(&self.fee_estimator, &msg);
-							let (closing_sig, tx_shutdown_result) =
+							let (closing_sig, signed_close_tx) =
 								try_channel_entry!(self, peer_state, res, chan_entry);
-							debug_assert_eq!(tx_shutdown_result.is_some(), chan.is_shutdown());
 							if let Some(msg) = closing_sig {
 								peer_state.pending_msg_events.push(
 									MessageSendEvent::SendClosingSig {
@@ -12878,18 +12912,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 									},
 								);
 							}
-							if let Some((tx, close_res)) = tx_shutdown_result {
-								let err = self.locked_handle_funded_coop_close(
-									&mut peer_state.closed_channel_monitor_update_ids,
-									&mut peer_state.in_flight_monitor_updates,
-									close_res,
-									chan,
-								);
-								chan_entry.remove();
-								Some((tx, Err(err)))
-							} else {
-								None
-							}
+							signed_close_tx
 						} else {
 							return try_channel_entry!(
 								self,
@@ -12911,7 +12934,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 				}
 			};
 			mem::drop(per_peer_state);
-			if let Some((broadcast_tx, err)) = tx_err {
+			if let Some(broadcast_tx) = signed_close_tx_to_broadcast {
 				log_info!(logger, "Broadcasting {}", log_tx!(broadcast_tx));
 				self.tx_broadcaster.broadcast_transactions(&[(
 					&broadcast_tx,
@@ -12920,7 +12943,6 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 						channel_id: msg.channel_id,
 					},
 				)]);
-				let _ = self.handle_error(err, counterparty_node_id);
 			}
 			Ok(())
 		}
@@ -12950,7 +12972,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 				)
 			})?;
 			let logger;
-			let tx_err: Option<(_, Result<Infallible, _>)> = {
+			let signed_close_tx_to_broadcast = {
 				let mut peer_state_lock = peer_state_mutex.lock().unwrap();
 				let peer_state = &mut *peer_state_lock;
 				match peer_state.channel_by_id.entry(msg.channel_id.clone()) {
@@ -12958,21 +12980,9 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 						if let Some(chan) = chan_entry.get_mut().as_funded_mut() {
 							logger = WithChannelContext::from(&self.logger, &chan.context, None);
 							let res = chan.closing_sig(&msg);
-							let tx_shutdown_result =
+							let signed_close_tx =
 								try_channel_entry!(self, peer_state, res, chan_entry);
-							debug_assert_eq!(tx_shutdown_result.is_some(), chan.is_shutdown());
-							if let Some((tx, close_res)) = tx_shutdown_result {
-								let err = self.locked_handle_funded_coop_close(
-									&mut peer_state.closed_channel_monitor_update_ids,
-									&mut peer_state.in_flight_monitor_updates,
-									close_res,
-									chan,
-								);
-								chan_entry.remove();
-								Some((tx, Err(err)))
-							} else {
-								None
-							}
+							signed_close_tx
 						} else {
 							return try_channel_entry!(
 								self,
@@ -12993,7 +13003,7 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 				}
 			};
 			mem::drop(per_peer_state);
-			if let Some((broadcast_tx, err)) = tx_err {
+			if let Some(broadcast_tx) = signed_close_tx_to_broadcast {
 				log_info!(logger, "Broadcasting {}", log_tx!(broadcast_tx));
 				self.tx_broadcaster.broadcast_transactions(&[(
 					&broadcast_tx,
@@ -13002,7 +13012,6 @@ This indicates a bug inside LDK. Please report this error at https://github.com/
 						channel_id: msg.channel_id,
 					},
 				)]);
-				let _ = self.handle_error(err, counterparty_node_id);
 			}
 			Ok(())
 		}
@@ -16709,6 +16718,7 @@ impl<
 pub(super) enum FundingConfirmedMessage {
 	Establishment(msgs::ChannelReady),
 	Splice(msgs::SpliceLocked, Option<OutPoint>, Option<ChannelMonitorUpdate>, Vec<FundingInfo>),
+	CooperativeClose(ShutdownResult),
 }
 
 impl<
@@ -16827,6 +16837,16 @@ impl<
 												msg: splice_locked,
 											});
 										}
+									},
+									Some(FundingConfirmedMessage::CooperativeClose(shutdown_result)) => {
+										let err = self.locked_handle_funded_coop_close(
+											&mut peer_state.closed_channel_monitor_update_ids,
+											&mut peer_state.in_flight_monitor_updates,
+											shutdown_result,
+											funded_channel,
+										);
+										failed_channels.push((Err(err), *counterparty_node_id));
+										return false;
 									},
 									None => {},
 								}

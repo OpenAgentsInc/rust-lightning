@@ -27,6 +27,7 @@ use crate::sign::{EntropySource, SignerProvider};
 use crate::types::string::UntrustedString;
 use crate::util::config::UserConfig;
 use crate::util::errors::APIError;
+use crate::util::ser::Writeable;
 use crate::util::test_utils;
 use crate::util::test_utils::OnGetShutdownScriptpubkey;
 
@@ -35,10 +36,76 @@ use bitcoin::locktime::absolute::LockTime;
 use bitcoin::network::Network;
 use bitcoin::opcodes;
 use bitcoin::script::Builder;
+use bitcoin::secp256k1::PublicKey;
 use bitcoin::transaction::Version;
 use bitcoin::{Transaction, TxOut, WitnessProgram, WitnessVersion};
 
 use crate::ln::functional_test_utils::*;
+
+#[cfg(all(simple_close, feature = "simple_taproot_musig2"))]
+fn simple_taproot_closing_complete_partial(
+	msg: &msgs::ClosingComplete,
+) -> crate::ln::simple_taproot::SimpleTaprootPartialSignatureWithNonce {
+	msg.simple_taproot_closer_output_only
+		.or(msg.simple_taproot_closee_output_only)
+		.or(msg.simple_taproot_closer_and_closee_outputs)
+		.expect("simple-taproot closing_complete partial")
+}
+
+#[cfg(all(simple_close, feature = "simple_taproot_musig2"))]
+fn closing_tx_fee_sats(funding_tx: &Transaction, closing_tx: &Transaction) -> u64 {
+	let prevout = closing_tx.input[0].previous_output;
+	assert_eq!(prevout.txid, funding_tx.compute_txid());
+	let input_value = funding_tx.output[prevout.vout as usize].value.to_sat();
+	let output_value = closing_tx.output.iter().map(|output| output.value.to_sat()).sum::<u64>();
+	input_value - output_value
+}
+
+#[cfg(all(simple_close, feature = "simple_taproot_musig2"))]
+fn replace_simple_taproot_closing_complete_nonce(
+	msg: &mut msgs::ClosingComplete, public_nonce: crate::ln::simple_taproot::Musig2PublicNonce,
+) {
+	if let Some(partial) = msg.simple_taproot_closer_output_only.as_mut() {
+		partial.public_nonce = public_nonce;
+	}
+	if let Some(partial) = msg.simple_taproot_closee_output_only.as_mut() {
+		partial.public_nonce = public_nonce;
+	}
+	if let Some(partial) = msg.simple_taproot_closer_and_closee_outputs.as_mut() {
+		partial.public_nonce = public_nonce;
+	}
+}
+
+#[cfg(all(simple_close, feature = "simple_taproot_musig2"))]
+fn assert_simple_taproot_processing_error(
+	node: &Node, counterparty_node_id: PublicKey, err: &str, channel_capacity_sats: u64,
+) {
+	let msg_events = node.node.get_and_clear_pending_msg_events();
+	assert!(
+		msg_events.iter().any(|event| match event {
+			MessageSendEvent::HandleError {
+				node_id,
+				action: ErrorAction::SendErrorMessage { msg },
+			} => *node_id == counterparty_node_id && msg.data == err,
+			MessageSendEvent::HandleError {
+				node_id,
+				action: ErrorAction::DisconnectPeer { msg: Some(msg) },
+			} => *node_id == counterparty_node_id && msg.data == err,
+			_ => false,
+		}),
+		"missing expected error `{}` in {:?}",
+		err,
+		msg_events
+	);
+	check_added_monitors(node, 1);
+	check_closed_event(
+		node,
+		1,
+		ClosureReason::ProcessingError { err: err.to_string() },
+		&[counterparty_node_id],
+		channel_capacity_sats,
+	);
+}
 
 #[cfg(all(simple_close, feature = "simple_taproot_musig2"))]
 #[test]
@@ -87,6 +154,9 @@ fn simple_taproot_cooperative_close_uses_closing_complete_and_sig() {
 	assert_eq!(node_0_tx.input[0].witness.len(), 1);
 	assert_eq!(node_0_tx.input[0].witness[0].len(), 64);
 
+	mine_transaction(&nodes[0], &node_0_tx);
+	mine_transaction(&nodes[1], &node_0_tx);
+
 	check_closed_event(
 		&nodes[0],
 		1,
@@ -101,6 +171,327 @@ fn simple_taproot_cooperative_close_uses_closing_complete_and_sig() {
 		&[node_a_id],
 		1_000_000,
 	);
+}
+
+#[cfg(all(simple_close, feature = "simple_taproot_musig2"))]
+fn do_simple_taproot_cooperative_close_rbf_nonce_rotation(closer_idx: usize) {
+	let closee_idx = 1 - closer_idx;
+	let mut simple_taproot_config = UserConfig::default();
+	simple_taproot_config.channel_handshake_config.negotiate_simple_taproot_channels = true;
+
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(
+		2,
+		&node_cfgs,
+		&[Some(simple_taproot_config.clone()), Some(simple_taproot_config)],
+	);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let closer_id = nodes[closer_idx].node.get_our_node_id();
+	let closee_id = nodes[closee_idx].node.get_our_node_id();
+	let (_, funding_tx) =
+		create_unannounced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 100_000_000);
+	let chan_id = nodes[closer_idx].node.list_channels()[0].channel_id;
+
+	nodes[closer_idx].node.close_channel(&chan_id, &closee_id).unwrap();
+	let closer_shutdown =
+		get_event_msg!(nodes[closer_idx], MessageSendEvent::SendShutdown, closee_id);
+	nodes[closee_idx].node.handle_shutdown(closer_id, &closer_shutdown);
+	let closee_shutdown =
+		get_event_msg!(nodes[closee_idx], MessageSendEvent::SendShutdown, closer_id);
+	nodes[closer_idx].node.handle_shutdown(closee_id, &closee_shutdown);
+
+	let first_closing_complete =
+		get_event_msg!(nodes[closer_idx], MessageSendEvent::SendClosingComplete, closee_id);
+	let first_closer_partial = simple_taproot_closing_complete_partial(&first_closing_complete);
+	nodes[closee_idx].node.handle_closing_complete(closer_id, first_closing_complete);
+	let first_closing_sig =
+		get_event_msg!(nodes[closee_idx], MessageSendEvent::SendClosingSig, closer_id);
+	let first_next_closee_nonce = first_closing_sig.simple_taproot_next_closee_nonce.unwrap();
+	let first_closee_tx =
+		nodes[closee_idx].tx_broadcaster.txn_broadcasted.lock().unwrap().remove(0);
+	nodes[closer_idx].node.handle_closing_sig(closee_id, first_closing_sig);
+	let first_closer_tx =
+		nodes[closer_idx].tx_broadcaster.txn_broadcasted.lock().unwrap().remove(0);
+	assert_eq!(first_closer_tx, first_closee_tx);
+
+	nodes[closer_idx]
+		.node
+		.close_channel_with_feerate_and_script(&chan_id, &closee_id, Some(1_000), None)
+		.unwrap();
+	let second_closing_complete =
+		get_event_msg!(nodes[closer_idx], MessageSendEvent::SendClosingComplete, closee_id);
+	let second_closer_partial = simple_taproot_closing_complete_partial(&second_closing_complete);
+	assert_ne!(first_closer_partial.public_nonce, second_closer_partial.public_nonce);
+
+	nodes[closee_idx].node.handle_closing_complete(closer_id, second_closing_complete);
+	let second_closing_sig =
+		get_event_msg!(nodes[closee_idx], MessageSendEvent::SendClosingSig, closer_id);
+	assert_ne!(
+		first_next_closee_nonce,
+		second_closing_sig.simple_taproot_next_closee_nonce.unwrap()
+	);
+	let second_closee_tx =
+		nodes[closee_idx].tx_broadcaster.txn_broadcasted.lock().unwrap().remove(0);
+	nodes[closer_idx].node.handle_closing_sig(closee_id, second_closing_sig);
+	let second_closer_tx =
+		nodes[closer_idx].tx_broadcaster.txn_broadcasted.lock().unwrap().remove(0);
+	assert_eq!(second_closer_tx, second_closee_tx);
+	assert_ne!(first_closer_tx.compute_txid(), second_closer_tx.compute_txid());
+	assert!(
+		closing_tx_fee_sats(&funding_tx, &second_closer_tx)
+			> closing_tx_fee_sats(&funding_tx, &first_closer_tx)
+	);
+	assert_eq!(second_closer_tx.input.len(), 1);
+	assert_eq!(second_closer_tx.input[0].witness.len(), 1);
+	assert_eq!(second_closer_tx.input[0].witness[0].len(), 64);
+
+	mine_transaction(&nodes[closer_idx], &second_closer_tx);
+	mine_transaction(&nodes[closee_idx], &second_closer_tx);
+	check_closed_event(
+		&nodes[closer_idx],
+		1,
+		ClosureReason::LocallyInitiatedCooperativeClosure,
+		&[closee_id],
+		1_000_000,
+	);
+	check_closed_event(
+		&nodes[closee_idx],
+		1,
+		ClosureReason::CounterpartyInitiatedCooperativeClosure,
+		&[closer_id],
+		1_000_000,
+	);
+}
+
+#[cfg(all(simple_close, feature = "simple_taproot_musig2"))]
+#[test]
+fn simple_taproot_cooperative_close_rbf_rotates_nonces_for_opener() {
+	do_simple_taproot_cooperative_close_rbf_nonce_rotation(0);
+}
+
+#[cfg(all(simple_close, feature = "simple_taproot_musig2"))]
+#[test]
+fn simple_taproot_cooperative_close_rbf_rotates_nonces_for_accepter() {
+	do_simple_taproot_cooperative_close_rbf_nonce_rotation(1);
+}
+
+#[cfg(all(simple_close, feature = "simple_taproot_musig2"))]
+#[test]
+fn simple_taproot_cooperative_close_requires_shutdown_nonce() {
+	let mut simple_taproot_config = UserConfig::default();
+	simple_taproot_config.channel_handshake_config.negotiate_simple_taproot_channels = true;
+
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(
+		2,
+		&node_cfgs,
+		&[Some(simple_taproot_config.clone()), Some(simple_taproot_config)],
+	);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node.get_our_node_id();
+	create_unannounced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 100_000_000);
+	let chan_id = nodes[0].node.list_channels()[0].channel_id;
+
+	nodes[0].node.close_channel(&chan_id, &node_b_id).unwrap();
+	let mut node_0_shutdown = get_event_msg!(nodes[0], MessageSendEvent::SendShutdown, node_b_id);
+	node_0_shutdown.simple_taproot_shutdown_nonce = None;
+	nodes[1].node.handle_shutdown(node_a_id, &node_0_shutdown);
+	assert_simple_taproot_processing_error(
+		&nodes[1],
+		node_a_id,
+		"Peer omitted simple-taproot shutdown closee nonce",
+		1_000_000,
+	);
+}
+
+#[cfg(all(simple_close, feature = "simple_taproot_musig2"))]
+#[test]
+fn simple_taproot_cooperative_close_rejects_missing_close_partials() {
+	let mut simple_taproot_config = UserConfig::default();
+	simple_taproot_config.channel_handshake_config.negotiate_simple_taproot_channels = true;
+
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(
+		2,
+		&node_cfgs,
+		&[Some(simple_taproot_config.clone()), Some(simple_taproot_config)],
+	);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node.get_our_node_id();
+	create_unannounced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 100_000_000);
+	let chan_id = nodes[0].node.list_channels()[0].channel_id;
+
+	nodes[0].node.close_channel(&chan_id, &node_b_id).unwrap();
+	let node_0_shutdown = get_event_msg!(nodes[0], MessageSendEvent::SendShutdown, node_b_id);
+	nodes[1].node.handle_shutdown(node_a_id, &node_0_shutdown);
+	let node_1_shutdown = get_event_msg!(nodes[1], MessageSendEvent::SendShutdown, node_a_id);
+	nodes[0].node.handle_shutdown(node_b_id, &node_1_shutdown);
+
+	let mut node_0_closing_complete =
+		get_event_msg!(nodes[0], MessageSendEvent::SendClosingComplete, node_b_id);
+	node_0_closing_complete.simple_taproot_closer_output_only = None;
+	node_0_closing_complete.simple_taproot_closee_output_only = None;
+	node_0_closing_complete.simple_taproot_closer_and_closee_outputs = None;
+	nodes[1].node.handle_closing_complete(node_a_id, node_0_closing_complete);
+	assert_simple_taproot_processing_error(
+		&nodes[1],
+		node_a_id,
+		"Peer omitted simple-taproot closing_complete signature",
+		1_000_000,
+	);
+}
+
+#[cfg(all(simple_close, feature = "simple_taproot_musig2"))]
+#[test]
+fn simple_taproot_cooperative_close_rejects_missing_next_closee_nonce() {
+	let mut simple_taproot_config = UserConfig::default();
+	simple_taproot_config.channel_handshake_config.negotiate_simple_taproot_channels = true;
+
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(
+		2,
+		&node_cfgs,
+		&[Some(simple_taproot_config.clone()), Some(simple_taproot_config)],
+	);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node.get_our_node_id();
+	create_unannounced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 100_000_000);
+	let chan_id = nodes[0].node.list_channels()[0].channel_id;
+
+	nodes[0].node.close_channel(&chan_id, &node_b_id).unwrap();
+	let node_0_shutdown = get_event_msg!(nodes[0], MessageSendEvent::SendShutdown, node_b_id);
+	nodes[1].node.handle_shutdown(node_a_id, &node_0_shutdown);
+	let node_1_shutdown = get_event_msg!(nodes[1], MessageSendEvent::SendShutdown, node_a_id);
+	nodes[0].node.handle_shutdown(node_b_id, &node_1_shutdown);
+
+	let node_0_closing_complete =
+		get_event_msg!(nodes[0], MessageSendEvent::SendClosingComplete, node_b_id);
+	nodes[1].node.handle_closing_complete(node_a_id, node_0_closing_complete);
+	let mut node_1_closing_sig =
+		get_event_msg!(nodes[1], MessageSendEvent::SendClosingSig, node_a_id);
+	node_1_closing_sig.simple_taproot_next_closee_nonce = None;
+	nodes[0].node.handle_closing_sig(node_b_id, node_1_closing_sig);
+	assert_simple_taproot_processing_error(
+		&nodes[0],
+		node_b_id,
+		"Peer omitted next simple-taproot closee nonce",
+		1_000_000,
+	);
+}
+
+#[cfg(all(simple_close, feature = "simple_taproot_musig2"))]
+#[test]
+fn simple_taproot_cooperative_close_rejects_reused_closer_nonce_on_rbf() {
+	let mut simple_taproot_config = UserConfig::default();
+	simple_taproot_config.channel_handshake_config.negotiate_simple_taproot_channels = true;
+
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(
+		2,
+		&node_cfgs,
+		&[Some(simple_taproot_config.clone()), Some(simple_taproot_config)],
+	);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node.get_our_node_id();
+	create_unannounced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 100_000_000);
+	let chan_id = nodes[0].node.list_channels()[0].channel_id;
+
+	nodes[0].node.close_channel(&chan_id, &node_b_id).unwrap();
+	let node_0_shutdown = get_event_msg!(nodes[0], MessageSendEvent::SendShutdown, node_b_id);
+	nodes[1].node.handle_shutdown(node_a_id, &node_0_shutdown);
+	let node_1_shutdown = get_event_msg!(nodes[1], MessageSendEvent::SendShutdown, node_a_id);
+	nodes[0].node.handle_shutdown(node_b_id, &node_1_shutdown);
+
+	let first_closing_complete =
+		get_event_msg!(nodes[0], MessageSendEvent::SendClosingComplete, node_b_id);
+	let first_closer_nonce =
+		simple_taproot_closing_complete_partial(&first_closing_complete).public_nonce;
+	nodes[1].node.handle_closing_complete(node_a_id, first_closing_complete);
+	let first_closing_sig = get_event_msg!(nodes[1], MessageSendEvent::SendClosingSig, node_a_id);
+	nodes[0].node.handle_closing_sig(node_b_id, first_closing_sig);
+	nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap().clear();
+	nodes[1].tx_broadcaster.txn_broadcasted.lock().unwrap().clear();
+
+	nodes[0]
+		.node
+		.close_channel_with_feerate_and_script(&chan_id, &node_b_id, Some(1_000), None)
+		.unwrap();
+	let mut second_closing_complete =
+		get_event_msg!(nodes[0], MessageSendEvent::SendClosingComplete, node_b_id);
+	replace_simple_taproot_closing_complete_nonce(&mut second_closing_complete, first_closer_nonce);
+	nodes[1].node.handle_closing_complete(node_a_id, second_closing_complete);
+	assert_simple_taproot_processing_error(
+		&nodes[1],
+		node_a_id,
+		"Peer reused simple-taproot closing_complete closer nonce",
+		1_000_000,
+	);
+}
+
+#[cfg(all(simple_close, feature = "simple_taproot_musig2"))]
+#[test]
+fn simple_taproot_cooperative_close_persists_sent_closing_complete() {
+	let mut simple_taproot_config = UserConfig::default();
+	simple_taproot_config.channel_handshake_config.negotiate_simple_taproot_channels = true;
+
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let persister;
+	let new_chain_monitor;
+	let nodes_0_deserialized;
+	let node_chanmgrs = create_node_chanmgrs(
+		2,
+		&node_cfgs,
+		&[Some(simple_taproot_config.clone()), Some(simple_taproot_config)],
+	);
+	let mut nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node.get_our_node_id();
+	create_unannounced_chan_between_nodes_with_value(&nodes, 0, 1, 1_000_000, 100_000_000);
+	let chan_id = nodes[0].node.list_channels()[0].channel_id;
+
+	nodes[0].node.close_channel(&chan_id, &node_b_id).unwrap();
+	let node_0_shutdown = get_event_msg!(nodes[0], MessageSendEvent::SendShutdown, node_b_id);
+	nodes[1].node.handle_shutdown(node_a_id, &node_0_shutdown);
+	let node_1_shutdown = get_event_msg!(nodes[1], MessageSendEvent::SendShutdown, node_a_id);
+	nodes[0].node.handle_shutdown(node_b_id, &node_1_shutdown);
+
+	let node_0_closing_complete =
+		get_event_msg!(nodes[0], MessageSendEvent::SendClosingComplete, node_b_id);
+	nodes[1].node.handle_closing_complete(node_a_id, node_0_closing_complete);
+	let node_1_closing_sig = get_event_msg!(nodes[1], MessageSendEvent::SendClosingSig, node_a_id);
+	let chan_0_monitor_serialized = get_monitor!(nodes[0], chan_id).encode();
+	nodes[0].node.peer_disconnected(node_b_id);
+	nodes[1].node.peer_disconnected(node_a_id);
+	nodes[0].onion_messenger.peer_disconnected(node_b_id);
+	nodes[1].onion_messenger.peer_disconnected(node_a_id);
+
+	reload_node!(
+		nodes[0],
+		&nodes[0].node.encode(),
+		&[&chan_0_monitor_serialized],
+		persister,
+		new_chain_monitor,
+		nodes_0_deserialized
+	);
+	connect_nodes(&nodes[0], &nodes[1]);
+	nodes[0].node.get_and_clear_pending_msg_events();
+	nodes[1].node.get_and_clear_pending_msg_events();
+
+	nodes[0].node.handle_closing_sig(node_b_id, node_1_closing_sig);
+	let node_0_tx = nodes[0].tx_broadcaster.txn_broadcasted.lock().unwrap().remove(0);
+	assert_eq!(node_0_tx.input.len(), 1);
+	assert_eq!(node_0_tx.input[0].witness.len(), 1);
+	assert_eq!(node_0_tx.input[0].witness[0].len(), 64);
 }
 
 #[test]

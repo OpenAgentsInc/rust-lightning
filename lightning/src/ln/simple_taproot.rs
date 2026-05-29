@@ -514,6 +514,130 @@ impl Readable for SimpleTaprootSentClosingComplete {
 	}
 }
 
+/// Restart-persisted set of simple-taproot cooperative close transactions
+/// signed during close/RBF negotiation. Confirmation of any of these spends
+/// the funding output cooperatively.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
+pub struct SimpleTaprootCoopCloseTxids(Vec<Txid>);
+
+impl SimpleTaprootCoopCloseTxids {
+	/// Returns true if no cooperative close transactions have been signed.
+	pub fn is_empty(&self) -> bool {
+		self.0.is_empty()
+	}
+
+	/// Returns true if the txid has already been recorded.
+	pub fn contains(&self, txid: &Txid) -> bool {
+		self.0.iter().any(|recorded| recorded == txid)
+	}
+
+	/// Records a signed cooperative close transaction.
+	pub fn push(&mut self, txid: Txid) {
+		if !self.contains(&txid) {
+			self.0.push(txid);
+		}
+	}
+}
+
+impl Writeable for SimpleTaprootCoopCloseTxids {
+	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), io::Error> {
+		CollectionLength(self.0.len() as u64).write(writer)?;
+		for txid in self.0.iter() {
+			txid.write(writer)?;
+		}
+		Ok(())
+	}
+}
+
+impl Readable for SimpleTaprootCoopCloseTxids {
+	fn read<R: Read>(reader: &mut R) -> Result<Self, DecodeError> {
+		let len: CollectionLength = Readable::read(reader)?;
+		let mut txids = Vec::new();
+		for _ in 0..len.0 {
+			txids.push(Readable::read(reader)?);
+		}
+		Ok(Self(txids))
+	}
+}
+
+/// A peer closer nonce already consumed by an inbound simple-taproot
+/// `closing_complete`.
+#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
+pub struct SimpleTaprootReceivedClosingNonce {
+	/// Funding transaction ID for the close transaction.
+	pub funding_txid: Txid,
+	/// The peer's closer public nonce.
+	pub public_nonce: Musig2PublicNonce,
+	/// Sighash signed by the peer for this nonce.
+	pub sighash: [u8; 32],
+}
+
+impl Writeable for SimpleTaprootReceivedClosingNonce {
+	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), io::Error> {
+		self.funding_txid.write(writer)?;
+		self.public_nonce.write(writer)?;
+		self.sighash.write(writer)
+	}
+}
+
+impl Readable for SimpleTaprootReceivedClosingNonce {
+	fn read<R: Read>(reader: &mut R) -> Result<Self, DecodeError> {
+		Ok(Self {
+			funding_txid: Readable::read(reader)?,
+			public_nonce: Readable::read(reader)?,
+			sighash: Readable::read(reader)?,
+		})
+	}
+}
+
+/// Restart-persisted peer closer nonces consumed during simple-taproot
+/// cooperative close/RBF negotiation.
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
+pub struct SimpleTaprootReceivedClosingNonces(Vec<SimpleTaprootReceivedClosingNonce>);
+
+impl SimpleTaprootReceivedClosingNonces {
+	/// Returns true when no peer closer nonces have been recorded.
+	pub fn is_empty(&self) -> bool {
+		self.0.is_empty()
+	}
+
+	/// Records a peer closer nonce, rejecting reuse in the same funding scope.
+	pub fn note(
+		&mut self, funding_txid: Txid, public_nonce: Musig2PublicNonce, sighash: [u8; 32],
+	) -> Result<(), SimpleTaprootMusigError> {
+		if self
+			.0
+			.iter()
+			.any(|used| used.funding_txid == funding_txid && used.public_nonce == public_nonce)
+		{
+			return Err(SimpleTaprootMusigError::DuplicateNonceUse);
+		}
+		self.0.push(SimpleTaprootReceivedClosingNonce { funding_txid, public_nonce, sighash });
+		Ok(())
+	}
+}
+
+impl Writeable for SimpleTaprootReceivedClosingNonces {
+	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), io::Error> {
+		CollectionLength(self.0.len() as u64).write(writer)?;
+		for nonce in self.0.iter() {
+			nonce.write(writer)?;
+		}
+		Ok(())
+	}
+}
+
+impl Readable for SimpleTaprootReceivedClosingNonces {
+	fn read<R: Read>(reader: &mut R) -> Result<Self, DecodeError> {
+		let len: CollectionLength = Readable::read(reader)?;
+		let mut nonces = Vec::new();
+		for _ in 0..len.0 {
+			nonces.push(Readable::read(reader)?);
+		}
+		Ok(Self(nonces))
+	}
+}
+
 impl Writeable for SimpleTaprootSentCommitmentSignature {
 	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), io::Error> {
 		self.funding_txid.write(writer)?;
